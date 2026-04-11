@@ -47,6 +47,63 @@ _SUPPORTED_MESSAGE_RESOURCE_TYPES = {"file", "image", "audio", "media"}
 _MODEL_REGISTRY_FILE_NAME = "feishu_model_registry.json"
 _MODEL_REGISTRY_SCHEMA_VERSION = 2
 _MODEL_REGISTRY_SESSIONS_DIR_NAME = "sessions"
+_DEFAULT_MODEL_REGISTRY_TABLE_NAME = "Hermes Model Registry"
+_FEISHU_BITABLE_TEXT_FIELD = 1
+_FEISHU_BITABLE_NUMBER_FIELD = 2
+_FEISHU_BITABLE_CHECKBOX_FIELD = 7
+_MODEL_REGISTRY_FIELD_SPECS = [
+    {"name": "Model", "type": _FEISHU_BITABLE_TEXT_FIELD, "required": True, "description": "Canonical model id used by Hermes."},
+    {"name": "Provider", "type": _FEISHU_BITABLE_TEXT_FIELD, "required": True, "description": "Provider slug such as openrouter or nvidia."},
+    {"name": "Display Name", "type": _FEISHU_BITABLE_TEXT_FIELD, "required": False, "description": "Human-readable model name."},
+    {"name": "Status", "type": _FEISHU_BITABLE_TEXT_FIELD, "required": False, "description": "Hermes availability state: active, degraded, inactive, invalid."},
+    {"name": "Hidden", "type": _FEISHU_BITABLE_CHECKBOX_FIELD, "required": False, "description": "Whether the model should be hidden from default views."},
+    {"name": "Is Available", "type": _FEISHU_BITABLE_CHECKBOX_FIELD, "required": False, "description": "Current Hermes availability signal."},
+    {"name": "Is Free", "type": _FEISHU_BITABLE_CHECKBOX_FIELD, "required": False, "description": "Whether the model is free-tier eligible."},
+    {"name": "Rank", "type": _FEISHU_BITABLE_NUMBER_FIELD, "required": False, "description": "Provider-specific ordering rank."},
+    {"name": "Selection Hint", "type": _FEISHU_BITABLE_TEXT_FIELD, "required": False, "description": "Hermes selection hint such as recommended or fallback."},
+    {"name": "Manual Pinned", "type": _FEISHU_BITABLE_CHECKBOX_FIELD, "required": False, "description": "Whether the model is operator-pinned."},
+    {"name": "Recent Used", "type": _FEISHU_BITABLE_CHECKBOX_FIELD, "required": False, "description": "Whether recent Hermes sessions used this model."},
+    {"name": "Recent Used Count", "type": _FEISHU_BITABLE_NUMBER_FIELD, "required": False, "description": "Approximate recent usage count derived from Hermes sessions."},
+    {"name": "Generated Command", "type": _FEISHU_BITABLE_TEXT_FIELD, "required": False, "description": "Direct Hermes command used to switch to this model."},
+    {"name": "Last Probe At", "type": _FEISHU_BITABLE_NUMBER_FIELD, "required": False, "description": "Unix timestamp of the latest provider probe."},
+    {"name": "Recent Used At", "type": _FEISHU_BITABLE_NUMBER_FIELD, "required": False, "description": "Unix timestamp of the most recent Hermes usage."},
+    {"name": "Last Sync At", "type": _FEISHU_BITABLE_NUMBER_FIELD, "required": False, "description": "Unix timestamp of the latest Bitable mirror sync."},
+    {"name": "Latency Ms", "type": _FEISHU_BITABLE_NUMBER_FIELD, "required": False, "description": "Observed or estimated latency in milliseconds."},
+    {"name": "Context Window", "type": _FEISHU_BITABLE_NUMBER_FIELD, "required": False, "description": "Reported context window in tokens."},
+    {"name": "Reasoning", "type": _FEISHU_BITABLE_CHECKBOX_FIELD, "required": False, "description": "Whether the model supports reasoning mode."},
+    {"name": "Consecutive Failures", "type": _FEISHU_BITABLE_NUMBER_FIELD, "required": False, "description": "Consecutive Hermes route failures for this model."},
+    {"name": "Failure Kind", "type": _FEISHU_BITABLE_TEXT_FIELD, "required": False, "description": "Normalized last failure category."},
+    {"name": "Last Error Code", "type": _FEISHU_BITABLE_TEXT_FIELD, "required": False, "description": "Last provider or Hermes error code."},
+    {"name": "Last Error Message", "type": _FEISHU_BITABLE_TEXT_FIELD, "required": False, "description": "Last provider or Hermes error message."},
+    {"name": "Last Failed At", "type": _FEISHU_BITABLE_NUMBER_FIELD, "required": False, "description": "Unix timestamp of the most recent failure."},
+    {"name": "Source", "type": _FEISHU_BITABLE_TEXT_FIELD, "required": False, "description": "Registry source, for example routing_state or curated-fallback."},
+]
+_MODEL_REGISTRY_VIEW_SPECS = [
+    {
+        "name": "All Models",
+        "view_type": "grid",
+        "description": "Complete registry sorted by rank.",
+        "filter_hint": "No filter. Sort by Rank ascending.",
+    },
+    {
+        "name": "Recommended",
+        "view_type": "grid",
+        "description": "Recommended models with Hidden unchecked.",
+        "filter_hint": "Filter Hidden != true and Selection Hint = recommended.",
+    },
+    {
+        "name": "Recent Used",
+        "view_type": "grid",
+        "description": "Recently used models with Hidden unchecked.",
+        "filter_hint": "Filter Hidden != true and Recent Used = true. Sort by Recent Used At descending.",
+    },
+    {
+        "name": "Hidden or Inactive",
+        "view_type": "grid",
+        "description": "Hidden or unavailable models kept for audit.",
+        "filter_hint": "Filter Hidden = true or Status in (inactive, invalid).",
+    },
+]
 
 
 @dataclass(slots=True)
@@ -597,6 +654,236 @@ def resolve_bitable_target(args: Dict[str, Any]) -> Tuple[str, str]:
     if not app_token or not table_id:
         raise ValueError("Bitable target is not configured. Provide app_token/table_id or set FEISHU_BITABLE_APP_TOKEN and FEISHU_BITABLE_TABLE_ID.")
     return app_token, table_id
+
+
+def get_model_registry_bitable_blueprint(*, table_name: str = _DEFAULT_MODEL_REGISTRY_TABLE_NAME) -> Dict[str, Any]:
+    return {
+        "table_name": table_name,
+        "fields": [dict(item) for item in _MODEL_REGISTRY_FIELD_SPECS],
+        "views": [dict(item) for item in _MODEL_REGISTRY_VIEW_SPECS],
+        "required_field_names": [item["name"] for item in _MODEL_REGISTRY_FIELD_SPECS if item.get("required")],
+    }
+
+
+def list_bitable_tables(client: "FeishuOpenApiClient", *, app_token: str) -> list[dict[str, Any]]:
+    tables: list[dict[str, Any]] = []
+    page_token = ""
+    while True:
+        params: Dict[str, Any] = {"page_size": 100}
+        if page_token:
+            params["page_token"] = page_token
+        payload = client.request_json(
+            "GET",
+            f"/open-apis/bitable/v1/apps/{app_token}/tables",
+            params=params,
+        )
+        items = payload.get("items") or []
+        tables.extend(item for item in items if isinstance(item, dict))
+        if not payload.get("has_more"):
+            break
+        page_token = str(payload.get("page_token") or "").strip()
+        if not page_token:
+            break
+    return tables
+
+
+def list_bitable_views(client: "FeishuOpenApiClient", *, app_token: str, table_id: str) -> list[dict[str, Any]]:
+    views: list[dict[str, Any]] = []
+    page_token = ""
+    while True:
+        params: Dict[str, Any] = {"page_size": 100}
+        if page_token:
+            params["page_token"] = page_token
+        payload = client.request_json(
+            "GET",
+            f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/views",
+            params=params,
+        )
+        items = payload.get("items") or []
+        views.extend(item for item in items if isinstance(item, dict))
+        if not payload.get("has_more"):
+            break
+        page_token = str(payload.get("page_token") or "").strip()
+        if not page_token:
+            break
+    return views
+
+
+def create_bitable_table(
+    client: "FeishuOpenApiClient",
+    *,
+    app_token: str,
+    table_name: str,
+    field_specs: list[dict[str, Any]] | None = None,
+    default_view_name: str | None = None,
+) -> dict[str, Any]:
+    fields_payload = []
+    for spec in field_specs or []:
+        fields_payload.append(
+            {
+                "field_name": spec["name"],
+                "type": int(spec["type"]),
+            }
+        )
+    body: Dict[str, Any] = {
+        "table": {
+            "name": table_name,
+        }
+    }
+    if fields_payload:
+        body["table"]["fields"] = fields_payload
+    if default_view_name:
+        body["table"]["default_view_name"] = default_view_name
+    payload = client.request_json(
+        "POST",
+        f"/open-apis/bitable/v1/apps/{app_token}/tables",
+        json_body=body,
+    )
+    table = payload.get("table") if isinstance(payload.get("table"), dict) else payload
+    return table if isinstance(table, dict) else {}
+
+
+def create_bitable_field(
+    client: "FeishuOpenApiClient",
+    *,
+    app_token: str,
+    table_id: str,
+    field_name: str,
+    field_type: int,
+) -> dict[str, Any]:
+    payload = client.request_json(
+        "POST",
+        f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/fields",
+        params={"client_token": str(uuid.uuid4())},
+        json_body={"field_name": field_name, "type": int(field_type)},
+    )
+    field = payload.get("field") if isinstance(payload.get("field"), dict) else payload
+    return field if isinstance(field, dict) else {}
+
+
+def create_bitable_view(
+    client: "FeishuOpenApiClient",
+    *,
+    app_token: str,
+    table_id: str,
+    view_name: str,
+    view_type: str = "grid",
+) -> dict[str, Any]:
+    payload = client.request_json(
+        "POST",
+        f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/views",
+        json_body={"view_name": view_name, "view_type": view_type},
+    )
+    view = payload.get("view") if isinstance(payload.get("view"), dict) else payload
+    return view if isinstance(view, dict) else {}
+
+
+def ensure_model_registry_bitable_schema(
+    client: "FeishuOpenApiClient",
+    *,
+    app_token: str,
+    table_id: str | None = None,
+    table_name: str = _DEFAULT_MODEL_REGISTRY_TABLE_NAME,
+    create_missing_table: bool = True,
+    create_missing_fields: bool = True,
+    create_missing_views: bool = True,
+) -> Dict[str, Any]:
+    blueprint = get_model_registry_bitable_blueprint(table_name=table_name)
+    tables = list_bitable_tables(client, app_token=app_token)
+    selected_table: dict[str, Any] | None = None
+    normalized_table_id = str(table_id or "").strip()
+    if normalized_table_id:
+        for item in tables:
+            if str(item.get("table_id") or "").strip() == normalized_table_id:
+                selected_table = item
+                break
+    else:
+        for item in tables:
+            if str(item.get("name") or "").strip() == table_name:
+                selected_table = item
+                normalized_table_id = str(item.get("table_id") or "").strip()
+                break
+
+    created_table = False
+    if selected_table is None:
+        if not create_missing_table:
+            return {
+                "status": "error",
+                "error": "table_not_found",
+                "app_token": app_token,
+                "table_id": normalized_table_id or None,
+                "table_name": table_name,
+                "recommended_schema": blueprint,
+            }
+        created = create_bitable_table(
+            client,
+            app_token=app_token,
+            table_name=table_name,
+            field_specs=blueprint["fields"],
+            default_view_name=blueprint["views"][0]["name"] if blueprint["views"] else None,
+        )
+        normalized_table_id = str(created.get("table_id") or "").strip()
+        selected_table = created
+        created_table = True
+
+    if not normalized_table_id:
+        raise RuntimeError("Failed to resolve target Bitable table_id")
+
+    schema_payload = client.request_json(
+        "GET",
+        f"/open-apis/bitable/v1/apps/{app_token}/tables/{normalized_table_id}/fields",
+        params={"page_size": 200},
+    )
+    field_items = [item for item in (schema_payload.get("items") or []) if isinstance(item, dict)]
+    existing_field_names = {str(item.get("field_name") or "").strip() for item in field_items}
+    missing_field_specs = [item for item in blueprint["fields"] if item["name"] not in existing_field_names]
+    created_fields: list[dict[str, Any]] = []
+    if missing_field_specs and create_missing_fields:
+        for spec in missing_field_specs:
+            created_fields.append(
+                create_bitable_field(
+                    client,
+                    app_token=app_token,
+                    table_id=normalized_table_id,
+                    field_name=spec["name"],
+                    field_type=int(spec["type"]),
+                )
+            )
+        existing_field_names.update(spec["name"] for spec in missing_field_specs)
+
+    views = list_bitable_views(client, app_token=app_token, table_id=normalized_table_id)
+    existing_view_names = {str(item.get("view_name") or "").strip() for item in views}
+    missing_view_specs = [item for item in blueprint["views"] if item["name"] not in existing_view_names]
+    created_views: list[dict[str, Any]] = []
+    if missing_view_specs and create_missing_views:
+        for spec in missing_view_specs:
+            created_views.append(
+                create_bitable_view(
+                    client,
+                    app_token=app_token,
+                    table_id=normalized_table_id,
+                    view_name=spec["name"],
+                    view_type=str(spec.get("view_type") or "grid"),
+                )
+            )
+        existing_view_names.update(spec["name"] for spec in missing_view_specs)
+
+    missing_required_fields = [name for name in blueprint["required_field_names"] if name not in existing_field_names]
+    return {
+        "status": "ok" if not missing_required_fields else "partial",
+        "app_token": app_token,
+        "table_id": normalized_table_id,
+        "table_name": str((selected_table or {}).get("name") or table_name),
+        "created_table": created_table,
+        "created_fields": created_fields,
+        "created_views": created_views,
+        "existing_field_names": sorted(existing_field_names),
+        "existing_view_names": sorted(existing_view_names),
+        "missing_required_fields": missing_required_fields,
+        "missing_optional_fields": [item["name"] for item in blueprint["fields"] if item["name"] not in existing_field_names],
+        "missing_views": [item["name"] for item in blueprint["views"] if item["name"] not in existing_view_names],
+        "recommended_schema": blueprint,
+    }
 
 
 def build_model_registry(force_refresh: bool = False) -> Dict[str, Any]:

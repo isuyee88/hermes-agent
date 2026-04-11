@@ -3079,6 +3079,38 @@ def _sync_feishu_model_registry_impl(*, force_refresh: bool = False, mirror_to_b
         }
 
 
+def _prepare_feishu_model_registry_bitable_impl(
+    *,
+    app_token: str | None = None,
+    table_id: str | None = None,
+    table_name: str = "Hermes Model Registry",
+    create_missing_table: bool = True,
+    create_missing_fields: bool = True,
+    create_missing_views: bool = True,
+) -> dict[str, Any]:
+    _prepare_runtime_environment()
+    try:
+        from tools.feishu_api import build_feishu_client, ensure_model_registry_bitable_schema
+
+        resolved_app_token = str(app_token or os.getenv("FEISHU_BITABLE_APP_TOKEN") or "").strip()
+        if not resolved_app_token:
+            return {"status": "error", "error": "FEISHU_BITABLE_APP_TOKEN is not configured"}
+        return ensure_model_registry_bitable_schema(
+            build_feishu_client(),
+            app_token=resolved_app_token,
+            table_id=str(table_id or "").strip() or None,
+            table_name=str(table_name or "Hermes Model Registry").strip() or "Hermes Model Registry",
+            create_missing_table=create_missing_table,
+            create_missing_fields=create_missing_fields,
+            create_missing_views=create_missing_views,
+        )
+    except Exception as exc:
+        return {
+            "status": "error",
+            "error": str(exc),
+        }
+
+
 def _debug_session_route_state(session_key: str) -> dict[str, Any]:
     _prepare_runtime_environment()
     normalized = str(session_key or "").strip()
@@ -4074,6 +4106,29 @@ if modal is not None:
         return _sync_feishu_model_registry_impl(
             force_refresh=force_refresh,
             mirror_to_bitable=mirror_to_bitable,
+        )
+
+    @app.function(
+        image=image,
+        volumes={"/data": volume},
+        secrets=secrets,
+        timeout=180,
+    )
+    def prepare_feishu_model_registry_bitable(
+        app_token: str = "",
+        table_id: str = "",
+        table_name: str = "Hermes Model Registry",
+        create_missing_table: bool = True,
+        create_missing_fields: bool = True,
+        create_missing_views: bool = True,
+    ) -> dict[str, Any]:
+        return _prepare_feishu_model_registry_bitable_impl(
+            app_token=app_token or None,
+            table_id=table_id or None,
+            table_name=table_name,
+            create_missing_table=create_missing_table,
+            create_missing_fields=create_missing_fields,
+            create_missing_views=create_missing_views,
         )
 
     @app.function(

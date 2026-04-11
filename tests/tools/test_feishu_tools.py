@@ -11,6 +11,7 @@ import httpx
 from tools.feishu_api import (
     build_model_registry,
     check_feishu_available,
+    ensure_model_registry_bitable_schema,
     extract_document_id,
     get_model_registry_path,
     mirror_model_registry_to_bitable,
@@ -241,6 +242,70 @@ class TestFeishuBitableAndMessages:
         assert listed["items"][0]["record_id"] == "rec1"
         assert upserted["created"] == 1
         assert upserted["updated"] == 1
+
+    def test_ensure_model_registry_bitable_schema_creates_table_fields_and_views(self):
+        client = FakeClient()
+        responses = iter(
+            [
+                {"items": [], "has_more": False},
+                {"table": {"table_id": "tbl_new", "name": "Hermes Model Registry"}},
+                {"items": [{"field_name": "Model"}, {"field_name": "Provider"}]},
+                {"field": {"field_id": "fld_display", "field_name": "Display Name"}},
+                {"field": {"field_id": "fld_status", "field_name": "Status"}},
+                {"field": {"field_id": "fld_hidden", "field_name": "Hidden"}},
+                {"field": {"field_id": "fld_available", "field_name": "Is Available"}},
+                {"field": {"field_id": "fld_free", "field_name": "Is Free"}},
+                {"field": {"field_id": "fld_rank", "field_name": "Rank"}},
+                {"field": {"field_id": "fld_hint", "field_name": "Selection Hint"}},
+                {"field": {"field_id": "fld_pinned", "field_name": "Manual Pinned"}},
+                {"field": {"field_id": "fld_recent", "field_name": "Recent Used"}},
+                {"field": {"field_id": "fld_recent_count", "field_name": "Recent Used Count"}},
+                {"field": {"field_id": "fld_command", "field_name": "Generated Command"}},
+                {"field": {"field_id": "fld_probe", "field_name": "Last Probe At"}},
+                {"field": {"field_id": "fld_recent_at", "field_name": "Recent Used At"}},
+                {"field": {"field_id": "fld_sync", "field_name": "Last Sync At"}},
+                {"field": {"field_id": "fld_latency", "field_name": "Latency Ms"}},
+                {"field": {"field_id": "fld_context", "field_name": "Context Window"}},
+                {"field": {"field_id": "fld_reasoning", "field_name": "Reasoning"}},
+                {"field": {"field_id": "fld_failures", "field_name": "Consecutive Failures"}},
+                {"field": {"field_id": "fld_failure_kind", "field_name": "Failure Kind"}},
+                {"field": {"field_id": "fld_error_code", "field_name": "Last Error Code"}},
+                {"field": {"field_id": "fld_error_message", "field_name": "Last Error Message"}},
+                {"field": {"field_id": "fld_failed_at", "field_name": "Last Failed At"}},
+                {"field": {"field_id": "fld_source", "field_name": "Source"}},
+                {"items": [], "has_more": False},
+                {"view": {"view_id": "vew_all", "view_name": "All Models"}},
+                {"view": {"view_id": "vew_recommended", "view_name": "Recommended"}},
+                {"view": {"view_id": "vew_recent", "view_name": "Recent Used"}},
+                {"view": {"view_id": "vew_hidden", "view_name": "Hidden or Inactive"}},
+            ]
+        )
+
+        def _request_json(method, path, **kwargs):
+            client.calls.append((method, path, kwargs))
+            return next(responses)
+
+        client.request_json = _request_json
+
+        result = ensure_model_registry_bitable_schema(
+            client,
+            app_token="app_token",
+            table_name="Hermes Model Registry",
+            create_missing_table=True,
+            create_missing_fields=True,
+            create_missing_views=True,
+        )
+
+        assert result["status"] == "ok"
+        assert result["created_table"] is True
+        assert result["table_id"] == "tbl_new"
+        assert len(result["created_fields"]) >= 1
+        assert [item["view_name"] for item in result["created_views"]] == [
+            "All Models",
+            "Recommended",
+            "Recent Used",
+            "Hidden or Inactive",
+        ]
 
     def test_message_send_and_chat_lookup(self):
         client = FakeClient()

@@ -65,7 +65,7 @@ _HERMES_CORE_TOOLS = [
     "feishu_bitable_list_records", "feishu_bitable_upsert_records",
     "feishu_message_send", "feishu_chat_lookup", "feishu_file_upload",
     "feishu_file_send", "feishu_file_download",
-    "feishu_model_registry_sync", "feishu_model_registry_publish_card",
+    "feishu_model_registry_sync", "feishu_model_registry_prepare_bitable", "feishu_model_registry_publish_card",
     # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
     "ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service",
 ]
@@ -149,7 +149,7 @@ TOOLSETS = {
             "feishu_bitable_list_records", "feishu_bitable_upsert_records",
             "feishu_message_send", "feishu_chat_lookup", "feishu_file_upload",
             "feishu_file_send", "feishu_file_download",
-            "feishu_model_registry_sync", "feishu_model_registry_publish_card",
+            "feishu_model_registry_sync", "feishu_model_registry_prepare_bitable", "feishu_model_registry_publish_card",
         ],
         "includes": []
     },

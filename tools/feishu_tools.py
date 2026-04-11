@@ -14,6 +14,7 @@ from tools.feishu_api import (
     build_model_registry,
     build_plain_post_payload,
     coerce_local_file_path,
+    ensure_model_registry_bitable_schema,
     extract_document_id,
     extract_filename_from_headers,
     extract_spreadsheet_token,
@@ -213,6 +214,19 @@ FEISHU_MODEL_REGISTRY_SYNC_SCHEMA = _schema(
         "mirror_to_bitable": {"type": "boolean", "description": "Mirror the registry into Bitable after rebuilding.", "default": False},
         "app_token": {"type": "string", "description": "Optional Bitable app token override."},
         "table_id": {"type": "string", "description": "Optional Bitable table id override."},
+    },
+)
+
+FEISHU_MODEL_REGISTRY_PREPARE_BITABLE_SCHEMA = _schema(
+    "feishu_model_registry_prepare_bitable",
+    "Create or validate the recommended Feishu Bitable table, fields, and views for Hermes model registry mirroring.",
+    {
+        "app_token": {"type": "string", "description": "Bitable app token. Falls back to FEISHU_BITABLE_APP_TOKEN."},
+        "table_id": {"type": "string", "description": "Optional target table id. If omitted, Hermes finds or creates the table by name."},
+        "table_name": {"type": "string", "description": "Table name to find or create.", "default": "Hermes Model Registry"},
+        "create_missing_table": {"type": "boolean", "description": "Create the table if it does not exist.", "default": True},
+        "create_missing_fields": {"type": "boolean", "description": "Create missing recommended fields.", "default": True},
+        "create_missing_views": {"type": "boolean", "description": "Create missing recommended views.", "default": True},
     },
 )
 
@@ -623,6 +637,26 @@ def feishu_model_registry_sync_tool(args: Dict[str, Any], **_kw: Any) -> str:
         return tool_error(f"Failed to sync Feishu model registry: {exc}")
 
 
+def feishu_model_registry_prepare_bitable_tool(args: Dict[str, Any], **_kw: Any) -> str:
+    try:
+        app_token = str(args.get("app_token") or os.getenv("FEISHU_BITABLE_APP_TOKEN") or "").strip()
+        if not app_token:
+            return tool_error("app_token is required or set FEISHU_BITABLE_APP_TOKEN")
+        result = ensure_model_registry_bitable_schema(
+            _client(),
+            app_token=app_token,
+            table_id=str(args.get("table_id") or "").strip() or None,
+            table_name=str(args.get("table_name") or "Hermes Model Registry").strip() or "Hermes Model Registry",
+            create_missing_table=bool(args.get("create_missing_table", True)),
+            create_missing_fields=bool(args.get("create_missing_fields", True)),
+            create_missing_views=bool(args.get("create_missing_views", True)),
+        )
+        return tool_result(result)
+    except Exception as exc:
+        logger.warning("feishu_model_registry_prepare_bitable failed: %s", exc)
+        return tool_error(f"Failed to prepare Feishu Bitable model registry schema: {exc}")
+
+
 def feishu_model_registry_publish_card_tool(args: Dict[str, Any], **_kw: Any) -> str:
     chat_id = str(args.get("chat_id", "") or "").strip()
     if not chat_id:
@@ -683,4 +717,5 @@ registry.register(name="feishu_file_upload", toolset="feishu", schema=FEISHU_FIL
 registry.register(name="feishu_file_send", toolset="feishu", schema=FEISHU_FILE_SEND_SCHEMA, handler=feishu_file_send_tool, check_fn=make_capability_check("files"), requires_env=["FEISHU_APP_ID", "FEISHU_APP_SECRET"], emoji="F")
 registry.register(name="feishu_file_download", toolset="feishu", schema=FEISHU_FILE_DOWNLOAD_SCHEMA, handler=feishu_file_download_tool, check_fn=make_capability_check("files"), requires_env=["FEISHU_APP_ID", "FEISHU_APP_SECRET"], emoji="F")
 registry.register(name="feishu_model_registry_sync", toolset="feishu", schema=FEISHU_MODEL_REGISTRY_SYNC_SCHEMA, handler=feishu_model_registry_sync_tool, check_fn=make_capability_check("model_registry"), requires_env=["FEISHU_APP_ID", "FEISHU_APP_SECRET"], emoji="F")
+registry.register(name="feishu_model_registry_prepare_bitable", toolset="feishu", schema=FEISHU_MODEL_REGISTRY_PREPARE_BITABLE_SCHEMA, handler=feishu_model_registry_prepare_bitable_tool, check_fn=make_capability_check("model_registry"), requires_env=["FEISHU_APP_ID", "FEISHU_APP_SECRET"], emoji="F")
 registry.register(name="feishu_model_registry_publish_card", toolset="feishu", schema=FEISHU_MODEL_REGISTRY_PUBLISH_CARD_SCHEMA, handler=feishu_model_registry_publish_card_tool, check_fn=make_capability_check("model_registry"), requires_env=["FEISHU_APP_ID", "FEISHU_APP_SECRET"], emoji="F")
