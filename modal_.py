@@ -26,6 +26,7 @@ import importlib.util
 import json
 import logging
 import os
+import queue as pyqueue
 import re
 import threading
 import time
@@ -2216,6 +2217,11 @@ def _process_chat_queue_impl(*, platform: str, partition: str, max_items: int = 
 
     claimed, claim_token = _claim_chat_partition(normalized_partition, platform=normalized_platform)
     if not claimed:
+        logger.warning(
+            "[ChatQueue] worker skipped platform=%s partition=%s reason=already_claimed",
+            normalized_platform or "unknown",
+            normalized_partition or "none",
+        )
         return {
             "status": "skipped",
             "reason": "already_claimed",
@@ -2223,18 +2229,61 @@ def _process_chat_queue_impl(*, platform: str, partition: str, max_items: int = 
             "partition": normalized_partition,
         }
 
+    logger.warning(
+        "[ChatQueue] worker claimed platform=%s partition=%s",
+        normalized_platform or "unknown",
+        normalized_partition or "none",
+    )
+
     queue = _get_chat_queue()
     processed: list[dict[str, Any]] = []
     try:
+        first_poll = True
         while True:
-            items = queue.get_many(max(max_items, 1), block=False, partition=normalized_partition)
+            try:
+                if first_poll:
+                    try:
+                        items = queue.get_many(
+                            max(max_items, 1),
+                            block=True,
+                            timeout=2.0,
+                            partition=normalized_partition,
+                        )
+                    except TypeError:
+                        items = queue.get_many(
+                            max(max_items, 1),
+                            block=True,
+                            partition=normalized_partition,
+                        )
+                    first_poll = False
+                else:
+                    items = queue.get_many(max(max_items, 1), block=False, partition=normalized_partition)
+            except pyqueue.Empty:
+                logger.warning(
+                    "[ChatQueue] worker poll timed out platform=%s partition=%s",
+                    normalized_platform or "unknown",
+                    normalized_partition or "none",
+                )
+                break
             if not items:
+                logger.warning(
+                    "[ChatQueue] worker found no items platform=%s partition=%s",
+                    normalized_platform or "unknown",
+                    normalized_partition or "none",
+                )
                 break
             for item in items:
                 processed.append(_process_chat_queue_item(item))
     finally:
         _sync_modal_volume(commit=True)
         _release_chat_partition_claim(normalized_partition, claim_token=claim_token)
+
+    logger.warning(
+        "[ChatQueue] worker released platform=%s partition=%s processed_count=%s",
+        normalized_platform or "unknown",
+        normalized_partition or "none",
+        len(processed),
+    )
 
     return {
         "status": "ok",
