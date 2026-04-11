@@ -633,6 +633,8 @@ def feishu_model_registry_publish_card_tool(args: Dict[str, Any], **_kw: Any) ->
         registry_payload = build_model_registry(force_refresh=False)
         grouped: dict[str, list[dict[str, Any]]] = {}
         for entry in registry_payload.get("entries") or []:
+            if entry.get("hidden"):
+                continue
             if not include_unavailable and not entry.get("is_available", True):
                 continue
             grouped.setdefault(str(entry.get("provider") or "unknown"), []).append(entry)

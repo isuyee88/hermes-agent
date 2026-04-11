@@ -3045,6 +3045,40 @@ def _build_feishu_model_registry_debug_state(*, force_refresh: bool = False) -> 
         }
 
 
+def _sync_feishu_model_registry_impl(*, force_refresh: bool = False, mirror_to_bitable: bool | None = None) -> dict[str, Any]:
+    _prepare_runtime_environment()
+    try:
+        from tools.feishu_api import build_feishu_client, build_model_registry, mirror_model_registry_to_bitable, resolve_bitable_target
+
+        registry_payload = build_model_registry(force_refresh=force_refresh)
+        should_mirror = (
+            mirror_to_bitable
+            if mirror_to_bitable is not None
+            else _is_truthy(os.getenv("FEISHU_MODEL_REGISTRY_MIRROR_ENABLED"), default=False)
+        )
+        result: dict[str, Any] = {
+            "status": "ok",
+            "entry_count": len(registry_payload.get("entries") or []),
+            "registry": registry_payload,
+            "mirrored": False,
+        }
+        if should_mirror:
+            app_token, table_id = resolve_bitable_target({})
+            result["bitable_mirror"] = mirror_model_registry_to_bitable(
+                build_feishu_client(),
+                registry_payload,
+                app_token=app_token,
+                table_id=table_id,
+            )
+            result["mirrored"] = True
+        return result
+    except Exception as exc:
+        return {
+            "status": "error",
+            "error": str(exc),
+        }
+
+
 def _debug_session_route_state(session_key: str) -> dict[str, Any]:
     _prepare_runtime_environment()
     normalized = str(session_key or "").strip()
@@ -4031,6 +4065,21 @@ if modal is not None:
         image=image,
         volumes={"/data": volume},
         secrets=secrets,
+        timeout=180,
+    )
+    def sync_feishu_model_registry(
+        force_refresh: bool = False,
+        mirror_to_bitable: bool | None = None,
+    ) -> dict[str, Any]:
+        return _sync_feishu_model_registry_impl(
+            force_refresh=force_refresh,
+            mirror_to_bitable=mirror_to_bitable,
+        )
+
+    @app.function(
+        image=image,
+        volumes={"/data": volume},
+        secrets=secrets,
         timeout=30,
     )
     def debug_model_routing_state(force_refresh: bool = False) -> dict[str, Any]:
@@ -4190,6 +4239,21 @@ if modal is not None:
             enqueue_limit=DEFAULT_CRON_QUEUE_BATCH_SIZE,
             worker_count=DEFAULT_CRON_QUEUE_WORKERS,
         )
+
+    @app.function(
+        image=image,
+        volumes={"/data": volume},
+        secrets=secrets,
+        timeout=300,
+        schedule=modal.Period(minutes=30),
+    )
+    def feishu_model_registry_heartbeat() -> dict[str, Any]:
+        settings = RuntimeSettings.from_env()
+        if not settings.feishu_model_registry_mirror_enabled:
+            return {"status": "skipped", "reason": "mirror_disabled"}
+        if not settings.feishu_bitable_app_token or not settings.feishu_bitable_table_id:
+            return {"status": "skipped", "reason": "bitable_not_configured"}
+        return _sync_feishu_model_registry_impl(force_refresh=True, mirror_to_bitable=True)
 
     @app.function(
         image=image,

@@ -45,6 +45,8 @@ _DEFAULT_FEISHU_TOOL_CAPABILITIES = {
 }
 _SUPPORTED_MESSAGE_RESOURCE_TYPES = {"file", "image", "audio", "media"}
 _MODEL_REGISTRY_FILE_NAME = "feishu_model_registry.json"
+_MODEL_REGISTRY_SCHEMA_VERSION = 2
+_MODEL_REGISTRY_SESSIONS_DIR_NAME = "sessions"
 
 
 @dataclass(slots=True)
@@ -89,6 +91,10 @@ def get_routing_state_path() -> Path:
     return get_modal_data_root() / "free_model_routing.json"
 
 
+def get_sessions_dir() -> Path:
+    return get_modal_data_root() / _MODEL_REGISTRY_SESSIONS_DIR_NAME
+
+
 def ensure_feishu_data_dir() -> None:
     get_modal_data_root().mkdir(parents=True, exist_ok=True)
 
@@ -108,6 +114,81 @@ def atomic_write_json(path: Path, payload: Any) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp.replace(path)
+
+
+def _iter_session_payloads(limit: int = 500) -> list[dict[str, Any]]:
+    sessions_dir = get_sessions_dir()
+    if limit <= 0 or not sessions_dir.exists():
+        return []
+    payloads: list[dict[str, Any]] = []
+    for path in sessions_dir.glob("*.json"):
+        payload = load_json(path, {})
+        if isinstance(payload, dict):
+            payloads.append(payload)
+    payloads.sort(key=lambda item: int(item.get("updated_at") or 0), reverse=True)
+    return payloads[:limit]
+
+
+def _normalize_failure_kind(error_text: str, failure_reason: str) -> str:
+    normalized_reason = str(failure_reason or "").strip().lower()
+    normalized_error = str(error_text or "").strip().lower()
+    if normalized_reason == "invalid_model" or "invalid model" in normalized_error:
+        return "invalid_model"
+    if "unknown provider" in normalized_error or "invalid_provider" in normalized_error:
+        return "provider_config_error"
+    if "auth" in normalized_error or "unauthorized" in normalized_error or "api key" in normalized_error:
+        return "auth_error"
+    if "429" in normalized_error or "rate limit" in normalized_error:
+        return "rate_limited"
+    if normalized_reason == "transient_error" or "timeout" in normalized_error or "temporar" in normalized_error:
+        return "transient_network"
+    if "5xx" in normalized_error or "502" in normalized_error or "503" in normalized_error or "504" in normalized_error:
+        return "upstream_5xx"
+    if normalized_reason == "incomplete_result":
+        return "incomplete_result"
+    return normalized_reason or ("unknown" if normalized_error else "")
+
+
+def _build_recent_model_usage(limit: int = 500) -> dict[tuple[str, str], dict[str, Any]]:
+    usage: dict[tuple[str, str], dict[str, Any]] = {}
+    for payload in _iter_session_payloads(limit=limit):
+        lease = payload.get("route_lease") or {}
+        route_debug = payload.get("route_debug") or {}
+        if not isinstance(lease, dict):
+            continue
+        provider = str(lease.get("provider") or route_debug.get("last_provider") or "").strip().lower()
+        model = str(lease.get("model") or route_debug.get("last_model") or "").strip()
+        if not provider or not model:
+            continue
+        key = (provider, model)
+        updated_at = int(payload.get("updated_at") or lease.get("last_success_at") or lease.get("selected_at") or 0)
+        fail_count = int(lease.get("fail_count") or 0)
+        error_text = str(route_debug.get("last_error") or lease.get("last_error") or "").strip()
+        failure_reason = str(route_debug.get("last_failure_reason") or lease.get("last_failure_reason") or "").strip()
+        selection_reason = str(lease.get("selection_reason") or route_debug.get("last_route_selection") or "").strip()
+        row = usage.setdefault(
+            key,
+            {
+                "recent_used_count": 0,
+                "recent_used_at": 0,
+                "last_error_message": "",
+                "last_error_code": "",
+                "last_failed_at": 0,
+                "consecutive_failures": 0,
+                "failure_kind": "",
+                "selection_reason": "",
+            },
+        )
+        row["recent_used_count"] = int(row.get("recent_used_count") or 0) + 1
+        row["recent_used_at"] = max(int(row.get("recent_used_at") or 0), updated_at)
+        row["consecutive_failures"] = max(int(row.get("consecutive_failures") or 0), fail_count)
+        if selection_reason and not row.get("selection_reason"):
+            row["selection_reason"] = selection_reason
+        if error_text:
+            row["last_error_message"] = error_text
+            row["last_failed_at"] = max(int(row.get("last_failed_at") or 0), updated_at)
+            row["failure_kind"] = _normalize_failure_kind(error_text, failure_reason)
+    return usage
 
 
 def get_feishu_tool_capabilities() -> set[str]:
@@ -556,6 +637,7 @@ def build_model_registry(force_refresh: bool = False) -> Dict[str, Any]:
         from agent.models_dev import get_model_info
     except Exception:
         get_model_info = None
+    usage_map = _build_recent_model_usage(limit=500)
 
     for provider, candidates in provider_candidates.items():
         for rank, model_id in enumerate(candidates, start=1):
@@ -565,13 +647,27 @@ def build_model_registry(force_refresh: bool = False) -> Dict[str, Any]:
                     info = get_model_info(provider, model_id)
                 except Exception:
                     info = None
+            usage = usage_map.get((provider, model_id), {})
+            failure_kind = str(usage.get("failure_kind") or "").strip()
+            consecutive_failures = int(usage.get("consecutive_failures") or 0)
+            is_hard_failure = failure_kind in {"invalid_model", "provider_config_error", "auth_error"}
+            status = "active"
+            hidden = False
+            is_available = True
+            if is_hard_failure:
+                status = "invalid" if failure_kind == "invalid_model" else "inactive"
+                hidden = True
+                is_available = False
+            elif failure_kind:
+                status = "degraded"
+            generated_command = f"/model {model_id} --provider {provider}"
             registry_entries.append(
                 {
                     "provider": provider,
                     "model": model_id,
                     "display_name": getattr(info, "display_name", None) or model_id,
                     "is_free": provider == "nvidia" or model_id.endswith(":free") or model_id == "openrouter/free",
-                    "is_available": True,
+                    "is_available": is_available,
                     "rank": rank,
                     "last_probe_at": int(routing_state.get("refreshed_at") or now) if isinstance(routing_state, dict) else now,
                     "latency_ms": None,
@@ -579,11 +675,35 @@ def build_model_registry(force_refresh: bool = False) -> Dict[str, Any]:
                     "reasoning": bool(getattr(info, "reasoning", False)) if info is not None else None,
                     "manual_pinned": rank == 1,
                     "selection_hint": "recommended" if rank == 1 else ("fallback" if rank > 3 else "candidate"),
+                    "status": status,
+                    "hidden": hidden,
+                    "recent_used": bool(usage.get("recent_used_count")),
+                    "recent_used_count": int(usage.get("recent_used_count") or 0),
+                    "recent_used_at": int(usage.get("recent_used_at") or 0) or None,
+                    "generated_command": generated_command,
+                    "last_error_code": str(usage.get("last_error_code") or "").strip(),
+                    "last_error_message": str(usage.get("last_error_message") or "").strip(),
+                    "last_failed_at": int(usage.get("last_failed_at") or 0) or None,
+                    "consecutive_failures": consecutive_failures,
+                    "failure_kind": failure_kind or None,
+                    "source": "routing_state" if isinstance(routing_state, dict) and routing_state.get("providers") else "curated-fallback",
                 }
             )
 
+    registry_entries.sort(
+        key=lambda item: (
+            bool(item.get("hidden")),
+            0 if item.get("recent_used") else 1,
+            0 if str(item.get("selection_hint") or "") == "recommended" else 1,
+            int(item.get("rank") or 9999),
+            str(item.get("provider") or ""),
+            str(item.get("model") or ""),
+        )
+    )
+
     payload = {
         "status": "ok",
+        "schema_version": _MODEL_REGISTRY_SCHEMA_VERSION,
         "generated_at": now,
         "refreshed_at": int(routing_state.get("refreshed_at") or now) if isinstance(routing_state, dict) else now,
         "source": "routing_state" if isinstance(routing_state, dict) and routing_state.get("providers") else "curated-fallback",
@@ -658,23 +778,10 @@ def mirror_model_registry_to_bitable(
         for item in (schema.get("items") or [])
         if isinstance(item, dict)
     }
-    expected_fields = {
-        "Provider",
-        "Model",
-        "Display Name",
-        "Is Free",
-        "Is Available",
-        "Rank",
-        "Last Probe At",
-        "Latency Ms",
-        "Context Window",
-        "Reasoning",
-        "Manual Pinned",
-        "Selection Hint",
-    }
-    missing_fields = sorted(name for name in expected_fields if name not in field_names)
-    if missing_fields:
-        raise RuntimeError(f"Bitable schema is missing fields required for mirroring: {', '.join(missing_fields)}")
+    required_fields = {"Provider", "Model"}
+    missing_required_fields = sorted(name for name in required_fields if name not in field_names)
+    if missing_required_fields:
+        raise RuntimeError(f"Bitable schema is missing required fields for mirroring: {', '.join(missing_required_fields)}")
 
     existing_records: list[dict[str, Any]] = []
     page_token = ""
@@ -706,8 +813,13 @@ def mirror_model_registry_to_bitable(
 
     created = 0
     updated = 0
+    hidden = 0
+    mirrored_keys: set[tuple[str, str]] = set()
+    current_sync_ts = int(registry_payload.get("generated_at") or time.time())
     for entry in registry_payload.get("entries") or []:
-        fields = {
+        key = (str(entry.get("provider") or "").strip().lower(), str(entry.get("model") or "").strip())
+        mirrored_keys.add(key)
+        raw_fields = {
             "Provider": entry.get("provider"),
             "Model": entry.get("model"),
             "Display Name": entry.get("display_name"),
@@ -720,8 +832,21 @@ def mirror_model_registry_to_bitable(
             "Reasoning": bool(entry.get("reasoning")) if entry.get("reasoning") is not None else None,
             "Manual Pinned": bool(entry.get("manual_pinned")),
             "Selection Hint": entry.get("selection_hint"),
+            "Status": entry.get("status"),
+            "Hidden": bool(entry.get("hidden")),
+            "Recent Used": bool(entry.get("recent_used")),
+            "Recent Used Count": int(entry.get("recent_used_count") or 0),
+            "Recent Used At": entry.get("recent_used_at"),
+            "Generated Command": entry.get("generated_command"),
+            "Last Error Code": entry.get("last_error_code"),
+            "Last Error Message": entry.get("last_error_message"),
+            "Last Failed At": entry.get("last_failed_at"),
+            "Consecutive Failures": int(entry.get("consecutive_failures") or 0),
+            "Failure Kind": entry.get("failure_kind"),
+            "Last Sync At": current_sync_ts,
         }
-        record_id = existing_lookup.get((str(entry.get("provider") or "").strip().lower(), str(entry.get("model") or "").strip()))
+        fields = {name: value for name, value in raw_fields.items() if name in field_names}
+        record_id = existing_lookup.get(key)
         if record_id:
             client.request_json(
                 "PUT",
@@ -736,10 +861,61 @@ def mirror_model_registry_to_bitable(
                 json_body={"fields": fields},
             )
             created += 1
+
+    for key, record_id in existing_lookup.items():
+        if key in mirrored_keys:
+            continue
+        raw_fields = {
+            "Status": "inactive",
+            "Hidden": True,
+            "Is Available": False,
+            "Last Sync At": current_sync_ts,
+            "Last Error Message": "Model missing from current Hermes registry snapshot",
+            "Failure Kind": "not_in_snapshot",
+        }
+        fields = {name: value for name, value in raw_fields.items() if name in field_names}
+        if not fields:
+            continue
+        client.request_json(
+            "PUT",
+            f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/records/{record_id}",
+            json_body={"fields": fields},
+        )
+        hidden += 1
     return {
         "mirrored": True,
         "created": created,
         "updated": updated,
+        "hidden": hidden,
+        "field_count": len(field_names),
+        "missing_optional_fields": sorted(
+            name
+            for name in {
+                "Display Name",
+                "Is Free",
+                "Is Available",
+                "Rank",
+                "Last Probe At",
+                "Latency Ms",
+                "Context Window",
+                "Reasoning",
+                "Manual Pinned",
+                "Selection Hint",
+                "Status",
+                "Hidden",
+                "Recent Used",
+                "Recent Used Count",
+                "Recent Used At",
+                "Generated Command",
+                "Last Error Code",
+                "Last Error Message",
+                "Last Failed At",
+                "Consecutive Failures",
+                "Failure Kind",
+                "Last Sync At",
+            }
+            if name not in field_names
+        ),
         "table_id": table_id,
         "app_token": app_token,
     }
