@@ -2699,6 +2699,17 @@ def _safe_chat_queue_depth() -> int | None:
         return None
 
 
+async def _safe_chat_queue_depth_async() -> int | None:
+    queue = _get_chat_queue()
+    try:
+        if hasattr(queue, "len") and hasattr(queue.len, "aio"):
+            return int(await queue.len.aio())  # type: ignore[union-attr]
+        return int(queue.len())
+    except Exception as exc:
+        logger.warning("Unable to read Modal chat queue depth: %s", exc)
+        return None
+
+
 def _load_chat_queue_claims() -> dict[str, Any]:
     payload = _load_json_file(CHAT_QUEUE_CLAIMS_PATH, {})
     return payload if isinstance(payload, dict) else {}
@@ -2856,6 +2867,45 @@ def _enqueue_chat_event(*, platform: str, partition: str, payload: dict[str, Any
         "partition": partition,
         "enqueued_at_ms": enqueued_at,
         "queue_depth": _safe_chat_queue_depth(),
+        **metadata,
+    }
+
+
+async def _enqueue_chat_event_async(
+    *,
+    platform: str,
+    partition: str,
+    payload: dict[str, Any],
+    metadata: dict[str, Any],
+) -> dict[str, Any]:
+    try:
+        queue = _get_chat_queue()
+    except Exception:
+        return _enqueue_chat_event(
+            platform=platform,
+            partition=partition,
+            payload=payload,
+            metadata=metadata,
+        )
+    enqueued_at = int(time.time() * 1000)
+    envelope = {
+        "platform": platform,
+        "partition": partition,
+        "payload": payload,
+        "metadata": metadata,
+        "enqueued_at_ms": enqueued_at,
+    }
+    partition_ttl = max(DEFAULT_CHAT_QUEUE_CLAIM_TTL_SECONDS, 3600)
+    if hasattr(queue, "put") and hasattr(queue.put, "aio"):
+        await queue.put.aio(envelope, partition=partition, partition_ttl=partition_ttl)  # type: ignore[union-attr]
+    else:
+        queue.put(envelope, partition=partition, partition_ttl=partition_ttl)
+    return {
+        "status": "enqueued",
+        "platform": platform,
+        "partition": partition,
+        "enqueued_at_ms": enqueued_at,
+        "queue_depth": await _safe_chat_queue_depth_async(),
         **metadata,
     }
 
@@ -3425,7 +3475,7 @@ def create_web_app():
             if chat_id:
                 await _send_telegram_message(settings.telegram_bot_token, chat_id, "Thinking...")
         context = _extract_telegram_queue_context(update)
-        enqueue_result = _enqueue_chat_event(
+        enqueue_result = await _enqueue_chat_event_async(
             platform="telegram",
             partition=context["partition"],
             payload=update,
@@ -3480,7 +3530,7 @@ def create_web_app():
                 event_id or "none",
             )
             context = _extract_feishu_queue_context(payload)
-            enqueue_result = _enqueue_chat_event(
+            enqueue_result = await _enqueue_chat_event_async(
                 platform="feishu",
                 partition=context["partition"],
                 payload=payload,
