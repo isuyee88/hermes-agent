@@ -42,9 +42,19 @@ logger = logging.getLogger(__name__)
 # Valid delivery platforms — used to validate user-supplied platform names
 # in cron delivery targets, preventing env var enumeration via crafted names.
 _KNOWN_DELIVERY_PLATFORMS = frozenset({
-    "telegram", "discord", "slack", "whatsapp", "signal",
+    "telegram", "qq", "discord", "slack", "whatsapp", "signal",
     "matrix", "mattermost", "homeassistant", "dingtalk", "feishu",
     "wecom", "sms", "email", "webhook", "bluebubbles",
+})
+_NON_LLM_PROVIDER_ALIASES = frozenset({
+    "tavily",
+    "exa",
+    "firecrawl",
+    "parallel",
+    "browserbase",
+    "browser-use",
+    "browser_use",
+    "serpapi",
 })
 
 from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run
@@ -91,7 +101,7 @@ def _resolve_delivery_target(job: dict) -> Optional[dict]:
             }
         # Origin missing (e.g. job created via API/script) — try each
         # platform's home channel as a fallback instead of silently dropping.
-        for platform_name in ("matrix", "telegram", "discord", "slack", "bluebubbles"):
+        for platform_name in ("matrix", "telegram", "qq", "discord", "slack", "bluebubbles"):
             chat_id = os.getenv(f"{platform_name.upper()}_HOME_CHANNEL", "")
             if chat_id:
                 logger.info(
@@ -224,6 +234,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
 
     platform_map = {
         "telegram": Platform.TELEGRAM,
+        "qq": Platform.QQ,
         "discord": Platform.DISCORD,
         "slack": Platform.SLACK,
         "whatsapp": Platform.WHATSAPP,
@@ -614,46 +625,53 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
 
         # Provider routing
         pr = _cfg.get("provider_routing", {})
-        smart_routing = _cfg.get("smart_model_routing", {}) or {}
 
         from hermes_cli.runtime_provider import (
             resolve_runtime_provider,
             format_runtime_provider_error,
         )
+        requested_provider = str(job.get("provider") or os.getenv("HERMES_INFERENCE_PROVIDER") or "").strip() or None
+        if requested_provider and requested_provider.lower() in _NON_LLM_PROVIDER_ALIASES:
+            logger.warning(
+                "Job '%s': ignoring non-LLM provider override '%s' and falling back to the default runtime provider",
+                job_id,
+                requested_provider,
+            )
+            requested_provider = None
         try:
-            runtime_kwargs = {
-                "requested": job.get("provider") or os.getenv("HERMES_INFERENCE_PROVIDER"),
-            }
+            runtime_kwargs = {}
+            if requested_provider:
+                runtime_kwargs["requested"] = requested_provider
             if job.get("base_url"):
                 runtime_kwargs["explicit_base_url"] = job.get("base_url")
             runtime = resolve_runtime_provider(**runtime_kwargs)
         except Exception as exc:
-            message = format_runtime_provider_error(exc)
-            raise RuntimeError(message) from exc
-
-        from agent.smart_model_routing import resolve_turn_route
-        turn_route = resolve_turn_route(
-            prompt,
-            smart_routing,
-            {
-                "model": model,
-                "api_key": runtime.get("api_key"),
-                "base_url": runtime.get("base_url"),
-                "provider": runtime.get("provider"),
-                "api_mode": runtime.get("api_mode"),
-                "command": runtime.get("command"),
-                "args": list(runtime.get("args") or []),
-            },
-        )
+            if requested_provider and "Unknown provider" in str(exc):
+                logger.warning(
+                    "Job '%s': provider '%s' is invalid for LLM runtime resolution; retrying with the default provider",
+                    job_id,
+                    requested_provider,
+                )
+                runtime_kwargs = {}
+                if job.get("base_url"):
+                    runtime_kwargs["explicit_base_url"] = job.get("base_url")
+                try:
+                    runtime = resolve_runtime_provider(**runtime_kwargs)
+                except Exception as retry_exc:
+                    message = format_runtime_provider_error(retry_exc)
+                    raise RuntimeError(message) from retry_exc
+            else:
+                message = format_runtime_provider_error(exc)
+                raise RuntimeError(message) from exc
 
         agent = AIAgent(
-            model=turn_route["model"],
-            api_key=turn_route["runtime"].get("api_key"),
-            base_url=turn_route["runtime"].get("base_url"),
-            provider=turn_route["runtime"].get("provider"),
-            api_mode=turn_route["runtime"].get("api_mode"),
-            acp_command=turn_route["runtime"].get("command"),
-            acp_args=turn_route["runtime"].get("args"),
+            model=model,
+            api_key=runtime.get("api_key"),
+            base_url=runtime.get("base_url"),
+            provider=runtime.get("provider"),
+            api_mode=runtime.get("api_mode"),
+            acp_command=runtime.get("command"),
+            acp_args=list(runtime.get("args") or []),
             max_iterations=max_iterations,
             reasoning_config=reasoning_config,
             prefill_messages=prefill_messages,

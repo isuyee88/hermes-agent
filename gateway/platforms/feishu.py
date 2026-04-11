@@ -18,6 +18,7 @@ Supports:
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import hmac
 import itertools
@@ -115,6 +116,36 @@ _MARKDOWN_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
 _MENTION_RE = re.compile(r"@_user_\d+")
 _MULTISPACE_RE = re.compile(r"[ \t]{2,}")
 _POST_CONTENT_INVALID_RE = re.compile(r"content format of the post type is incorrect", re.IGNORECASE)
+
+
+def _is_truthy(value: str | None, *, default: bool = False) -> bool:
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _mask_chat_id(chat_id: str) -> str:
+    raw = str(chat_id or "").strip()
+    if len(raw) <= 8:
+        return raw
+    return f"{raw[:4]}...{raw[-4:]}"
+
+
+def _trim_log_field(value: Any, *, limit: int = 120) -> str:
+    text = str(value or "")
+    return text if len(text) <= limit else f"{text[:limit]}..."
+
+
+def _feishu_send_audit_enabled() -> bool:
+    return _is_truthy(os.getenv("HERMES_FEISHU_SEND_AUDIT_LOG"), default=True)
+
+
+def _feishu_resolve_sender_names_enabled() -> bool:
+    return _is_truthy(os.getenv("HERMES_FEISHU_RESOLVE_SENDER_NAMES"), default=True)
+
+
+def _feishu_menu_open_id_fallback_enabled() -> bool:
+    return _is_truthy(os.getenv("HERMES_FEISHU_MENU_OPEN_BY_OPEN_ID"), default=True)
 # ---------------------------------------------------------------------------
 # Media type sets and upload constants
 # ---------------------------------------------------------------------------
@@ -169,6 +200,16 @@ _FEISHU_CARD_ACTION_DEDUP_TTL_SECONDS = 15 * 60    # card action token dedup win
 _FEISHU_BOT_MSG_TRACK_SIZE = 512                   # LRU size for tracking sent message IDs
 _FEISHU_REPLY_FALLBACK_CODES = frozenset({230011, 231003})  # reply target withdrawn/missing → create fallback
 _FEISHU_ACK_EMOJI = "OK"
+_FEISHU_MODEL_PICKER_PAGE_SIZE = 6
+_FEISHU_MENU_COMMANDS = {
+    "model_picker": "/model",
+    "model_switch": "/model",
+    "model_status": "/model",
+    "provider_status": "/provider",
+    "provider_openrouter": "/model --provider openrouter",
+    "provider_nvidia": "/model --provider nvidia",
+    "route_status": "/provider",
+}
 # ---------------------------------------------------------------------------
 # Fallback display strings
 # ---------------------------------------------------------------------------
@@ -259,6 +300,7 @@ class FeishuAdapterSettings:
     verification_token: str
     group_policy: str
     allowed_group_users: frozenset[str]
+    group_require_mention: bool
     bot_open_id: str
     bot_user_id: str
     bot_name: str
@@ -1034,8 +1076,12 @@ class FeishuAdapter(BasePlatformAdapter):
         self._event_handler: Optional[Any] = None
         self._seen_message_ids: Dict[str, float] = {}  # message_id → seen_at (time.time())
         self._seen_message_order: List[str] = []
+        self._inflight_message_ids: set[str] = set()  # message_id currently being processed
         self._dedup_state_path = get_hermes_home() / "feishu_seen_message_ids.json"
+        self._inflight_state_dir = get_hermes_home() / "feishu_inflight"
+        self._model_picker_state_path = get_hermes_home() / "feishu_model_picker_state.json"
         self._dedup_lock = threading.Lock()
+        self._ui_state_lock = threading.Lock()
         self._sender_name_cache: Dict[str, tuple[str, float]] = {}  # sender_id → (name, expire_at)
         self._webhook_rate_counts: Dict[str, tuple[int, float]] = {}  # rate_key → (count, window_start)
         self._webhook_anomaly_counts: Dict[str, tuple[int, str, float]] = {}  # ip → (count, last_status, first_seen)
@@ -1056,7 +1102,10 @@ class FeishuAdapter(BasePlatformAdapter):
         # Exec approval button state (approval_id → {session_key, message_id, chat_id})
         self._approval_state: Dict[int, Dict[str, str]] = {}
         self._approval_counter = itertools.count(1)
+        self._model_picker_state: Dict[str, Dict[str, Any]] = {}
+        self._model_picker_counter = itertools.count(1)
         self._load_seen_message_ids()
+        self._load_model_picker_state()
 
     @staticmethod
     def _load_settings(extra: Dict[str, Any]) -> FeishuAdapterSettings:
@@ -1080,6 +1129,28 @@ class FeishuAdapter(BasePlatformAdapter):
         # Default group policy (for groups not in group_rules)
         default_group_policy = str(extra.get("default_group_policy", "")).strip().lower()
 
+        env_allowed_group_users = {
+            item.strip()
+            for item in os.getenv("FEISHU_ALLOWED_USERS", "").split(",")
+            if item.strip()
+        }
+        extra_allowed_group_users_raw = extra.get("allowed_group_users", [])
+        extra_allowed_group_users: set[str] = set()
+        if isinstance(extra_allowed_group_users_raw, str):
+            extra_allowed_group_users = {
+                item.strip() for item in extra_allowed_group_users_raw.split(",") if item.strip()
+            }
+        elif isinstance(extra_allowed_group_users_raw, (list, tuple, set)):
+            extra_allowed_group_users = {
+                str(item).strip() for item in extra_allowed_group_users_raw if str(item).strip()
+            }
+        allowed_group_users = frozenset(env_allowed_group_users | extra_allowed_group_users)
+
+        raw_require_mention = str(
+            extra.get("group_require_mention", os.getenv("FEISHU_GROUP_REQUIRE_MENTION", "true"))
+        ).strip().lower()
+        group_require_mention = raw_require_mention in {"1", "true", "yes", "on"}
+
         return FeishuAdapterSettings(
             app_id=str(extra.get("app_id") or os.getenv("FEISHU_APP_ID", "")).strip(),
             app_secret=str(extra.get("app_secret") or os.getenv("FEISHU_APP_SECRET", "")).strip(),
@@ -1089,12 +1160,9 @@ class FeishuAdapter(BasePlatformAdapter):
             ).strip().lower(),
             encrypt_key=os.getenv("FEISHU_ENCRYPT_KEY", "").strip(),
             verification_token=os.getenv("FEISHU_VERIFICATION_TOKEN", "").strip(),
-            group_policy=os.getenv("FEISHU_GROUP_POLICY", "allowlist").strip().lower(),
-            allowed_group_users=frozenset(
-                item.strip()
-                for item in os.getenv("FEISHU_ALLOWED_USERS", "").split(",")
-                if item.strip()
-            ),
+            group_policy=str(extra.get("group_policy") or os.getenv("FEISHU_GROUP_POLICY", "allowlist")).strip().lower(),
+            allowed_group_users=allowed_group_users,
+            group_require_mention=group_require_mention,
             bot_open_id=os.getenv("FEISHU_BOT_OPEN_ID", "").strip(),
             bot_user_id=os.getenv("FEISHU_BOT_USER_ID", "").strip(),
             bot_name=os.getenv("FEISHU_BOT_NAME", "").strip(),
@@ -1144,6 +1212,7 @@ class FeishuAdapter(BasePlatformAdapter):
         self._verification_token = settings.verification_token
         self._group_policy = settings.group_policy
         self._allowed_group_users = set(settings.allowed_group_users)
+        self._group_require_mention = settings.group_require_mention
         self._admins = set(settings.admins)
         self._default_group_policy = settings.default_group_policy or settings.group_policy
         self._group_rules = settings.group_rules
@@ -1166,7 +1235,7 @@ class FeishuAdapter(BasePlatformAdapter):
     def _build_event_handler(self) -> Any:
         if EventDispatcherHandler is None:
             return None
-        return (
+        builder = (
             EventDispatcherHandler.builder(
                 self._encrypt_key,
                 self._verification_token,
@@ -1180,8 +1249,13 @@ class FeishuAdapter(BasePlatformAdapter):
                 lambda data: self._on_reaction_event("im.message.reaction.deleted_v1", data)
             )
             .register_p2_card_action_trigger(self._on_card_action_trigger)
-            .build()
         )
+        for attr in ("register_p1_application_bot_menu_v6", "register_p2_application_bot_menu_v6"):
+            register = getattr(builder, attr, None)
+            if callable(register):
+                builder = register(self._on_bot_menu_event)
+                break
+        return builder.build()
 
     async def connect(self) -> bool:
         """Connect to Feishu/Lark."""
@@ -1323,10 +1397,22 @@ class FeishuAdapter(BasePlatformAdapter):
         formatted = self.format_message(content)
         chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
         last_response = None
+        audit_enabled = _feishu_send_audit_enabled()
+        total_chunks = len(chunks)
 
         try:
-            for chunk in chunks:
+            for chunk_index, chunk in enumerate(chunks, start=1):
                 msg_type, payload = self._build_outbound_payload(chunk)
+                if audit_enabled:
+                    logger.warning(
+                        "[Feishu] send start chat=%s chunk=%d/%d msg_type=%s chars=%d reply_to=%s",
+                        _mask_chat_id(chat_id),
+                        chunk_index,
+                        total_chunks,
+                        msg_type,
+                        len(chunk or ""),
+                        bool(reply_to),
+                    )
                 try:
                     response = await self._feishu_send_with_retry(
                         chat_id=chat_id,
@@ -1359,9 +1445,30 @@ class FeishuAdapter(BasePlatformAdapter):
                         reply_to=reply_to,
                         metadata=metadata,
                     )
+                if audit_enabled:
+                    logger.warning(
+                        "[Feishu] send chunk done chat=%s chunk=%d/%d success=%s code=%s message_id=%s msg=%s",
+                        _mask_chat_id(chat_id),
+                        chunk_index,
+                        total_chunks,
+                        self._response_succeeded(response),
+                        _trim_log_field(getattr(response, "code", None), limit=32),
+                        _trim_log_field(self._extract_response_field(response, "message_id"), limit=64),
+                        _trim_log_field(getattr(response, "msg", ""), limit=160),
+                    )
                 last_response = response
 
-            return self._finalize_send_result(last_response, "send failed")
+            result = self._finalize_send_result(last_response, "send failed")
+            if audit_enabled:
+                logger.warning(
+                    "[Feishu] send final chat=%s success=%s message_id=%s error=%s chunks=%d",
+                    _mask_chat_id(chat_id),
+                    result.success,
+                    _trim_log_field(result.message_id, limit=64),
+                    _trim_log_field(result.error, limit=200),
+                    total_chunks,
+                )
+            return result
         except Exception as exc:
             logger.error("[Feishu] Send error: %s", exc, exc_info=True)
             return SendResult(success=False, error=str(exc))
@@ -1496,6 +1603,569 @@ class FeishuAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.warning("[Feishu] Failed to update approval card %s: %s", message_id, exc)
 
+    async def send_model_picker(
+        self,
+        chat_id: str,
+        providers: list,
+        current_model: str,
+        current_provider: str,
+        session_key: str,
+        on_model_selected,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send an interactive Feishu card for provider/model selection."""
+        if not self._client:
+            return SendResult(success=False, error="Not connected")
+
+        try:
+            picker_id = f"fp{next(self._model_picker_counter)}"
+            card = self._build_model_picker_provider_card(
+                providers=providers,
+                current_model=current_model,
+                current_provider=current_provider,
+                picker_id=picker_id,
+            )
+            payload = json.dumps(card, ensure_ascii=False)
+            response = await self._feishu_send_with_retry(
+                chat_id=chat_id,
+                msg_type="interactive",
+                payload=payload,
+                reply_to=None,
+                metadata=metadata,
+            )
+            result = self._finalize_send_result(response, "send_model_picker failed")
+            if result.success:
+                self._model_picker_state[picker_id] = {
+                    "picker_id": picker_id,
+                    "chat_id": chat_id,
+                    "message_id": result.message_id or "",
+                    "providers": list(providers or []),
+                    "session_key": session_key,
+                    "on_model_selected": on_model_selected,
+                    "current_model": current_model,
+                    "current_provider": current_provider,
+                    "selected_provider": None,
+                    "model_page": 0,
+                    "allowed_user_id": str((metadata or {}).get("user_id") or "").strip(),
+                }
+                self._persist_model_picker_state()
+            return result
+        except Exception as exc:
+            logger.warning("[Feishu] send_model_picker failed: %s", exc)
+            return SendResult(success=False, error=str(exc))
+
+    def _build_model_picker_provider_card(
+        self,
+        *,
+        providers: list,
+        current_model: str,
+        current_provider: str,
+        picker_id: str,
+    ) -> Dict[str, Any]:
+        rows: List[Dict[str, Any]] = []
+        rows.append(
+            {
+                "tag": "markdown",
+                "content": (
+                    f"Current model: {current_model or 'unknown'}\n"
+                    f"Current provider: {current_provider or 'unknown'}\n"
+                    "Tap a model name below to switch quickly. Use More when you need the longer list."
+                ),
+            }
+        )
+        for provider in providers:
+            provider_slug = str(provider.get("slug") or "").strip()
+            provider_name = str(provider.get("name") or provider_slug or "provider").strip()
+            preview_models = self._dedupe_preserving_order(list(provider.get("preview_models", []) or []))[:4]
+            recent_models = self._dedupe_preserving_order(list(provider.get("recent_models", []) or []))[:3]
+            total_models = int(provider.get("total_models") or len(provider.get("models", [])) or 0)
+            status_bits = ["current" if provider_slug == current_provider else "available"]
+            status_bits.append("ready" if provider.get("authenticated") else "not configured")
+            recent_text = ", ".join(recent_models) or "None yet"
+            rows.append(
+                {
+                    "tag": "markdown",
+                    "content": (
+                        f"**{provider_name}** ({provider_slug}) - {', '.join(status_bits)} - {total_models} models\n"
+                        f"Recent: {recent_text}"
+                    ),
+                }
+            )
+            provider_models = list(provider.get("models", []) or [])
+            quick_models = [
+                model_id
+                for model_id in self._dedupe_preserving_order([current_model] + recent_models + preview_models)
+                if model_id in provider_models
+            ][:4]
+            if quick_models:
+                rows.append(
+                    {
+                        "tag": "markdown",
+                        "content": "\n".join(
+                            f"{index + 1}. {model_id}" for index, model_id in enumerate(quick_models)
+                        ),
+                    }
+                )
+            quick_actions: List[Dict[str, Any]] = []
+            for model_id in quick_models:
+                try:
+                    model_index = provider_models.index(model_id)
+                except ValueError:
+                    continue
+                quick_actions.append(
+                    self._make_model_picker_button(
+                        label=self._shorten_model_picker_label(model_id),
+                        action_name="model_picker_select",
+                        picker_id=picker_id,
+                        extra={"provider": provider_slug, "index": model_index},
+                        btn_type="primary" if model_id == current_model else "default",
+                    )
+                )
+            for action_chunk in self._chunk_action_buttons(quick_actions, chunk_size=2):
+                rows.append({"tag": "action", "actions": action_chunk})
+            rows.append(
+                {
+                    "tag": "action",
+                    "actions": [
+                        self._make_model_picker_button(
+                            label=f"More {provider_name}",
+                            action_name="model_picker_provider",
+                            picker_id=picker_id,
+                            extra={"provider": provider_slug},
+                            btn_type="default",
+                        )
+                    ],
+                }
+            )
+        rows.append(
+            {
+                "tag": "action",
+                "actions": [
+                    self._make_model_picker_button(
+                        label="Cancel",
+                        action_name="model_picker_cancel",
+                        picker_id=picker_id,
+                        extra={},
+                        btn_type="danger",
+                    )
+                ],
+            }
+        )
+        return {
+            "config": {"wide_screen_mode": True},
+            "header": {
+                "title": {"content": "Model Configuration", "tag": "plain_text"},
+                "template": "orange",
+            },
+            "elements": rows,
+        }
+
+    def _build_model_picker_model_card(
+        self,
+        *,
+        state: Dict[str, Any],
+        provider_slug: str,
+        page: int,
+    ) -> Dict[str, Any]:
+        provider = next(
+            (p for p in state.get("providers", []) if p.get("slug") == provider_slug),
+            None,
+        )
+        if not provider:
+            return self._build_model_picker_status_card(
+                title="Model Picker Expired",
+                body="The selected provider is no longer available. Use /model to reopen the picker.",
+                template="red",
+            )
+
+        models = list(provider.get("models", []) or [])
+        total = len(models)
+        total_pages = max(1, (total + _FEISHU_MODEL_PICKER_PAGE_SIZE - 1) // _FEISHU_MODEL_PICKER_PAGE_SIZE)
+        page = max(0, min(page, total_pages - 1))
+        start = page * _FEISHU_MODEL_PICKER_PAGE_SIZE
+        end = min(start + _FEISHU_MODEL_PICKER_PAGE_SIZE, total)
+
+        action_rows: List[Dict[str, Any]] = []
+        visible_models = models[start:end]
+        if visible_models:
+            action_rows.append(
+                {
+                    "tag": "markdown",
+                    "content": "\n".join(
+                        f"{offset + 1}. {model_id}"
+                        for offset, model_id in enumerate(visible_models, start=start)
+                    ),
+                }
+            )
+        button_row: List[Dict[str, Any]] = []
+        for idx, model_id in enumerate(visible_models, start=start):
+            button_row.append(
+                self._make_model_picker_button(
+                    label=self._shorten_model_picker_label(model_id),
+                    action_name="model_picker_select",
+                    picker_id=state["picker_id"],
+                    extra={"provider": provider_slug, "index": idx},
+                    btn_type="primary" if model_id == state.get("current_model") else "default",
+                )
+            )
+            if len(button_row) == 2:
+                action_rows.append({"tag": "action", "actions": button_row})
+                button_row = []
+        if button_row:
+            action_rows.append({"tag": "action", "actions": button_row})
+
+        nav_actions = [
+            self._make_model_picker_button(
+                label="Back",
+                action_name="model_picker_back",
+                picker_id=state["picker_id"],
+                extra={},
+            )
+        ]
+        if page > 0:
+            nav_actions.append(
+                self._make_model_picker_button(
+                    label="Prev",
+                    action_name="model_picker_page",
+                    picker_id=state["picker_id"],
+                    extra={"provider": provider_slug, "page": page - 1},
+                )
+            )
+        if page < total_pages - 1:
+            nav_actions.append(
+                self._make_model_picker_button(
+                    label="Next",
+                    action_name="model_picker_page",
+                    picker_id=state["picker_id"],
+                    extra={"provider": provider_slug, "page": page + 1},
+                )
+            )
+        nav_actions.append(
+            self._make_model_picker_button(
+                label="Cancel",
+                action_name="model_picker_cancel",
+                picker_id=state["picker_id"],
+                extra={},
+                btn_type="danger",
+            )
+        )
+        action_rows.append({"tag": "action", "actions": nav_actions})
+
+        total_models = int(provider.get("total_models") or total)
+        action_rows.insert(
+            0,
+            {
+                "tag": "markdown",
+                "content": (
+                    f"Provider: {provider.get('name', provider_slug)} ({provider_slug})\n"
+                    f"Showing {start + 1}-{end} of {total_models} models."
+                ),
+            },
+        )
+        return {
+            "config": {"wide_screen_mode": True},
+            "header": {
+                "title": {
+                    "content": f"Select Model · {provider.get('name', provider_slug)}",
+                    "tag": "plain_text",
+                },
+                "template": "orange",
+            },
+            "elements": action_rows,
+        }
+
+    @staticmethod
+    def _build_model_picker_status_card(*, title: str, body: str, template: str = "green") -> Dict[str, Any]:
+        return {
+            "config": {"wide_screen_mode": True},
+            "header": {
+                "title": {"content": title, "tag": "plain_text"},
+                "template": template,
+            },
+            "elements": [{"tag": "markdown", "content": body}],
+        }
+
+    @staticmethod
+    def _shorten_model_picker_label(model_id: str) -> str:
+        text = str(model_id or "").strip()
+        if len(text) <= 32:
+            return text
+        if "/" in text:
+            provider, remainder = text.split("/", 1)
+            if len(remainder) <= 24:
+                return text
+            return f"{provider}/{remainder[:14]}...{remainder[-8:]}"
+        return text[:18] + "..." + text[-8:]
+
+    @staticmethod
+    def _dedupe_preserving_order(values: List[str]) -> List[str]:
+        seen: set[str] = set()
+        result: List[str] = []
+        for value in values:
+            item = str(value or "").strip()
+            if not item or item in seen:
+                continue
+            seen.add(item)
+            result.append(item)
+        return result
+
+    @staticmethod
+    def _chunk_action_buttons(actions: List[Dict[str, Any]], *, chunk_size: int = 2) -> List[List[Dict[str, Any]]]:
+        if chunk_size <= 0:
+            chunk_size = 2
+        return [actions[index:index + chunk_size] for index in range(0, len(actions), chunk_size)]
+
+    @staticmethod
+    def _make_model_picker_button(
+        *,
+        label: str,
+        action_name: str,
+        picker_id: str,
+        extra: Dict[str, Any],
+        btn_type: str = "default",
+    ) -> Dict[str, Any]:
+        value = {"hermes_action": action_name, "picker_id": picker_id}
+        value.update(extra or {})
+        return {
+            "tag": "button",
+            "text": {"tag": "plain_text", "content": label},
+            "type": btn_type,
+            "value": value,
+        }
+
+    async def _update_interactive_card(self, message_id: str, card: Dict[str, Any]) -> None:
+        if not self._client or not message_id:
+            return
+        payload = json.dumps(card, ensure_ascii=False)
+        body = self._build_update_message_body(msg_type="interactive", content=payload)
+        request = self._build_update_message_request(message_id=message_id, request_body=body)
+        await asyncio.to_thread(self._client.im.v1.message.update, request)
+
+    async def _handle_model_picker_action(self, action_value: Dict[str, Any], chat_id: str, open_id: str) -> bool:
+        picker_id = str(action_value.get("picker_id") or "").strip()
+        if not picker_id:
+            return False
+        state = self._get_model_picker_state_entry(picker_id)
+        if not state:
+            logger.debug("[Feishu] Model picker %s already expired", picker_id)
+            return True
+
+        allowed_user_id = str(state.get("allowed_user_id") or "").strip()
+        if allowed_user_id and open_id and open_id != allowed_user_id:
+            logger.info("[Feishu] Ignoring model picker action from non-owner user=%s picker=%s", open_id, picker_id)
+            return True
+
+        action_name = str(action_value.get("hermes_action") or "").strip()
+        message_id = str(state.get("message_id") or "").strip()
+        if action_name == "model_picker_provider":
+            provider_slug = str(action_value.get("provider") or "").strip()
+            state["selected_provider"] = provider_slug
+            state["model_page"] = 0
+            self._persist_model_picker_state()
+            await self._update_interactive_card(
+                message_id,
+                self._build_model_picker_model_card(state=state, provider_slug=provider_slug, page=0),
+            )
+            return True
+
+        if action_name == "model_picker_page":
+            provider_slug = str(action_value.get("provider") or state.get("selected_provider") or "").strip()
+            try:
+                page = int(action_value.get("page", 0))
+            except (TypeError, ValueError):
+                page = 0
+            state["selected_provider"] = provider_slug
+            state["model_page"] = page
+            self._persist_model_picker_state()
+            await self._update_interactive_card(
+                message_id,
+                self._build_model_picker_model_card(state=state, provider_slug=provider_slug, page=page),
+            )
+            return True
+
+        if action_name == "model_picker_back":
+            await self._update_interactive_card(
+                message_id,
+                self._build_model_picker_provider_card(
+                    providers=state.get("providers", []),
+                    current_model=str(state.get("current_model") or ""),
+                    current_provider=str(state.get("current_provider") or ""),
+                    picker_id=picker_id,
+                ),
+            )
+            return True
+
+        if action_name == "model_picker_cancel":
+            self._model_picker_state.pop(picker_id, None)
+            self._persist_model_picker_state()
+            await self._update_interactive_card(
+                message_id,
+                self._build_model_picker_status_card(
+                    title="Model Picker Closed",
+                    body="Use `/model` or the Feishu menu to open the picker again.",
+                    template="red",
+                ),
+            )
+            return True
+
+        if action_name == "model_picker_select":
+            provider_slug = str(action_value.get("provider") or state.get("selected_provider") or "").strip()
+            provider = next(
+                (p for p in state.get("providers", []) if p.get("slug") == provider_slug),
+                None,
+            )
+            if not provider:
+                await self._update_interactive_card(
+                    message_id,
+                    self._build_model_picker_status_card(
+                        title="Provider Missing",
+                        body="That provider is no longer available. Reopen the picker and try again.",
+                        template="red",
+                    ),
+                )
+                self._model_picker_state.pop(picker_id, None)
+                return True
+            models = list(provider.get("models", []) or [])
+            try:
+                index = int(action_value.get("index", -1))
+            except (TypeError, ValueError):
+                index = -1
+            if index < 0 or index >= len(models):
+                await self._update_interactive_card(
+                    message_id,
+                    self._build_model_picker_status_card(
+                        title="Model Missing",
+                        body="That model is no longer available. Reopen the picker and try again.",
+                        template="red",
+                    ),
+                )
+                self._model_picker_state.pop(picker_id, None)
+                return True
+            model_id = str(models[index] or "").strip()
+            callback = state.get("on_model_selected")
+            if callable(callback):
+                try:
+                    confirmation = await callback(chat_id, model_id, provider_slug)
+                except Exception as exc:
+                    logger.warning("[Feishu] Model picker callback failed: %s", exc, exc_info=True)
+                    confirmation = f"Error: {exc}"
+                if isinstance(confirmation, str):
+                    template = "green" if not confirmation.lower().startswith("error:") else "red"
+                    await self._update_interactive_card(
+                        message_id,
+                        self._build_model_picker_status_card(
+                            title="Model Updated" if template == "green" else "Model Switch Failed",
+                            body=confirmation,
+                            template=template,
+                        ),
+                    )
+            else:
+                await self._update_interactive_card(
+                    message_id,
+                    self._build_model_picker_status_card(
+                        title="Applying Model Switch",
+                        body=f"Switching to `{model_id}` via `{provider_slug}`...",
+                        template="orange",
+                    ),
+                )
+                await self._dispatch_model_picker_selection(
+                    chat_id=chat_id,
+                    open_id=open_id,
+                    model_id=model_id,
+                    provider_slug=provider_slug,
+                )
+            self._model_picker_state.pop(picker_id, None)
+            self._persist_model_picker_state()
+            return True
+
+        return False
+
+    async def _handle_bot_menu_event(self, data: Any) -> None:
+        """Route Feishu bot menu clicks as synthetic commands."""
+        event = getattr(data, "event", None)
+        header = getattr(data, "header", None)
+        event_key = str(getattr(event, "event_key", "") or getattr(header, "event_key", "") or "").strip()
+        synthetic_text = _FEISHU_MENU_COMMANDS.get(event_key)
+        if not synthetic_text:
+            logger.debug("[Feishu] Ignoring unsupported bot menu event_key=%s", event_key or "unknown")
+            return
+
+        operator = getattr(event, "operator", None)
+        operator_id = getattr(operator, "operator_id", None)
+        open_id = str(
+            getattr(operator_id, "open_id", "")
+            or getattr(operator, "open_id", "")
+            or getattr(event, "open_id", "")
+            or ""
+        ).strip()
+        chat = getattr(event, "chat", None)
+        context = getattr(event, "context", None)
+        chat_id = str(
+            getattr(chat, "chat_id", "")
+            or getattr(chat, "open_chat_id", "")
+            or getattr(context, "open_chat_id", "")
+            or getattr(event, "chat_id", "")
+            or getattr(event, "open_chat_id", "")
+            or ""
+        ).strip()
+        chat_type = str(
+            getattr(chat, "chat_type", "")
+            or getattr(event, "chat_type", "")
+            or "p2p"
+        ).strip().lower()
+        if not open_id:
+            logger.debug("[Feishu] Bot menu event missing chat_id/open_id")
+            return
+        used_open_id_fallback = False
+        if not chat_id and _feishu_menu_open_id_fallback_enabled():
+            chat_id = open_id
+            chat_type = "p2p"
+            used_open_id_fallback = True
+
+        sender_id = SimpleNamespace(open_id=open_id, user_id=None, union_id=None)
+        sender_profile = await self._resolve_sender_profile(sender_id)
+        if used_open_id_fallback:
+            chat_info = {
+                "chat_id": chat_id,
+                "name": sender_profile.get("user_name") or open_id,
+                "type": "dm",
+                "raw_type": "p2p",
+            }
+            logger.info(
+                "[Feishu] Bot menu event_key=%s missing chat_id; falling back to open_id delivery target %s",
+                event_key,
+                open_id,
+            )
+        else:
+            chat_info = await self.get_chat_info(chat_id)
+        source = self.build_source(
+            chat_id=chat_id,
+            chat_name=chat_info.get("name") or chat_id or "Feishu Chat",
+            chat_type=self._resolve_source_chat_type(chat_info=chat_info, event_chat_type=chat_type),
+            user_id=sender_profile["user_id"],
+            user_name=sender_profile["user_name"],
+            thread_id=None,
+            user_id_alt=sender_profile["user_id_alt"],
+        )
+        synthetic_event = MessageEvent(
+            text=synthetic_text,
+            message_type=MessageType.COMMAND,
+            source=source,
+            raw_message=data,
+            message_id=None,
+            timestamp=datetime.now(),
+        )
+        chat_lock = self._get_chat_lock(chat_id)
+        async with chat_lock:
+            logger.info(
+                "[Feishu] Routing bot menu event_key=%s from %s in %s as %s",
+                event_key,
+                open_id,
+                chat_id,
+                synthetic_text,
+            )
+            await self.handle_message(synthetic_event)
+
     async def send_voice(
         self,
         chat_id: str,
@@ -1570,6 +2240,15 @@ class FeishuAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=f"Image file not found: {image_path}")
 
         try:
+            audit_enabled = _feishu_send_audit_enabled()
+            if audit_enabled:
+                logger.warning(
+                    "[Feishu] image upload start chat=%s path=%s caption=%s reply_to=%s",
+                    _mask_chat_id(chat_id),
+                    os.path.basename(image_path),
+                    bool(caption),
+                    bool(reply_to),
+                )
             with open(image_path, "rb") as image_file:
                 body = self._build_image_upload_body(
                     image_type=_FEISHU_IMAGE_UPLOAD_TYPE,
@@ -1583,6 +2262,13 @@ class FeishuAdapter(BasePlatformAdapter):
                     upload_response,
                     default_message="image upload failed",
                     override_error="Feishu image upload missing image_key",
+                )
+            if audit_enabled:
+                logger.warning(
+                    "[Feishu] image upload complete chat=%s path=%s image_key=%s",
+                    _mask_chat_id(chat_id),
+                    os.path.basename(image_path),
+                    _trim_log_field(image_key, limit=64),
                 )
 
             if caption:
@@ -1605,7 +2291,17 @@ class FeishuAdapter(BasePlatformAdapter):
                     reply_to=reply_to,
                     metadata=metadata,
                 )
-            return self._finalize_send_result(message_response, "image send failed")
+            result = self._finalize_send_result(message_response, "image send failed")
+            if audit_enabled:
+                logger.warning(
+                    "[Feishu] image send final chat=%s path=%s success=%s message_id=%s error=%s",
+                    _mask_chat_id(chat_id),
+                    os.path.basename(image_path),
+                    result.success,
+                    _trim_log_field(result.message_id, limit=64),
+                    _trim_log_field(result.error, limit=200),
+                )
+            return result
         except Exception as exc:
             logger.error("[Feishu] Failed to send image %s: %s", image_path, exc, exc_info=True)
             return SendResult(success=False, error=str(exc))
@@ -1744,7 +2440,7 @@ class FeishuAdapter(BasePlatformAdapter):
             return
 
         message_id = getattr(message, "message_id", None)
-        if not message_id or self._is_duplicate(message_id):
+        if not message_id:
             logger.debug("[Feishu] Dropping duplicate/missing message_id: %s", message_id)
             return
         if getattr(sender, "sender_type", "") == "bot":
@@ -1756,13 +2452,22 @@ class FeishuAdapter(BasePlatformAdapter):
         if chat_type != "p2p" and not self._should_accept_group_message(message, sender_id, chat_id):
             logger.debug("[Feishu] Dropping group message that failed mention/policy gate: %s", message_id)
             return
-        await self._process_inbound_message(
-            data=data,
-            message=message,
-            sender_id=sender_id,
-            chat_type=chat_type,
-            message_id=message_id,
-        )
+        if not self._mark_message_inflight(message_id):
+            logger.debug("[Feishu] Dropping duplicate/inflight message_id: %s", message_id)
+            return
+        try:
+            await self._process_inbound_message(
+                data=data,
+                message=message,
+                sender_id=sender_id,
+                chat_type=chat_type,
+                message_id=message_id,
+            )
+        except Exception:
+            self._mark_message_processing_failed(message_id)
+            raise
+        else:
+            self._mark_message_processed(message_id)
 
     def _on_message_read_event(self, data: P2ImMessageMessageReadV1) -> None:
         """Ignore read-receipt events that Hermes does not act on."""
@@ -1831,6 +2536,19 @@ class FeishuAdapter(BasePlatformAdapter):
         if P2CardActionTriggerResponse is None:
             return None
         return P2CardActionTriggerResponse()
+
+    def _on_bot_menu_event(self, data: Any) -> Any:
+        """Schedule Feishu bot menu events on the adapter loop."""
+        loop = self._loop
+        if loop is None or bool(getattr(loop, "is_closed", lambda: False)()):
+            logger.warning("[Feishu] Dropping bot menu event before adapter loop is ready")
+            return None
+        future = asyncio.run_coroutine_threadsafe(
+            self._handle_bot_menu_event(data),
+            loop,
+        )
+        future.add_done_callback(self._log_background_failure)
+        return None
 
     async def _handle_reaction_event(self, event_type: str, data: Any) -> None:
         """Fetch the reacted-to message; if it was sent by this bot, emit a synthetic text event."""
@@ -1921,11 +2639,16 @@ class FeishuAdapter(BasePlatformAdapter):
 
         action = getattr(event, "action", None)
         action_tag = str(getattr(action, "tag", "") or "button")
-        action_value = getattr(action, "value", {}) or {}
+        action_value = self._normalize_card_action_value(getattr(action, "value", {}) or {})
 
         # --- Exec approval button intercept ---
         hermes_action = action_value.get("hermes_action") if isinstance(action_value, dict) else None
         if hermes_action:
+            if str(hermes_action).startswith("model_picker_"):
+                handled = await self._handle_model_picker_action(action_value, chat_id, open_id)
+                if handled:
+                    return
+
             approval_id = action_value.get("approval_id")
             state = self._approval_state.pop(approval_id, None)
             if not state:
@@ -1992,10 +2715,62 @@ class FeishuAdapter(BasePlatformAdapter):
             message_type=MessageType.COMMAND,
             source=source,
             raw_message=data,
-            message_id=token or str(uuid.uuid4()),
+            message_id=None,
             timestamp=datetime.now(),
         )
         logger.info("[Feishu] Routing card action %r from %s in %s as synthetic command", action_tag, open_id, chat_id)
+        await self._handle_message_with_guards(synthetic_event)
+
+    @staticmethod
+    def _normalize_card_action_value(value: Any) -> Dict[str, Any]:
+        if isinstance(value, dict):
+            return dict(value)
+        if hasattr(value, "__dict__"):
+            raw = {key: item for key, item in vars(value).items() if not key.startswith("_")}
+            if raw:
+                return raw
+        try:
+            parsed = json.loads(str(value))
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            pass
+        return {}
+
+    async def _dispatch_model_picker_selection(
+        self,
+        *,
+        chat_id: str,
+        open_id: str,
+        model_id: str,
+        provider_slug: str,
+    ) -> None:
+        sender_id = SimpleNamespace(open_id=open_id, user_id=None, union_id=None)
+        sender_profile = await self._resolve_sender_profile(sender_id)
+        chat_info = await self.get_chat_info(chat_id)
+        source = self.build_source(
+            chat_id=chat_id,
+            chat_name=chat_info.get("name") or chat_id or "Feishu Chat",
+            chat_type=self._resolve_source_chat_type(chat_info=chat_info, event_chat_type="p2p"),
+            user_id=sender_profile["user_id"],
+            user_name=sender_profile["user_name"],
+            thread_id=None,
+            user_id_alt=sender_profile["user_id_alt"],
+        )
+        synthetic_event = MessageEvent(
+            text=f"/model {model_id} --provider {provider_slug}",
+            message_type=MessageType.COMMAND,
+            source=source,
+            raw_message=None,
+            message_id=None,
+            timestamp=datetime.now(),
+        )
+        logger.info(
+            "[Feishu] Dispatching persisted model picker selection model=%s provider=%s chat=%s",
+            model_id,
+            provider_slug,
+            chat_id,
+        )
         await self._handle_message_with_guards(synthetic_event)
 
     # =========================================================================
@@ -2022,6 +2797,11 @@ class FeishuAdapter(BasePlatformAdapter):
         chat_id = getattr(event.source, "chat_id", "") or "" if event.source else ""
         chat_lock = self._get_chat_lock(chat_id)
         async with chat_lock:
+            logger.info(
+                "[Feishu] session lock acquired chat=%s message_id=%s",
+                _mask_chat_id(chat_id),
+                getattr(event, "message_id", "") or "",
+            )
             message_id = event.message_id
             if message_id:
                 await self._add_ack_reaction(message_id)
@@ -2358,14 +3138,6 @@ class FeishuAdapter(BasePlatformAdapter):
             return web.json_response({"challenge": payload.get("challenge", "")})
 
         # Verification token check — second layer of defence beyond signature (matches openclaw).
-        if self._verification_token:
-            header = payload.get("header") or {}
-            incoming_token = str(header.get("token") or payload.get("token") or "")
-            if not incoming_token or not hmac.compare_digest(incoming_token, self._verification_token):
-                logger.warning("[Feishu] Webhook rejected: invalid verification token from %s", remote_ip)
-                self._record_webhook_anomaly(remote_ip, "401-token")
-                return web.Response(status=401, text="Invalid verification token")
-
         # Timing-safe signature verification (only enforced when encrypt_key is set).
         if self._encrypt_key and not self._is_webhook_signature_valid(request.headers, body_bytes):
             logger.warning("[Feishu] Webhook rejected: invalid signature from %s", remote_ip)
@@ -2373,9 +3145,22 @@ class FeishuAdapter(BasePlatformAdapter):
             return web.Response(status=401, text="Invalid signature")
 
         if payload.get("encrypt"):
-            logger.error("[Feishu] Encrypted webhook payloads are not supported by Hermes webhook mode")
-            self._record_webhook_anomaly(remote_ip, "400-encrypted")
-            return web.json_response({"code": 400, "msg": "encrypted webhook payloads are not supported"}, status=400)
+            try:
+                payload = self._decrypt_webhook_payload(str(payload.get("encrypt") or ""))
+            except Exception as exc:
+                logger.error("[Feishu] Failed to decrypt encrypted webhook payload: %s", exc, exc_info=True)
+                self._record_webhook_anomaly(remote_ip, "400-encrypted")
+                return web.json_response({"code": 400, "msg": "failed to decrypt webhook payload"}, status=400)
+            if payload.get("type") == "url_verification":
+                return web.json_response({"challenge": payload.get("challenge", "")})
+
+        if self._verification_token:
+            header = payload.get("header") or {}
+            incoming_token = str(header.get("token") or payload.get("token") or "")
+            if not incoming_token or not hmac.compare_digest(incoming_token, self._verification_token):
+                logger.warning("[Feishu] Webhook rejected: invalid verification token from %s", remote_ip)
+                self._record_webhook_anomaly(remote_ip, "401-token")
+                return web.Response(status=401, text="Invalid verification token")
 
         self._clear_webhook_anomaly(remote_ip)
 
@@ -2393,6 +3178,8 @@ class FeishuAdapter(BasePlatformAdapter):
             self._on_reaction_event(event_type, data)
         elif event_type == "card.action.trigger":
             self._on_card_action_trigger(data)
+        elif event_type == "application.bot.menu_v6":
+            self._on_bot_menu_event(data)
         else:
             logger.debug("[Feishu] Ignoring webhook event type: %s", event_type or "unknown")
         return web.json_response({"code": 0, "msg": "ok"})
@@ -2417,6 +3204,34 @@ class FeishuAdapter(BasePlatformAdapter):
         except Exception:
             logger.debug("[Feishu] Signature verification raised an exception", exc_info=True)
             return False
+
+    def _decrypt_webhook_payload(self, encrypted_payload: str) -> Dict[str, Any]:
+        """Decrypt a base64-encoded Feishu webhook payload."""
+        if not encrypted_payload:
+            raise ValueError("encrypted webhook payload is empty")
+        if not self._encrypt_key:
+            raise ValueError("encrypt_key is required to decrypt webhook payloads")
+
+        try:
+            from cryptography.hazmat.backends import default_backend
+            from cryptography.hazmat.primitives import padding
+            from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+        except ImportError as exc:
+            raise RuntimeError("cryptography is required for Feishu webhook decryption") from exc
+
+        encrypted_bytes = base64.b64decode(encrypted_payload)
+        aes_key = hashlib.sha256(self._encrypt_key.encode("utf-8")).digest()
+        iv = aes_key[:16]
+        cipher = Cipher(algorithms.AES(aes_key), modes.CBC(iv), backend=default_backend())
+        decryptor = cipher.decryptor()
+        padded = decryptor.update(encrypted_bytes) + decryptor.finalize()
+
+        unpadder = padding.PKCS7(algorithms.AES.block_size).unpadder()
+        plaintext = unpadder.update(padded) + unpadder.finalize()
+        payload = json.loads(plaintext.decode("utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("decrypted webhook payload must be a JSON object")
+        return payload
 
     def _check_webhook_rate_limit(self, rate_key: str) -> bool:
         """Return False when the composite rate_key has exceeded _FEISHU_WEBHOOK_RATE_LIMIT_MAX.
@@ -2477,6 +3292,13 @@ class FeishuAdapter(BasePlatformAdapter):
 
     async def _enqueue_text_event(self, event: MessageEvent) -> None:
         """Debounce rapid Feishu text bursts into a single MessageEvent."""
+        # In short-lived event-loop runtimes (e.g. webhook workers), delayed
+        # flush tasks may be cancelled when the loop exits. Allow turning
+        # batching off by setting delay <= 0 to process text immediately.
+        if self._text_batch_delay_seconds <= 0:
+            await self._handle_message_with_guards(event)
+            return
+
         key = self._text_batch_key(event)
         existing = self._pending_text_batches.get(key)
         if existing is None:
@@ -2854,7 +3676,9 @@ class FeishuAdapter(BasePlatformAdapter):
         user_id = getattr(sender_id, "user_id", None) or None
         union_id = getattr(sender_id, "union_id", None) or None
         primary_id = open_id or user_id
-        display_name = await self._resolve_sender_name_from_api(primary_id or union_id)
+        display_name = None
+        if _feishu_resolve_sender_names_enabled():
+            display_name = await self._resolve_sender_name_from_api(primary_id or union_id)
         return {
             "user_id": primary_id,
             "user_name": display_name,
@@ -2992,6 +3816,8 @@ class FeishuAdapter(BasePlatformAdapter):
         """Require an explicit @mention before group messages enter the agent."""
         if not self._allow_group_message(sender_id, chat_id):
             return False
+        if not self._group_require_mention:
+            return True
         # @_all is Feishu's @everyone placeholder — always route to the bot.
         raw_content = getattr(message, "content", "") or ""
         if "@_all" in raw_content:
@@ -3101,21 +3927,189 @@ class FeishuAdapter(BasePlatformAdapter):
         except OSError:
             logger.warning("[Feishu] Failed to persist dedup state to %s", self._dedup_state_path, exc_info=True)
 
+    def _load_model_picker_state(self) -> None:
+        try:
+            payload = json.loads(self._model_picker_state_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return
+        except (OSError, json.JSONDecodeError):
+            logger.warning(
+                "[Feishu] Failed to load persisted model picker state from %s",
+                self._model_picker_state_path,
+                exc_info=True,
+            )
+            return
+        items = payload.get("pickers", {}) if isinstance(payload, dict) else {}
+        if not isinstance(items, dict):
+            return
+        self._model_picker_state.update(
+            {
+                str(picker_id): state
+                for picker_id, state in items.items()
+                if isinstance(picker_id, str) and isinstance(state, dict)
+            }
+        )
+
+    def _persist_model_picker_state(self) -> None:
+        try:
+            self._model_picker_state_path.parent.mkdir(parents=True, exist_ok=True)
+            with self._ui_state_lock:
+                payload = {
+                    "pickers": {
+                        picker_id: {
+                            key: value
+                            for key, value in state.items()
+                            if key != "on_model_selected"
+                        }
+                        for picker_id, state in self._model_picker_state.items()
+                    }
+                }
+                self._model_picker_state_path.write_text(
+                    json.dumps(payload, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+        except OSError:
+            logger.warning(
+                "[Feishu] Failed to persist model picker state to %s",
+                self._model_picker_state_path,
+                exc_info=True,
+            )
+
+    def _get_model_picker_state_entry(self, picker_id: str) -> Optional[Dict[str, Any]]:
+        state = self._model_picker_state.get(picker_id)
+        if state:
+            return state
+        self._load_model_picker_state()
+        return self._model_picker_state.get(picker_id)
+
+    def _inflight_marker_path(self, message_id: str) -> Path:
+        safe_message_id = re.sub(r"[^A-Za-z0-9_.-]", "_", str(message_id or "").strip())
+        return self._inflight_state_dir / f"{safe_message_id}.json"
+
+    def _claim_inflight_marker(self, message_id: str, now: float) -> bool:
+        marker_path = self._inflight_marker_path(message_id)
+        self._inflight_state_dir.mkdir(parents=True, exist_ok=True)
+        payload = json.dumps({"message_id": message_id, "claimed_at": now}, ensure_ascii=False)
+
+        for _ in range(2):
+            try:
+                fd = os.open(str(marker_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            except FileExistsError:
+                try:
+                    raw = marker_path.read_text(encoding="utf-8")
+                    marker_payload = json.loads(raw) if raw else {}
+                    claimed_at = float(marker_payload.get("claimed_at", 0.0))
+                except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                    claimed_at = 0.0
+                if claimed_at and (_FEISHU_DEDUP_TTL_SECONDS <= 0 or now - claimed_at < _FEISHU_DEDUP_TTL_SECONDS):
+                    return False
+                try:
+                    marker_path.unlink(missing_ok=True)
+                except OSError:
+                    return False
+                continue
+            except OSError:
+                logger.warning("[Feishu] Failed to claim inflight marker for %s", message_id, exc_info=True)
+                return False
+
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as fp:
+                    fp.write(payload)
+                return True
+            except OSError:
+                try:
+                    marker_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                logger.warning("[Feishu] Failed to persist inflight marker for %s", message_id, exc_info=True)
+                return False
+        return False
+
+    def _release_inflight_marker(self, message_id: str) -> None:
+        try:
+            self._inflight_marker_path(message_id).unlink(missing_ok=True)
+        except OSError:
+            logger.warning("[Feishu] Failed to release inflight marker for %s", message_id, exc_info=True)
+
     def _is_duplicate(self, message_id: str) -> bool:
+        """Legacy duplicate helper that also records newly seen message IDs.
+
+        Production inbound handling uses the explicit inflight/processed helpers.
+        Tests and a few debug call sites still rely on ``_is_duplicate`` to act
+        like a combined "check and remember" probe across adapter restarts.
+        """
         now = time.time()
         ttl = _FEISHU_DEDUP_TTL_SECONDS
         with self._dedup_lock:
             seen_at = self._seen_message_ids.get(message_id)
-            if seen_at is not None and (ttl <= 0 or now - seen_at < ttl):
+            if seen_at is not None:
+                if ttl <= 0 or now - seen_at < ttl:
+                    return True
+                self._seen_message_ids.pop(message_id, None)
+                try:
+                    self._seen_message_order.remove(message_id)
+                except ValueError:
+                    pass
+            self._load_seen_message_ids()
+            seen_at = self._seen_message_ids.get(message_id)
+            if seen_at is not None:
+                if ttl <= 0 or now - seen_at < ttl:
+                    return True
+                self._seen_message_ids.pop(message_id, None)
+                try:
+                    self._seen_message_order.remove(message_id)
+                except ValueError:
+                    pass
+            if message_id in self._inflight_message_ids:
                 return True
-            # Record with current wall-clock timestamp so TTL works across restarts.
             self._seen_message_ids[message_id] = now
+            try:
+                self._seen_message_order.remove(message_id)
+            except ValueError:
+                pass
             self._seen_message_order.append(message_id)
             while len(self._seen_message_order) > self._dedup_cache_size:
                 stale = self._seen_message_order.pop(0)
                 self._seen_message_ids.pop(stale, None)
             self._persist_seen_message_ids()
             return False
+
+    def _mark_message_inflight(self, message_id: str) -> bool:
+        now = time.time()
+        ttl = _FEISHU_DEDUP_TTL_SECONDS
+        with self._dedup_lock:
+            self._load_seen_message_ids()
+            seen_at = self._seen_message_ids.get(message_id)
+            if seen_at is not None and (ttl <= 0 or now - seen_at < ttl):
+                return False
+            if message_id in self._inflight_message_ids:
+                return False
+            if not self._claim_inflight_marker(message_id, now):
+                return False
+            self._inflight_message_ids.add(message_id)
+            return True
+
+    def _mark_message_processing_failed(self, message_id: str) -> None:
+        with self._dedup_lock:
+            self._inflight_message_ids.discard(message_id)
+            self._release_inflight_marker(message_id)
+
+    def _mark_message_processed(self, message_id: str) -> None:
+        now = time.time()
+        with self._dedup_lock:
+            self._inflight_message_ids.discard(message_id)
+            self._release_inflight_marker(message_id)
+            if message_id in self._seen_message_ids:
+                try:
+                    self._seen_message_order.remove(message_id)
+                except ValueError:
+                    pass
+            self._seen_message_ids[message_id] = now
+            self._seen_message_order.append(message_id)
+            while len(self._seen_message_order) > self._dedup_cache_size:
+                stale = self._seen_message_order.pop(0)
+                self._seen_message_ids.pop(stale, None)
+            self._persist_seen_message_ids()
 
     # =========================================================================
     # Outbound payload construction and send pipeline
@@ -3149,6 +4143,17 @@ class FeishuAdapter(BasePlatformAdapter):
             requested_message_type=outbound_message_type,
         )
         try:
+            audit_enabled = _feishu_send_audit_enabled()
+            if audit_enabled:
+                logger.warning(
+                    "[Feishu] file upload start chat=%s path=%s upload_type=%s msg_type=%s caption=%s reply_to=%s",
+                    _mask_chat_id(chat_id),
+                    display_name,
+                    upload_file_type,
+                    resolved_message_type,
+                    bool(caption),
+                    bool(reply_to),
+                )
             with open(file_path, "rb") as file_obj:
                 body = self._build_file_upload_body(
                     file_type=upload_file_type,
@@ -3163,6 +4168,13 @@ class FeishuAdapter(BasePlatformAdapter):
                     upload_response,
                     default_message="file upload failed",
                     override_error="Feishu file upload missing file_key",
+                )
+            if audit_enabled:
+                logger.warning(
+                    "[Feishu] file upload complete chat=%s path=%s file_key=%s",
+                    _mask_chat_id(chat_id),
+                    display_name,
+                    _trim_log_field(file_key, limit=64),
                 )
 
             if caption:
@@ -3186,7 +4198,17 @@ class FeishuAdapter(BasePlatformAdapter):
                     reply_to=reply_to,
                     metadata=metadata,
                 )
-            return self._finalize_send_result(message_response, "file send failed")
+            result = self._finalize_send_result(message_response, "file send failed")
+            if audit_enabled:
+                logger.warning(
+                    "[Feishu] file send final chat=%s path=%s success=%s message_id=%s error=%s",
+                    _mask_chat_id(chat_id),
+                    display_name,
+                    result.success,
+                    _trim_log_field(result.message_id, limit=64),
+                    _trim_log_field(result.error, limit=200),
+                )
+            return result
         except Exception as exc:
             logger.error("[Feishu] Failed to send file %s: %s", file_path, exc, exc_info=True)
             return SendResult(success=False, error=str(exc))
@@ -3201,6 +4223,7 @@ class FeishuAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]],
     ) -> Any:
         reply_in_thread = bool((metadata or {}).get("thread_id"))
+        receive_id_type = str((metadata or {}).get("receive_id_type") or "chat_id").strip() or "chat_id"
         if reply_to:
             body = self._build_reply_message_body(
                 content=payload,
@@ -3217,12 +4240,26 @@ class FeishuAdapter(BasePlatformAdapter):
             content=payload,
             uuid_value=str(uuid.uuid4()),
         )
-        request = self._build_create_message_request("chat_id", body)
+        request = self._build_create_message_request(receive_id_type, body)
         return await asyncio.to_thread(self._client.im.v1.message.create, request)
 
     @staticmethod
     def _response_succeeded(response: Any) -> bool:
         return bool(response and getattr(response, "success", lambda: False)())
+
+    @staticmethod
+    def _is_retryable_send_response(response: Any, msg_type: str) -> bool:
+        if FeishuAdapter._response_succeeded(response):
+            return False
+        code = getattr(response, "code", None)
+        message = str(getattr(response, "msg", "") or "")
+        if msg_type == "post" and _POST_CONTENT_INVALID_RE.search(message):
+            return False
+        if code == 429:
+            return True
+        if isinstance(code, int) and 400 <= code < 500:
+            return False
+        return True
 
     @staticmethod
     def _extract_response_field(response: Any, field_name: str) -> Any:
@@ -3345,6 +4382,7 @@ class FeishuAdapter(BasePlatformAdapter):
     ) -> Any:
         last_error: Optional[Exception] = None
         active_reply_to = reply_to
+        audit_enabled = _feishu_send_audit_enabled()
         for attempt in range(_FEISHU_SEND_ATTEMPTS):
             try:
                 response = await self._send_raw_message(
@@ -3374,7 +4412,36 @@ class FeishuAdapter(BasePlatformAdapter):
                             reply_to=None,
                             metadata=metadata,
                         )
-                return response
+                success = self._response_succeeded(response)
+                if audit_enabled:
+                    logger.warning(
+                        "[Feishu] send api attempt=%d/%d chat=%s msg_type=%s reply_to=%s success=%s code=%s message_id=%s msg=%s",
+                        attempt + 1,
+                        _FEISHU_SEND_ATTEMPTS,
+                        _mask_chat_id(chat_id),
+                        msg_type,
+                        bool(active_reply_to),
+                        success,
+                        _trim_log_field(getattr(response, "code", None), limit=32),
+                        _trim_log_field(self._extract_response_field(response, "message_id"), limit=64),
+                        _trim_log_field(getattr(response, "msg", ""), limit=160),
+                    )
+                if success or attempt >= _FEISHU_SEND_ATTEMPTS - 1:
+                    return response
+                if not self._is_retryable_send_response(response, msg_type):
+                    return response
+                wait_seconds = 2 ** attempt
+                logger.warning(
+                    "[Feishu] Send API non-success for chat %s (attempt %d/%d); retrying in %ds [code=%s msg=%s]",
+                    _mask_chat_id(chat_id),
+                    attempt + 1,
+                    _FEISHU_SEND_ATTEMPTS,
+                    wait_seconds,
+                    _trim_log_field(getattr(response, "code", None), limit=32),
+                    _trim_log_field(getattr(response, "msg", ""), limit=160),
+                )
+                await asyncio.sleep(wait_seconds)
+                continue
             except Exception as exc:
                 last_error = exc
                 if msg_type == "post" and _POST_CONTENT_INVALID_RE.search(str(exc)):

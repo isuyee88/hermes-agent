@@ -384,6 +384,12 @@ class SessionEntry:
     # survives gateway restarts (the old in-memory _pre_flushed_sessions
     # set was lost on restart, causing redundant re-flushes).
     memory_flushed: bool = False
+
+    # Session-level provider/model lease and debug metadata used to keep
+    # messaging turns on a stable route for cache locality and observability.
+    route_lease: Optional[Dict[str, Any]] = None
+    route_debug: Optional[Dict[str, Any]] = None
+    route_metrics: Optional[Dict[str, Any]] = None
     
     def to_dict(self) -> Dict[str, Any]:
         result = {
@@ -403,6 +409,9 @@ class SessionEntry:
             "estimated_cost_usd": self.estimated_cost_usd,
             "cost_status": self.cost_status,
             "memory_flushed": self.memory_flushed,
+            "route_lease": self.route_lease or None,
+            "route_debug": self.route_debug or {},
+            "route_metrics": self.route_metrics or {},
         }
         if self.origin:
             result["origin"] = self.origin.to_dict()
@@ -439,6 +448,9 @@ class SessionEntry:
             estimated_cost_usd=data.get("estimated_cost_usd", 0.0),
             cost_status=data.get("cost_status", "unknown"),
             memory_flushed=data.get("memory_flushed", False),
+            route_lease=data.get("route_lease"),
+            route_debug=data.get("route_debug") or {},
+            route_metrics=data.get("route_metrics") or {},
         )
 
 
@@ -811,6 +823,9 @@ class SessionStore:
         self,
         session_key: str,
         last_prompt_tokens: int = None,
+        route_lease: Optional[Dict[str, Any]] = None,
+        route_debug: Optional[Dict[str, Any]] = None,
+        route_metrics: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Update lightweight session metadata after an interaction."""
         with self._lock:
@@ -821,6 +836,12 @@ class SessionStore:
                 entry.updated_at = _now()
                 if last_prompt_tokens is not None:
                     entry.last_prompt_tokens = last_prompt_tokens
+                if route_lease is not None:
+                    entry.route_lease = route_lease
+                if route_debug is not None:
+                    entry.route_debug = route_debug
+                if route_metrics is not None:
+                    entry.route_metrics = route_metrics
                 self._save()
 
     def reset_session(self, session_key: str) -> Optional[SessionEntry]:

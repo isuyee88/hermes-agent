@@ -41,7 +41,11 @@ class TestSecureWrite:
         target = tmp_path / "secret.json"
         _secure_write(target, "data")
         mode = oct(target.stat().st_mode & 0o777)
-        assert mode == "0o600"
+        if os.name == "nt":
+            # Windows does not project ACL changes onto POSIX mode bits here.
+            assert mode in {"0o600", "0o666"}
+        else:
+            assert mode == "0o600"
 
 
 # ---------------------------------------------------------------------------
@@ -176,6 +180,24 @@ class TestApprovalFlow:
         with patch("gateway.pairing.PAIRING_DIR", tmp_path):
             store = PairingStore()
             assert store.is_approved("telegram", "nonexistent") is False
+
+    def test_approved_user_with_utf8_bom_file_is_readable(self, tmp_path):
+        approved_path = tmp_path / "telegram-approved.json"
+        approved_path.write_bytes(
+            json.dumps(
+                {
+                    "user1": {
+                        "user_name": "Alice",
+                        "approved_at": 123,
+                    }
+                },
+                ensure_ascii=False,
+                indent=2,
+            ).encode("utf-8-sig")
+        )
+        with patch("gateway.pairing.PAIRING_DIR", tmp_path):
+            store = PairingStore()
+            assert store.is_approved("telegram", "user1") is True
 
     def test_approve_removes_from_pending(self, tmp_path):
         with patch("gateway.pairing.PAIRING_DIR", tmp_path):

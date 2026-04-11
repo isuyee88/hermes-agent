@@ -47,7 +47,10 @@ import re
 import asyncio
 from typing import List, Dict, Any, Optional
 import httpx
-from firecrawl import Firecrawl
+try:
+    from firecrawl import Firecrawl
+except ImportError:
+    Firecrawl = None
 from agent.auxiliary_client import (
     async_call_llm,
     extract_content_or_reasoning,
@@ -123,6 +126,15 @@ def _is_backend_available(backend: str) -> bool:
 
 _firecrawl_client = None
 _firecrawl_client_config = None
+
+
+def _require_firecrawl_class():
+    """Return the Firecrawl client class when the optional dependency is installed."""
+    if Firecrawl is None:
+        raise ImportError(
+            "firecrawl is not installed. Install the optional Firecrawl dependency before using the Firecrawl backend."
+        )
+    return Firecrawl
 
 
 def _get_direct_firecrawl_config() -> Optional[tuple[Dict[str, str], tuple[str, Optional[str], Optional[str]]]]:
@@ -235,7 +247,8 @@ def _get_firecrawl_client():
     if _firecrawl_client is not None and _firecrawl_client_config == client_config:
         return _firecrawl_client
 
-    _firecrawl_client = Firecrawl(**kwargs)
+    firecrawl_cls = _require_firecrawl_class()
+    _firecrawl_client = firecrawl_cls(**kwargs)
     _firecrawl_client_config = client_config
     return _firecrawl_client
 
@@ -287,7 +300,7 @@ _TAVILY_BASE_URL = "https://api.tavily.com"
 def _tavily_request(endpoint: str, payload: dict) -> dict:
     """Send a POST request to the Tavily API.
 
-    Auth is provided via ``api_key`` in the JSON body (no header-based auth).
+    Auth follows Tavily's documented bearer-token scheme.
     Raises ``ValueError`` if ``TAVILY_API_KEY`` is not set.
     """
     api_key = os.getenv("TAVILY_API_KEY")
@@ -296,10 +309,17 @@ def _tavily_request(endpoint: str, payload: dict) -> dict:
             "TAVILY_API_KEY environment variable not set. "
             "Get your API key at https://app.tavily.com/home"
         )
-    payload["api_key"] = api_key
     url = f"{_TAVILY_BASE_URL}/{endpoint.lstrip('/')}"
     logger.info("Tavily %s request to %s", endpoint, url)
-    response = httpx.post(url, json=payload, timeout=60)
+    response = httpx.post(
+        url,
+        json=payload,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        timeout=60,
+    )
     response.raise_for_status()
     return response.json()
 

@@ -302,6 +302,22 @@ PLATFORM_HINTS = {
         "bubbles, and videos (.mp4) play inline. You can also include image "
         "URLs in markdown format ![alt](url) and they will be sent as native photos."
     ),
+    "feishu": (
+        "You are on a text messaging communication platform, Feishu/Lark. "
+        "Prefer plain text over markdown-heavy formatting so replies stay readable "
+        "in chat. You can send media files natively: to deliver a file to the user, "
+        "include MEDIA:/absolute/path/to/file in your response. Images (.png, .jpg, "
+        ".jpeg, .webp) are sent as native image messages, and documents such as "
+        ".pdf, .txt, .md, and .docx are sent as native file attachments. You can "
+        "also include image URLs in markdown format ![alt](url) and they will be "
+        "sent as native images when possible."
+    ),
+    "qq": (
+        "You are communicating through the QQ official bot platform. "
+        "Prefer plain text over markdown-heavy formatting. Keep replies concise "
+        "and easy to read in chat. Group replies are usually triggered by @mentions, "
+        "and direct replies should stay conversational and compact."
+    ),
     "discord": (
         "You are in a Discord server or group chat communicating with your user. "
         "You can send media files natively: include MEDIA:/absolute/path/to/file "

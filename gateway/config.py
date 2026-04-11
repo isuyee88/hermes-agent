@@ -49,6 +49,7 @@ class Platform(Enum):
     """Supported messaging platforms."""
     LOCAL = "local"
     TELEGRAM = "telegram"
+    QQ = "qq"
     DISCORD = "discord"
     WHATSAPP = "whatsapp"
     SLACK = "slack"
@@ -284,6 +285,9 @@ class GatewayConfig:
                 connected.append(platform)
             # Feishu uses extra dict for app credentials
             elif platform == Platform.FEISHU and config.extra.get("app_id"):
+                connected.append(platform)
+            # QQ official bot uses extra dict for app credentials
+            elif platform == Platform.QQ and config.extra.get("app_id"):
                 connected.append(platform)
             # WeCom uses extra dict for bot credentials
             elif platform == Platform.WECOM and config.extra.get("bot_id"):
@@ -699,6 +703,36 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             chat_id=telegram_home,
             name=os.getenv("TELEGRAM_HOME_CHANNEL_NAME", "Home"),
         )
+
+    # QQ official bot
+    qq_app_id = os.getenv("QQ_APP_ID")
+    qq_app_secret = os.getenv("QQ_APP_SECRET")
+    if qq_app_id and qq_app_secret:
+        if Platform.QQ not in config.platforms:
+            config.platforms[Platform.QQ] = PlatformConfig()
+        config.platforms[Platform.QQ].enabled = True
+        config.platforms[Platform.QQ].extra.update(
+            {
+                "app_id": qq_app_id,
+                "app_secret": qq_app_secret,
+                "connection_mode": os.getenv("QQ_CONNECTION_MODE", "webhook"),
+                "webhook_host": os.getenv("QQ_WEBHOOK_HOST", "0.0.0.0"),
+                "webhook_path": os.getenv("QQ_WEBHOOK_PATH", "/qq/webhook"),
+            }
+        )
+        qq_webhook_port = os.getenv("QQ_WEBHOOK_PORT", "")
+        if qq_webhook_port:
+            try:
+                config.platforms[Platform.QQ].extra["webhook_port"] = int(qq_webhook_port)
+            except ValueError:
+                pass
+        qq_home = os.getenv("QQ_HOME_CHANNEL")
+        if qq_home:
+            config.platforms[Platform.QQ].home_channel = HomeChannel(
+                platform=Platform.QQ,
+                chat_id=qq_home,
+                name=os.getenv("QQ_HOME_CHANNEL_NAME", "Home"),
+            )
     
     # Discord
     discord_token = os.getenv("DISCORD_BOT_TOKEN")

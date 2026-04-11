@@ -173,6 +173,22 @@ class TestResolveDeliveryTarget:
             "thread_id": None,
         }
 
+    def test_bare_qq_platform_falls_back_to_home_channel(self, monkeypatch):
+        monkeypatch.setenv("QQ_HOME_CHANNEL", "group:group-openid-1")
+        job = {
+            "deliver": "qq",
+            "origin": {
+                "platform": "discord",
+                "chat_id": "abc",
+            },
+        }
+
+        assert _resolve_delivery_target(job) == {
+            "platform": "qq",
+            "chat_id": "group:group-openid-1",
+            "thread_id": None,
+        }
+
 
 class TestDeliverResultWrapping:
     """Verify that cron deliveries are wrapped with header/footer and no longer mirrored."""
@@ -791,6 +807,48 @@ class TestRunJobConfigLogging:
 
 
 class TestRunJobPerJobOverrides:
+    def test_non_llm_provider_override_falls_back_to_default_runtime(self, tmp_path):
+        config_yaml = tmp_path / "config.yaml"
+        config_yaml.write_text(
+            "model:\n"
+            "  default: openrouter/free\n"
+            "  provider: openrouter\n"
+        )
+
+        job = {
+            "id": "search-job",
+            "name": "search",
+            "prompt": "Search the web for Levanta reliability.",
+            "provider": "tavily",
+        }
+
+        fake_db = MagicMock()
+        fake_runtime = {
+            "provider": "openrouter",
+            "api_mode": "chat_completions",
+            "base_url": "https://openrouter.ai/api/v1",
+            "api_key": "***",
+        }
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("dotenv.load_dotenv"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch("hermes_cli.runtime_provider.resolve_runtime_provider", return_value=fake_runtime) as runtime_mock, \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {"final_response": "ok"}
+            mock_agent_cls.return_value = mock_agent
+
+            success, output, final_response, error = run_job(job)
+
+        assert success is True
+        assert error is None
+        assert final_response == "ok"
+        assert "ok" in output
+        runtime_mock.assert_called_once_with()
+        assert mock_agent_cls.call_args.kwargs["provider"] == "openrouter"
+
     def test_job_level_model_provider_and_base_url_overrides_are_used(self, tmp_path):
         config_yaml = tmp_path / "config.yaml"
         config_yaml.write_text(

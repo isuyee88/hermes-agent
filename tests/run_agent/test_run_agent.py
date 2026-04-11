@@ -806,6 +806,104 @@ class TestBuildApiKwargs:
         kwargs = agent._build_api_kwargs(messages)
         assert kwargs["extra_body"]["provider"]["only"] == ["Anthropic"]
 
+    def test_openrouter_broadcast_trace_injected(self, agent, monkeypatch):
+        monkeypatch.setenv("OPENROUTER_BROADCAST_ENABLED", "true")
+        monkeypatch.setenv("OPENROUTER_BROADCAST_PRIVACY_MODE", "true")
+        agent.base_url = "https://openrouter.ai/api/v1"
+        agent._base_url_lower = agent.base_url.lower()
+        agent.provider = "openrouter"
+        agent.model = "qwen/qwen3-coder:free"
+        agent.platform = "feishu"
+        agent._user_id = "ou_1234567890"
+        agent._trace_session_key = "feishu:oc_test_chat"
+        agent._trace_metadata = {
+            "channel_type": "dm",
+            "route_selection": "sticky_hit",
+            "chat_id": "oc_raw_should_not_leak",
+        }
+
+        kwargs = agent._build_api_kwargs([{"role": "user", "content": "hi"}])
+
+        assert kwargs["user"].startswith("feishu:")
+        assert kwargs["extra_body"]["session_id"] == "feishu:oc_test_chat"
+        assert kwargs["extra_body"]["trace"]["platform"] == "feishu"
+        assert kwargs["extra_body"]["trace"]["channel_type"] == "dm"
+        assert kwargs["extra_body"]["trace"]["route_selection"] == "sticky_hit"
+        assert "chat_id" not in kwargs["extra_body"]["trace"]
+
+    def test_openrouter_broadcast_disabled_by_default(self, agent, monkeypatch):
+        monkeypatch.delenv("OPENROUTER_BROADCAST_ENABLED", raising=False)
+        agent.base_url = "https://openrouter.ai/api/v1"
+        agent._base_url_lower = agent.base_url.lower()
+        agent.provider = "openrouter"
+        agent._trace_session_key = "session-key"
+        agent._trace_metadata = {"channel_type": "dm"}
+
+        kwargs = agent._build_api_kwargs([{"role": "user", "content": "hi"}])
+
+        assert "user" not in kwargs
+        assert "session_id" not in kwargs.get("extra_body", {})
+        assert "trace" not in kwargs.get("extra_body", {})
+
+    def test_extract_openrouter_usage_metadata(self, agent):
+        agent.base_url = "https://openrouter.ai/api/v1"
+        agent._base_url_lower = agent.base_url.lower()
+        agent.provider = "openrouter"
+        response = SimpleNamespace(
+            id="gen_123",
+            model="google/gemma-4-31b-it",
+            usage=SimpleNamespace(
+                prompt_tokens=1200,
+                completion_tokens=80,
+                total_tokens=1280,
+                cost=0.0012,
+                usage=0.0012,
+                usage_upstream=0.0009,
+                prompt_tokens_details=SimpleNamespace(
+                    cached_tokens=900,
+                    cache_write_tokens=120,
+                ),
+                cost_details=SimpleNamespace(
+                    upstream_inference_cost=0.0009,
+                    cache_discount=0.0003,
+                ),
+            ),
+        )
+
+        payload = agent._extract_openrouter_usage_metadata(response)
+
+        assert payload["generation_id"] == "gen_123"
+        assert payload["cost"] == pytest.approx(0.0012)
+        assert payload["upstream_inference_cost"] == pytest.approx(0.0009)
+        assert payload["cache_discount"] == pytest.approx(0.0003)
+        assert payload["cached_tokens"] == 900
+        assert payload["cache_write_tokens"] == 120
+        assert payload["usage"] == pytest.approx(0.0012)
+        assert payload["usage_upstream"] == pytest.approx(0.0009)
+
+    def test_usage_summary_hook_includes_provider_usage(self, agent):
+        agent.base_url = "https://openrouter.ai/api/v1"
+        agent._base_url_lower = agent.base_url.lower()
+        agent.provider = "openrouter"
+        response = SimpleNamespace(
+            id="gen_456",
+            model="google/gemma-4-31b-it",
+            usage=SimpleNamespace(
+                prompt_tokens=100,
+                completion_tokens=20,
+                total_tokens=120,
+                cost=0.0004,
+                cost_details=SimpleNamespace(upstream_inference_cost=0.0003),
+                prompt_tokens_details=SimpleNamespace(cached_tokens=50, cache_write_tokens=10),
+            ),
+        )
+
+        payload = agent._extract_openrouter_usage_metadata(response)
+
+        assert payload["prompt_tokens"] == 100
+        assert payload["completion_tokens"] == 20
+        assert payload["total_tokens"] == 120
+
     def test_reasoning_config_default_openrouter(self, agent):
         """Default reasoning config for OpenRouter should be medium."""
         agent.base_url = "https://openrouter.ai/api/v1"

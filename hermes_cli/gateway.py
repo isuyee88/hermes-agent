@@ -1315,6 +1315,33 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False):
 # and prompts needed to configure a messaging platform.
 _PLATFORMS = [
     {
+        "key": "qq",
+        "label": "QQ Official Bot",
+        "emoji": "🐧",
+        "token_var": "QQ_APP_ID",
+        "setup_instructions": [
+            "1. Go to https://q.qq.com/#/ and create or open your QQ bot application",
+            "2. Copy the AppID and Secret from the bot credentials page",
+            "3. In the developer console, enable webhook callback mode",
+            "4. Set the callback URL to your Hermes deployment endpoint, e.g. https://<your-modal-app>/qq/webhook",
+            "5. Select the message events Hermes should receive, typically GROUP_AT_MESSAGE_CREATE and C2C_MESSAGE_CREATE",
+            "6. Restrict access with QQ_ALLOWED_USERS for production use",
+        ],
+        "vars": [
+            {"name": "QQ_APP_ID", "prompt": "App ID", "password": False,
+             "help": "The AppID from your QQ bot application."},
+            {"name": "QQ_APP_SECRET", "prompt": "App Secret", "password": True,
+             "help": "The Secret from your QQ bot application."},
+            {"name": "QQ_CONNECTION_MODE", "prompt": "Connection mode (default: webhook)", "password": False,
+             "help": "Hermes currently supports webhook mode for QQ production deployments."},
+            {"name": "QQ_ALLOWED_USERS", "prompt": "Allowed user IDs/openids (comma-separated, or empty)", "password": False,
+             "is_allowlist": True,
+             "help": "Restrict which QQ users can interact with Hermes."},
+            {"name": "QQ_HOME_CHANNEL", "prompt": "Home target (optional, e.g. c2c:USER_OPENID or group:GROUP_OPENID)", "password": False,
+             "help": "Target used for cron jobs and notifications."},
+        ],
+    },
+    {
         "key": "telegram",
         "label": "Telegram",
         "emoji": "📱",

@@ -305,6 +305,11 @@ SUPPORTED_DOCUMENT_TYPES = {
     ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
 }
 
+LOCAL_AUDIO_EXTENSIONS = {".ogg", ".opus", ".mp3", ".wav", ".m4a"}
+LOCAL_VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp"}
+LOCAL_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
+LOCAL_DOCUMENT_EXTENSIONS = set(SUPPORTED_DOCUMENT_TYPES.keys()) | {".doc", ".xls", ".ppt"}
+
 
 def get_document_cache_dir() -> Path:
     """Return the document cache directory, creating it if it doesn't exist."""
@@ -897,7 +902,7 @@ class BasePlatformAdapter(ABC):
         Detect bare local file paths in response text for native media delivery.
 
         Matches absolute paths (/...) and tilde paths (~/) ending in common
-        image or video extensions.  Validates each candidate with
+        image, video, or document extensions.  Validates each candidate with
         ``os.path.isfile()`` to avoid false positives from URLs or
         non-existent paths.
 
@@ -908,9 +913,12 @@ class BasePlatformAdapter(ABC):
             Tuple of (list of expanded file paths, cleaned text with the
             raw path strings removed).
         """
-        _LOCAL_MEDIA_EXTS = (
-            '.png', '.jpg', '.jpeg', '.gif', '.webp',
-            '.mp4', '.mov', '.avi', '.mkv', '.webm',
+        _LOCAL_MEDIA_EXTS = tuple(
+            sorted(
+                LOCAL_IMAGE_EXTENSIONS
+                | LOCAL_VIDEO_EXTENSIONS
+                | LOCAL_DOCUMENT_EXTENSIONS
+            )
         )
         ext_part = '|'.join(e.lstrip('.') for e in _LOCAL_MEDIA_EXTS)
 
@@ -958,6 +966,35 @@ class BasePlatformAdapter(ABC):
             cleaned = re.sub(r'\n{3,}', '\n\n', cleaned).strip()
 
         return paths, cleaned
+
+    @staticmethod
+    def classify_local_attachment(path: str) -> str:
+        """Classify a local attachment path for routing to the right send method."""
+        ext = Path(path).suffix.lower()
+        if ext in LOCAL_AUDIO_EXTENSIONS:
+            return "audio"
+        if ext in LOCAL_VIDEO_EXTENSIONS:
+            return "video"
+        if ext in LOCAL_IMAGE_EXTENSIONS:
+            return "image"
+        return "document"
+
+    @staticmethod
+    def _safe_local_path_for_log(path: str, max_len: int = 96) -> str:
+        """Return a local path safe for logs, preserving only the basename when long."""
+        text = str(path or "")
+        if len(text) <= max_len:
+            return text
+        basename = os.path.basename(text.rstrip("/\\"))
+        if not basename:
+            return text[:max_len]
+        prefix = ".../" if "/" in text else "..."
+        safe = f"{prefix}{basename}"
+        if len(safe) <= max_len:
+            return safe
+        if max_len <= 3:
+            return "." * max_len
+        return f"{safe[:max_len - 3]}..."
 
     async def _keep_typing(self, chat_id: str, interval: float = 2.0, metadata=None) -> None:
         """
@@ -1149,12 +1186,32 @@ class BasePlatformAdapter(ABC):
         enabling interruption support.
         """
         if not self._message_handler:
+            logger.warning(
+                "[%s] Dropping message because no message handler is registered "
+                "(chat=%s message_id=%s type=%s)",
+                self.name,
+                getattr(event.source, "chat_id", "") or "",
+                getattr(event, "message_id", "") or "",
+                getattr(getattr(event, "message_type", None), "value", getattr(event, "message_type", None)),
+            )
             return
         
         session_key = build_session_key(
             event.source,
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
+        )
+        logger.info(
+            "[%s] handle_message received session=%s chat=%s message_id=%s type=%s "
+            "active=%s pending=%d bg_tasks=%d",
+            self.name,
+            session_key,
+            getattr(event.source, "chat_id", "") or "",
+            getattr(event, "message_id", "") or "",
+            getattr(getattr(event, "message_type", None), "value", getattr(event, "message_type", None)),
+            session_key in self._active_sessions,
+            len(self._pending_messages),
+            len(self._background_tasks),
         )
         
         # Check if there's already an active handler for this session
@@ -1177,6 +1234,14 @@ class BasePlatformAdapter(ABC):
                 )
                 try:
                     _thread_meta = {"thread_id": event.source.thread_id} if event.source.thread_id else None
+                    logger.info(
+                        "[%s] Bypassing active-session guard for command /%s "
+                        "(session=%s message_id=%s)",
+                        self.name,
+                        cmd,
+                        session_key,
+                        getattr(event, "message_id", "") or "",
+                    )
                     response = await self._message_handler(event)
                     if response:
                         await self._send_with_retry(
@@ -1220,6 +1285,14 @@ class BasePlatformAdapter(ABC):
 
         # Spawn background task to process this message
         task = asyncio.create_task(self._process_message_background(event, session_key))
+        logger.info(
+            "[%s] Background task created session=%s chat=%s message_id=%s task=%s",
+            self.name,
+            session_key,
+            getattr(event.source, "chat_id", "") or "",
+            getattr(event, "message_id", "") or "",
+            hex(id(task)),
+        )
         try:
             self._background_tasks.add(task)
         except TypeError:
@@ -1269,17 +1342,42 @@ class BasePlatformAdapter(ABC):
         # Fall back to a new Event only if the entry was removed externally.
         interrupt_event = self._active_sessions.get(session_key) or asyncio.Event()
         self._active_sessions[session_key] = interrupt_event
-        
+        logger.info(
+            "[%s] Background task start session=%s chat=%s message_id=%s type=%s interrupted=%s",
+            self.name,
+            session_key,
+            getattr(event.source, "chat_id", "") or "",
+            getattr(event, "message_id", "") or "",
+            getattr(getattr(event, "message_type", None), "value", getattr(event, "message_type", None)),
+            interrupt_event.is_set(),
+        )
+
         # Start continuous typing indicator (refreshes every 2 seconds)
         _thread_metadata = {"thread_id": event.source.thread_id} if event.source.thread_id else None
         typing_task = asyncio.create_task(self._keep_typing(event.source.chat_id, metadata=_thread_metadata))
-        
+
         try:
             await self._run_processing_hook("on_processing_start", event)
 
             # Call the handler (this can take a while with tool calls)
+            logger.info(
+                "[%s] Background task invoking handler session=%s message_id=%s",
+                self.name,
+                session_key,
+                getattr(event, "message_id", "") or "",
+            )
             response = await self._message_handler(event)
-            
+            response_len = len(response) if isinstance(response, str) else 0
+            logger.info(
+                "[%s] Background task handler returned session=%s message_id=%s "
+                "has_response=%s response_len=%d",
+                self.name,
+                session_key,
+                getattr(event, "message_id", "") or "",
+                bool(response),
+                response_len,
+            )
+
             # Send response if any.  A None/empty response is normal when
             # streaming already delivered the text (already_sent=True) or
             # when the message was queued behind an active agent.  Log at
@@ -1343,6 +1441,14 @@ class BasePlatformAdapter(ABC):
                 # Send the text portion
                 if text_content:
                     logger.info("[%s] Sending response (%d chars) to %s", self.name, len(text_content), event.source.chat_id)
+                    logger.info(
+                        "[%s] Background task send start session=%s message_id=%s reply_to=%s chars=%d",
+                        self.name,
+                        session_key,
+                        getattr(event, "message_id", "") or "",
+                        getattr(event, "message_id", "") or "",
+                        len(text_content),
+                    )
                     result = await self._send_with_retry(
                         chat_id=event.source.chat_id,
                         content=text_content,
@@ -1350,6 +1456,16 @@ class BasePlatformAdapter(ABC):
                         metadata=_thread_metadata,
                     )
                     _record_delivery(result)
+                    logger.info(
+                        "[%s] Background task send complete session=%s message_id=%s "
+                        "success=%s send_message_id=%s error=%s",
+                        self.name,
+                        session_key,
+                        getattr(event, "message_id", "") or "",
+                        getattr(result, "success", False),
+                        getattr(result, "message_id", None),
+                        getattr(result, "error", None),
+                    )
 
                 # Human-like pacing delay between text and media
                 human_delay = self._get_human_delay()
@@ -1388,28 +1504,30 @@ class BasePlatformAdapter(ABC):
                         logger.error("[%s] Error sending image: %s", self.name, img_err, exc_info=True)
 
                 # Send extracted media files — route by file type
-                _AUDIO_EXTS = {'.ogg', '.opus', '.mp3', '.wav', '.m4a'}
-                _VIDEO_EXTS = {'.mp4', '.mov', '.avi', '.mkv', '.webm', '.3gp'}
-                _IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp', '.gif'}
-
                 for media_path, is_voice in media_files:
                     if human_delay > 0:
                         await asyncio.sleep(human_delay)
                     try:
-                        ext = Path(media_path).suffix.lower()
-                        if ext in _AUDIO_EXTS:
+                        attachment_kind = self.classify_local_attachment(media_path)
+                        logger.info(
+                            "[%s] Attachment dispatch source=media_tag kind=%s path=%s",
+                            self.name,
+                            attachment_kind,
+                            self._safe_local_path_for_log(media_path),
+                        )
+                        if attachment_kind == "audio":
                             media_result = await self.send_voice(
                                 chat_id=event.source.chat_id,
                                 audio_path=media_path,
                                 metadata=_thread_metadata,
                             )
-                        elif ext in _VIDEO_EXTS:
+                        elif attachment_kind == "video":
                             media_result = await self.send_video(
                                 chat_id=event.source.chat_id,
                                 video_path=media_path,
                                 metadata=_thread_metadata,
                             )
-                        elif ext in _IMAGE_EXTS:
+                        elif attachment_kind == "image":
                             media_result = await self.send_image_file(
                                 chat_id=event.source.chat_id,
                                 image_path=media_path,
@@ -1422,8 +1540,16 @@ class BasePlatformAdapter(ABC):
                                 metadata=_thread_metadata,
                             )
 
+                        logger.info(
+                            "[%s] Attachment dispatch complete source=media_tag kind=%s success=%s message_id=%s error=%s",
+                            self.name,
+                            attachment_kind,
+                            media_result.success,
+                            getattr(media_result, "message_id", None),
+                            getattr(media_result, "error", None),
+                        )
                         if not media_result.success:
-                            logger.warning("[%s] Failed to send media (%s): %s", self.name, ext, media_result.error)
+                            logger.warning("[%s] Failed to send media (%s): %s", self.name, attachment_kind, media_result.error)
                     except Exception as media_err:
                         logger.warning("[%s] Error sending media: %s", self.name, media_err)
 
@@ -1432,25 +1558,45 @@ class BasePlatformAdapter(ABC):
                     if human_delay > 0:
                         await asyncio.sleep(human_delay)
                     try:
-                        ext = Path(file_path).suffix.lower()
-                        if ext in _IMAGE_EXTS:
-                            await self.send_image_file(
+                        attachment_kind = self.classify_local_attachment(file_path)
+                        logger.info(
+                            "[%s] Attachment dispatch source=local_path kind=%s path=%s",
+                            self.name,
+                            attachment_kind,
+                            self._safe_local_path_for_log(file_path),
+                        )
+                        if attachment_kind == "image":
+                            result = await self.send_image_file(
                                 chat_id=event.source.chat_id,
                                 image_path=file_path,
                                 metadata=_thread_metadata,
                             )
-                        elif ext in _VIDEO_EXTS:
-                            await self.send_video(
+                        elif attachment_kind == "video":
+                            result = await self.send_video(
                                 chat_id=event.source.chat_id,
                                 video_path=file_path,
                                 metadata=_thread_metadata,
                             )
+                        elif attachment_kind == "audio":
+                            result = await self.send_voice(
+                                chat_id=event.source.chat_id,
+                                audio_path=file_path,
+                                metadata=_thread_metadata,
+                            )
                         else:
-                            await self.send_document(
+                            result = await self.send_document(
                                 chat_id=event.source.chat_id,
                                 file_path=file_path,
                                 metadata=_thread_metadata,
                             )
+                        logger.info(
+                            "[%s] Attachment dispatch complete source=local_path kind=%s success=%s message_id=%s error=%s",
+                            self.name,
+                            attachment_kind,
+                            result.success,
+                            getattr(result, "message_id", None),
+                            getattr(result, "error", None),
+                        )
                     except Exception as file_err:
                         logger.error("[%s] Error sending local file %s: %s", self.name, file_path, file_err)
 
@@ -1461,7 +1607,14 @@ class BasePlatformAdapter(ABC):
             # Check if there's a pending message that was queued during our processing
             if session_key in self._pending_messages:
                 pending_event = self._pending_messages.pop(session_key)
-                logger.debug("[%s] Processing queued message from interrupt", self.name)
+                logger.info(
+                    "[%s] Processing queued message from interrupt session=%s "
+                    "current_message_id=%s next_message_id=%s",
+                    self.name,
+                    session_key,
+                    getattr(event, "message_id", "") or "",
+                    getattr(pending_event, "message_id", "") or "",
+                )
                 # Clean up current session before processing pending
                 if session_key in self._active_sessions:
                     del self._active_sessions[session_key]
@@ -1476,6 +1629,12 @@ class BasePlatformAdapter(ABC):
                 
         except asyncio.CancelledError:
             await self._run_processing_hook("on_processing_complete", event, False)
+            logger.warning(
+                "[%s] Background task cancelled session=%s message_id=%s",
+                self.name,
+                session_key,
+                getattr(event, "message_id", "") or "",
+            )
             raise
         except Exception as e:
             await self._run_processing_hook("on_processing_complete", event, False)
@@ -1513,6 +1672,17 @@ class BasePlatformAdapter(ABC):
             # Clean up session tracking
             if session_key in self._active_sessions:
                 del self._active_sessions[session_key]
+            logger.info(
+                "[%s] Background task finish session=%s message_id=%s "
+                "delivery_attempted=%s delivery_succeeded=%s pending=%d bg_tasks=%d",
+                self.name,
+                session_key,
+                getattr(event, "message_id", "") or "",
+                delivery_attempted,
+                delivery_succeeded,
+                len(self._pending_messages),
+                len(self._background_tasks),
+            )
     
     async def cancel_background_tasks(self) -> None:
         """Cancel any in-flight background message-processing tasks.

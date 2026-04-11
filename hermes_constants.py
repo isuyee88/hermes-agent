@@ -5,7 +5,30 @@ without risk of circular imports.
 """
 
 import os
+import tempfile
 from pathlib import Path
+
+
+def _resolve_system_home() -> Path:
+    """Return a usable home directory even when HOME-style env vars are absent."""
+    try:
+        return Path.home()
+    except RuntimeError:
+        pass
+
+    for key in ("HOME", "USERPROFILE"):
+        candidate = os.getenv(key, "").strip()
+        if candidate:
+            return Path(candidate)
+
+    home_drive = os.getenv("HOMEDRIVE", "").strip()
+    home_path = os.getenv("HOMEPATH", "").strip()
+    if home_drive and home_path:
+        return Path(f"{home_drive}{home_path}")
+
+    # Some tests clear all home-related env vars. Fall back to a stable temp root
+    # so adapters can still initialize without crashing.
+    return Path(tempfile.gettempdir()) / "hermes-home"
 
 
 def get_hermes_home() -> Path:
@@ -14,7 +37,10 @@ def get_hermes_home() -> Path:
     Reads HERMES_HOME env var, falls back to ~/.hermes.
     This is the single source of truth — all other copies should import this.
     """
-    return Path(os.getenv("HERMES_HOME", Path.home() / ".hermes"))
+    override = os.getenv("HERMES_HOME", "").strip()
+    if override:
+        return Path(override)
+    return _resolve_system_home() / ".hermes"
 
 
 def get_optional_skills_dir(default: Path | None = None) -> Path:
@@ -66,8 +92,9 @@ def display_hermes_home() -> str:
     :func:`get_hermes_home` instead.
     """
     home = get_hermes_home()
+    system_home = _resolve_system_home()
     try:
-        return "~/" + str(home.relative_to(Path.home()))
+        return "~/" + str(home.relative_to(system_home))
     except ValueError:
         return str(home)
 

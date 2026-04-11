@@ -24,6 +24,7 @@ def _mock_event_dispatcher_builder(mock_handler_class):
     mock_builder.register_p2_im_message_reaction_created_v1 = Mock(return_value=mock_builder)
     mock_builder.register_p2_im_message_reaction_deleted_v1 = Mock(return_value=mock_builder)
     mock_builder.register_p2_card_action_trigger = Mock(return_value=mock_builder)
+    mock_builder.register_p1_application_bot_menu_v6 = Mock(return_value=mock_builder)
     mock_builder.build = Mock(return_value=object())
     mock_handler_class.builder = Mock(return_value=mock_builder)
     return mock_builder
@@ -727,6 +728,55 @@ class TestAdapterBehavior(unittest.TestCase):
         )
 
     @patch.dict(os.environ, {}, clear=True)
+    def test_build_event_handler_registers_bot_menu_processor_when_supported(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        calls = []
+
+        class _Builder:
+            def register_p2_im_message_message_read_v1(self, _handler):
+                calls.append("message_read")
+                return self
+
+            def register_p2_im_message_receive_v1(self, _handler):
+                calls.append("message_receive")
+                return self
+
+            def register_p2_im_message_reaction_created_v1(self, _handler):
+                calls.append("reaction_created")
+                return self
+
+            def register_p2_im_message_reaction_deleted_v1(self, _handler):
+                calls.append("reaction_deleted")
+                return self
+
+            def register_p2_card_action_trigger(self, _handler):
+                calls.append("card_action")
+                return self
+
+            def register_p1_application_bot_menu_v6(self, _handler):
+                calls.append("bot_menu")
+                return self
+
+            def build(self):
+                calls.append("build")
+                return "handler"
+
+        class _Dispatcher:
+            @staticmethod
+            def builder(_encrypt_key, _verification_token):
+                calls.append("builder")
+                return _Builder()
+
+        with patch("gateway.platforms.feishu.EventDispatcherHandler", _Dispatcher):
+            handler = adapter._build_event_handler()
+
+        self.assertEqual(handler, "handler")
+        self.assertIn("bot_menu", calls)
+
+    @patch.dict(os.environ, {}, clear=True)
     @unittest.skipUnless(_HAS_LARK_OAPI, "lark-oapi not installed")
     def test_add_ack_reaction_uses_ok_emoji(self):
         from gateway.config import PlatformConfig
@@ -878,6 +928,51 @@ class TestAdapterBehavior(unittest.TestCase):
                 "",
             )
         )
+
+    @patch.dict(
+        os.environ,
+        {
+            "FEISHU_GROUP_POLICY": "allowlist",
+            "FEISHU_ALLOWED_USERS": "ou_allowed",
+            "FEISHU_GROUP_REQUIRE_MENTION": "false",
+        },
+        clear=True,
+    )
+    def test_group_message_allowlist_can_skip_mention_when_configured(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        no_mention_message = SimpleNamespace(mentions=[], message_type="text", content='{"text":"hello"}')
+
+        self.assertTrue(
+            adapter._should_accept_group_message(
+                no_mention_message,
+                SimpleNamespace(open_id="ou_allowed", user_id=None),
+                "",
+            )
+        )
+
+    @patch.dict(
+        os.environ,
+        {
+            "FEISHU_GROUP_POLICY": "allowlist",
+            "FEISHU_ALLOWED_USERS": "ou_env_allowed",
+            "FEISHU_GROUP_REQUIRE_MENTION": "true",
+        },
+        clear=True,
+    )
+    def test_group_settings_merge_extra_allowed_users(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(
+            PlatformConfig(extra={"allowed_group_users": ["ou_pairing_allowed"], "group_require_mention": False})
+        )
+
+        self.assertIn("ou_env_allowed", adapter._allowed_group_users)
+        self.assertIn("ou_pairing_allowed", adapter._allowed_group_users)
+        self.assertFalse(adapter._group_require_mention)
 
     def test_per_group_allowlist_policy_gates_by_sender(self):
         from gateway.config import PlatformConfig
@@ -2119,6 +2214,21 @@ class TestAdapterBehavior(unittest.TestCase):
         )
 
     @patch.dict(os.environ, {}, clear=True)
+    def test_send_document_missing_file_reports_local_path(self):
+        with tempfile.TemporaryDirectory() as temp_home:
+            with patch.dict(os.environ, {"HERMES_HOME": temp_home}, clear=False):
+                from gateway.config import PlatformConfig
+                from gateway.platforms.feishu import FeishuAdapter
+
+                adapter = FeishuAdapter(PlatformConfig())
+                adapter._client = SimpleNamespace(im=SimpleNamespace(v1=SimpleNamespace()))
+
+                result = asyncio.run(adapter.send_document(chat_id="oc_chat", file_path="/tmp/missing-report.pdf"))
+
+        self.assertFalse(result.success)
+        self.assertIn("/tmp/missing-report.pdf", result.error)
+
+    @patch.dict(os.environ, {}, clear=True)
     def test_send_document_with_caption_uses_single_post_message(self):
         from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter
@@ -2224,6 +2334,21 @@ class TestAdapterBehavior(unittest.TestCase):
             captured["message_request"].request_body.content,
             '{"image_key": "img_123"}',
         )
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_send_image_file_missing_file_reports_local_path(self):
+        with tempfile.TemporaryDirectory() as temp_home:
+            with patch.dict(os.environ, {"HERMES_HOME": temp_home}, clear=False):
+                from gateway.config import PlatformConfig
+                from gateway.platforms.feishu import FeishuAdapter
+
+                adapter = FeishuAdapter(PlatformConfig())
+                adapter._client = SimpleNamespace(im=SimpleNamespace(v1=SimpleNamespace()))
+
+                result = asyncio.run(adapter.send_image_file(chat_id="oc_chat", image_path="/tmp/missing-image.png"))
+
+        self.assertFalse(result.success)
+        self.assertIn("/tmp/missing-image.png", result.error)
 
     @patch.dict(os.environ, {}, clear=True)
     def test_send_image_file_with_caption_uses_single_post_message(self):
@@ -2614,6 +2739,24 @@ class TestWebhookSecurity(unittest.TestCase):
         with patch.dict(os.environ, {"FEISHU_APP_ID": "cli", "FEISHU_APP_SECRET": "sec", "FEISHU_ENCRYPT_KEY": encrypt_key}, clear=True):
             return FeishuAdapter(PlatformConfig())
 
+    @staticmethod
+    def _encrypt_payload(encrypt_key: str, payload: dict) -> str:
+        import base64
+        import hashlib
+        from cryptography.hazmat.backends import default_backend
+        from cryptography.hazmat.primitives import padding
+        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+
+        plaintext = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        aes_key = hashlib.sha256(encrypt_key.encode("utf-8")).digest()
+        iv = aes_key[:16]
+        padder = padding.PKCS7(algorithms.AES.block_size).padder()
+        padded = padder.update(plaintext) + padder.finalize()
+        cipher = Cipher(algorithms.AES(aes_key), modes.CBC(iv), backend=default_backend())
+        encryptor = cipher.encryptor()
+        encrypted = encryptor.update(padded) + encryptor.finalize()
+        return base64.b64encode(encrypted).decode("utf-8")
+
     def test_signature_valid_passes(self):
         import hashlib
         from gateway.platforms.feishu import FeishuAdapter
@@ -2641,6 +2784,18 @@ class TestWebhookSecurity(unittest.TestCase):
     def test_signature_missing_headers_rejected(self):
         adapter = self._make_adapter("test_secret")
         self.assertFalse(adapter._is_webhook_signature_valid({}, b'{}'))
+
+    def test_decrypt_webhook_payload_round_trips(self):
+        encrypt_key = "test_secret"
+        adapter = self._make_adapter(encrypt_key)
+        original = {
+            "header": {"event_type": "im.message.receive_v1"},
+            "event": {"message": {"message_id": "om_enc"}},
+        }
+
+        encrypted = self._encrypt_payload(encrypt_key, original)
+
+        self.assertEqual(adapter._decrypt_webhook_payload(encrypted), original)
 
     def test_rate_limit_allows_requests_within_window(self):
         adapter = self._make_adapter()
@@ -2727,6 +2882,43 @@ class TestWebhookSecurity(unittest.TestCase):
         self.assertEqual(response.status, 200)
         self.assertIn(b"test_challenge_token", response.body)
 
+    @patch.dict(os.environ, {"FEISHU_ENCRYPT_KEY": "test_secret"}, clear=True)
+    def test_webhook_request_accepts_encrypted_payload(self):
+        import hashlib
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._on_message_event = Mock()
+
+        decrypted_payload = {
+            "header": {"event_type": "im.message.receive_v1"},
+            "event": {"message": {"message_id": "om_test"}},
+        }
+        outer_payload = {
+            "encrypt": self._encrypt_payload("test_secret", decrypted_payload),
+        }
+        body = json.dumps(outer_payload).encode("utf-8")
+        timestamp = "1700000000"
+        nonce = "abc123"
+        content = f"{timestamp}{nonce}test_secret" + body.decode("utf-8")
+        sig = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        request = SimpleNamespace(
+            remote="127.0.0.1",
+            content_length=None,
+            headers={
+                "x-lark-request-timestamp": timestamp,
+                "x-lark-request-nonce": nonce,
+                "x-lark-signature": sig,
+            },
+            read=AsyncMock(return_value=body),
+        )
+
+        response = asyncio.run(adapter._handle_webhook_request(request))
+
+        self.assertEqual(response.status, 200)
+        adapter._on_message_event.assert_called_once()
+
 
 class TestDedupTTL(unittest.TestCase):
     """Tests for TTL-aware deduplication."""
@@ -2784,6 +2976,133 @@ class TestDedupTTL(unittest.TestCase):
             adapter._load_seen_message_ids()
         self.assertIn("om_a", adapter._seen_message_ids)
         self.assertIn("om_b", adapter._seen_message_ids)
+
+
+class TestFeishuDedupLifecycle(unittest.TestCase):
+    @patch.dict(os.environ, {}, clear=True)
+    def test_inflight_message_is_treated_as_duplicate_until_released(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        with tempfile.TemporaryDirectory() as temp_home:
+            with patch.dict(os.environ, {"HERMES_HOME": temp_home}, clear=False):
+                adapter = FeishuAdapter(PlatformConfig())
+
+                self.assertTrue(adapter._mark_message_inflight("om_inflight"))
+                self.assertTrue(adapter._is_duplicate("om_inflight"))
+
+                adapter._mark_message_processing_failed("om_inflight")
+
+                self.assertFalse(adapter._is_duplicate("om_inflight"))
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_successful_message_processing_marks_message_seen_after_handler_finishes(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        with tempfile.TemporaryDirectory() as temp_home:
+            with patch.dict(os.environ, {"HERMES_HOME": temp_home}, clear=False):
+                adapter = FeishuAdapter(PlatformConfig())
+                adapter._process_inbound_message = AsyncMock()
+                message = SimpleNamespace(
+                    message_id="om_success",
+                    chat_type="p2p",
+                    chat_id="oc_chat",
+                )
+                sender_id = SimpleNamespace(open_id="ou_user", user_id=None, union_id=None)
+                sender = SimpleNamespace(sender_id=sender_id, sender_type="user")
+                data = SimpleNamespace(event=SimpleNamespace(message=message, sender=sender))
+
+                with patch.object(adapter, "_persist_seen_message_ids"):
+                    asyncio.run(adapter._handle_message_event_data(data))
+
+                adapter._process_inbound_message.assert_awaited_once()
+                self.assertNotIn("om_success", adapter._inflight_message_ids)
+                self.assertIn("om_success", adapter._seen_message_ids)
+                self.assertTrue(adapter._is_duplicate("om_success"))
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_failed_message_processing_releases_inflight_without_persisting_seen_state(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        with tempfile.TemporaryDirectory() as temp_home:
+            with patch.dict(os.environ, {"HERMES_HOME": temp_home}, clear=False):
+                adapter = FeishuAdapter(PlatformConfig())
+                message = SimpleNamespace(
+                    message_id="om_failure",
+                    chat_type="p2p",
+                    chat_id="oc_chat",
+                )
+                sender_id = SimpleNamespace(open_id="ou_user", user_id=None, union_id=None)
+                sender = SimpleNamespace(sender_id=sender_id, sender_type="user")
+                data = SimpleNamespace(event=SimpleNamespace(message=message, sender=sender))
+
+                with patch.object(adapter, "_persist_seen_message_ids"):
+                    adapter._process_inbound_message = AsyncMock(side_effect=RuntimeError("boom"))
+                    with self.assertRaisesRegex(RuntimeError, "boom"):
+                        asyncio.run(adapter._handle_message_event_data(data))
+
+                self.assertNotIn("om_failure", adapter._inflight_message_ids)
+                self.assertNotIn("om_failure", adapter._seen_message_ids)
+                self.assertFalse(adapter._is_duplicate("om_failure"))
+
+    @patch.dict(
+        os.environ,
+        {
+            "HERMES_FEISHU_TEXT_BATCH_DELAY_SECONDS": "0",
+        },
+        clear=True,
+    )
+    def test_zero_text_batch_delay_processes_text_event_immediately(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.base import MessageEvent, MessageType
+        from gateway.platforms.feishu import FeishuAdapter
+        from gateway.session import SessionSource
+
+        with tempfile.TemporaryDirectory() as temp_home:
+            with patch.dict(os.environ, {"HERMES_HOME": temp_home, "HERMES_FEISHU_TEXT_BATCH_DELAY_SECONDS": "0"}, clear=False):
+                adapter = FeishuAdapter(PlatformConfig())
+                adapter.handle_message = AsyncMock()
+                source = SessionSource(
+                    platform=adapter.platform,
+                    chat_id="oc_chat",
+                    chat_name="Feishu DM",
+                    chat_type="dm",
+                    user_id="ou_user",
+                    user_name="张三",
+                )
+
+                asyncio.run(
+                    adapter._dispatch_inbound_event(
+                        MessageEvent(
+                            text="fs-diag-immediate",
+                            message_type=MessageType.TEXT,
+                            source=source,
+                            message_id="om_now",
+                        )
+                    )
+                )
+
+                adapter.handle_message.assert_awaited_once()
+                self.assertEqual(adapter._pending_text_batches, {})
+                self.assertEqual(adapter._pending_text_batch_tasks, {})
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_inflight_marker_blocks_duplicate_across_adapter_instances(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        with tempfile.TemporaryDirectory() as temp_home:
+            with patch.dict(os.environ, {"HERMES_HOME": temp_home}, clear=False):
+                first = FeishuAdapter(PlatformConfig())
+                second = FeishuAdapter(PlatformConfig())
+
+                self.assertTrue(first._mark_message_inflight("om_shared"))
+                self.assertFalse(second._mark_message_inflight("om_shared"))
+
+                first._mark_message_processing_failed("om_shared")
+                self.assertTrue(second._mark_message_inflight("om_shared"))
 
 
 class TestGroupMentionAtAll(unittest.TestCase):
@@ -2922,3 +3241,339 @@ class TestSenderNameResolution(unittest.TestCase):
             result = asyncio.run(adapter._resolve_sender_name_from_api("ou_broken"))
 
         self.assertIsNone(result)
+
+
+class TestFeishuModelPickerAndMenu(unittest.TestCase):
+    @patch.dict(os.environ, {}, clear=True)
+    def test_send_model_picker_stores_picker_state(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.base import SendResult
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._client = object()
+        adapter._feishu_send_with_retry = AsyncMock(return_value=SimpleNamespace())
+        adapter._finalize_send_result = Mock(return_value=SendResult(success=True, message_id="om_picker"))
+
+        providers = [
+            {"slug": "openrouter", "name": "OpenRouter", "models": ["a", "b"], "total_models": 2, "is_current": True},
+            {"slug": "nvidia", "name": "NVIDIA", "models": ["c"], "total_models": 1, "is_current": False},
+        ]
+
+        async def _selected(_chat_id, _model_id, _provider_slug):
+            return "ok"
+
+        result = asyncio.run(
+            adapter.send_model_picker(
+                chat_id="oc_chat",
+                providers=providers,
+                current_model="a",
+                current_provider="openrouter",
+                session_key="agent:main:feishu:dm:oc_chat",
+                on_model_selected=_selected,
+                metadata={"user_id": "ou_owner"},
+            )
+        )
+
+        self.assertTrue(result.success)
+        self.assertEqual(len(adapter._model_picker_state), 1)
+        picker = next(iter(adapter._model_picker_state.values()))
+        self.assertEqual(picker["message_id"], "om_picker")
+        self.assertEqual(picker["allowed_user_id"], "ou_owner")
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_model_picker_provider_card_shows_model_ids_and_recent_models(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        card = adapter._build_model_picker_provider_card(
+            providers=[
+                {
+                    "slug": "openrouter",
+                    "name": "OpenRouter",
+                    "models": [
+                        "openai/gpt-4.1-mini",
+                        "google/gemma-3-27b-it:free",
+                        "anthropic/claude-opus-4.6",
+                    ],
+                    "preview_models": [
+                        "openai/gpt-4.1-mini",
+                        "google/gemma-3-27b-it:free",
+                        "anthropic/claude-opus-4.6",
+                    ],
+                    "recent_models": ["openai/gpt-4.1-mini", "anthropic/claude-opus-4.6"],
+                    "total_models": 3,
+                    "authenticated": True,
+                }
+            ],
+            current_model="openai/gpt-4.1-mini",
+            current_provider="openrouter",
+            picker_id="fp1",
+        )
+
+        markdown_blocks = [item["content"] for item in card["elements"] if item.get("tag") == "markdown"]
+        action_rows = [item for item in card["elements"] if item.get("tag") == "action"]
+
+        self.assertTrue(any("Current model: openai/gpt-4.1-mini" in block for block in markdown_blocks))
+        self.assertTrue(any("Recent: openai/gpt-4.1-mini, anthropic/claude-opus-4.6" in block for block in markdown_blocks))
+        self.assertTrue(any("1. openai/gpt-4.1-mini" in block for block in markdown_blocks))
+        self.assertTrue(any("2. anthropic/claude-opus-4.6" in block for block in markdown_blocks))
+        labels = [
+            action["text"]["content"]
+            for row in action_rows
+            for action in row.get("actions", [])
+            if action.get("tag") == "button"
+        ]
+        self.assertIn("More OpenRouter", labels)
+        self.assertIn("openai/gpt-4.1-mini", labels)
+        self.assertIn("anthropic/claude-opus-4.6", labels)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_model_picker_model_card_lists_full_model_ids(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        card = adapter._build_model_picker_model_card(
+            state={
+                "picker_id": "fp1",
+                "current_model": "anthropic/claude-opus-4.6",
+                "providers": [
+                    {
+                        "slug": "openrouter",
+                        "name": "OpenRouter",
+                        "models": [
+                            "openai/gpt-4.1-mini",
+                            "anthropic/claude-opus-4.6",
+                            "google/gemma-3-27b-it:free",
+                        ],
+                        "total_models": 3,
+                    }
+                ],
+            },
+            provider_slug="openrouter",
+            page=0,
+        )
+
+        markdown_blocks = [item["content"] for item in card["elements"] if item.get("tag") == "markdown"]
+        self.assertTrue(any("Provider: OpenRouter (openrouter)" in block for block in markdown_blocks))
+        self.assertTrue(any("1. openai/gpt-4.1-mini" in block for block in markdown_blocks))
+        self.assertTrue(any("2. anthropic/claude-opus-4.6" in block for block in markdown_blocks))
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_card_action_model_picker_select_invokes_callback_and_clears_state(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        callback = AsyncMock(return_value="Model switched to `test-model`")
+        adapter._update_interactive_card = AsyncMock()
+        adapter._model_picker_state["fp1"] = {
+            "picker_id": "fp1",
+            "chat_id": "oc_chat",
+            "message_id": "om_picker",
+            "providers": [
+                {"slug": "openrouter", "name": "OpenRouter", "models": ["test-model"]},
+            ],
+            "session_key": "agent:main:feishu:dm:oc_chat",
+            "on_model_selected": callback,
+            "current_model": "old-model",
+            "current_provider": "openrouter",
+            "selected_provider": "openrouter",
+            "model_page": 0,
+            "allowed_user_id": "ou_owner",
+        }
+
+        data = SimpleNamespace(
+            event=SimpleNamespace(
+                token="ca_1",
+                context=SimpleNamespace(open_chat_id="oc_chat"),
+                operator=SimpleNamespace(open_id="ou_owner"),
+                action=SimpleNamespace(
+                    tag="button",
+                    value={
+                        "hermes_action": "model_picker_select",
+                        "picker_id": "fp1",
+                        "provider": "openrouter",
+                        "index": 0,
+                    },
+                ),
+            )
+        )
+
+        asyncio.run(adapter._handle_card_action_event(data))
+
+        callback.assert_awaited_once_with("oc_chat", "test-model", "openrouter")
+        adapter._update_interactive_card.assert_awaited()
+        self.assertNotIn("fp1", adapter._model_picker_state)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_bot_menu_event_routes_to_synthetic_command(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter.handle_message = AsyncMock()
+        adapter._resolve_sender_profile = AsyncMock(
+            return_value={"user_id": "ou_user", "user_name": "Alice", "user_id_alt": None}
+        )
+        adapter.get_chat_info = AsyncMock(return_value={"chat_id": "oc_chat", "name": "Feishu DM", "type": "dm"})
+
+        data = SimpleNamespace(
+            header=SimpleNamespace(event_id="evt_menu"),
+            event=SimpleNamespace(
+                event_key="model_picker",
+                operator=SimpleNamespace(operator_id=SimpleNamespace(open_id="ou_user")),
+                chat=SimpleNamespace(chat_id="oc_chat", chat_type="p2p"),
+            ),
+        )
+
+        asyncio.run(adapter._handle_bot_menu_event(data))
+
+        adapter.handle_message.assert_awaited_once()
+        event = adapter.handle_message.await_args.args[0]
+        self.assertEqual(event.text, "/model")
+        self.assertEqual(event.source.chat_id, "oc_chat")
+        self.assertIsNone(event.message_id)
+
+    @patch.dict(os.environ, {"HERMES_FEISHU_MENU_OPEN_BY_OPEN_ID": "true"}, clear=True)
+    def test_bot_menu_event_falls_back_to_open_id_when_chat_missing(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter.handle_message = AsyncMock()
+        adapter._resolve_sender_profile = AsyncMock(
+            return_value={"user_id": "ou_user", "user_name": "Alice", "user_id_alt": None}
+        )
+        adapter.get_chat_info = AsyncMock()
+
+        data = SimpleNamespace(
+            header=SimpleNamespace(event_id="evt_menu"),
+            event=SimpleNamespace(
+                event_key="model_picker",
+                operator=SimpleNamespace(operator_id=SimpleNamespace(open_id="ou_user")),
+                context=SimpleNamespace(open_chat_id=""),
+            ),
+        )
+
+        asyncio.run(adapter._handle_bot_menu_event(data))
+
+        adapter.handle_message.assert_awaited_once()
+        adapter.get_chat_info.assert_not_called()
+        event = adapter.handle_message.await_args.args[0]
+        self.assertEqual(event.text, "/model")
+        self.assertEqual(event.source.chat_id, "ou_user")
+        self.assertEqual(event.source.chat_type, "dm")
+
+    @patch.dict(os.environ, {"HERMES_FEISHU_RESOLVE_SENDER_NAMES": "false"}, clear=True)
+    def test_resolve_sender_profile_skips_name_lookup_when_disabled(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._resolve_sender_name_from_api = AsyncMock(return_value="Should Not Be Used")
+
+        result = asyncio.run(
+            adapter._resolve_sender_profile(SimpleNamespace(open_id="ou_user", user_id=None, union_id="on_union"))
+        )
+
+        adapter._resolve_sender_name_from_api.assert_not_awaited()
+        self.assertEqual(result["user_id"], "ou_user")
+        self.assertIsNone(result["user_name"])
+        self.assertEqual(result["user_id_alt"], "on_union")
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_send_raw_message_supports_open_id_receive_type(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        captured = {}
+
+        class _MessageAPI:
+            def create(self, request):
+                captured["request"] = request
+                return SimpleNamespace(success=lambda: True, data=SimpleNamespace(message_id="om_open_id"))
+
+        adapter._client = SimpleNamespace(im=SimpleNamespace(v1=SimpleNamespace(message=_MessageAPI())))
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct):
+            response = asyncio.run(
+                adapter._send_raw_message(
+                    chat_id="ou_user",
+                    msg_type="interactive",
+                    payload='{"type":"template"}',
+                    reply_to=None,
+                    metadata={"receive_id_type": "open_id"},
+                )
+            )
+
+        self.assertTrue(response.success())
+        self.assertEqual(captured["request"].receive_id_type, "open_id")
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_card_action_uses_persisted_model_picker_state_across_adapter_restart(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        with tempfile.TemporaryDirectory() as temp_home:
+            with patch.dict(os.environ, {"HERMES_HOME": temp_home}, clear=False):
+                first = FeishuAdapter(PlatformConfig())
+                first._client = object()
+                first._feishu_send_with_retry = AsyncMock(return_value=SimpleNamespace())
+                first._finalize_send_result = Mock(return_value=SimpleNamespace(success=True, message_id="om_picker"))
+
+                providers = [
+                    {"slug": "openrouter", "name": "OpenRouter", "models": ["demo-model"], "total_models": 1, "is_current": True},
+                ]
+
+                async def _selected(_chat_id, _model_id, _provider_slug):
+                    return "ok"
+
+                asyncio.run(
+                    first.send_model_picker(
+                        chat_id="oc_chat",
+                        providers=providers,
+                        current_model="demo-model",
+                        current_provider="openrouter",
+                        session_key="agent:main:feishu:dm:oc_chat",
+                        on_model_selected=_selected,
+                        metadata={"user_id": "ou_owner"},
+                    )
+                )
+
+                second = FeishuAdapter(PlatformConfig())
+                second._update_interactive_card = AsyncMock()
+                second._dispatch_model_picker_selection = AsyncMock()
+
+                data = SimpleNamespace(
+                    event=SimpleNamespace(
+                        token="ca_1",
+                        context=SimpleNamespace(open_chat_id="oc_chat"),
+                        operator=SimpleNamespace(open_id="ou_owner"),
+                        action=SimpleNamespace(
+                            tag="button",
+                            value=SimpleNamespace(
+                                hermes_action="model_picker_select",
+                                picker_id="fp1",
+                                provider="openrouter",
+                                index=0,
+                            ),
+                        ),
+                    )
+                )
+
+                asyncio.run(second._handle_card_action_event(data))
+
+                second._dispatch_model_picker_selection.assert_awaited_once_with(
+                    chat_id="oc_chat",
+                    open_id="ou_owner",
+                    model_id="demo-model",
+                    provider_slug="openrouter",
+                )
+                self.assertNotIn("fp1", second._model_picker_state)

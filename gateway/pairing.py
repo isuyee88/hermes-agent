@@ -100,7 +100,9 @@ class PairingStore:
     def _load_json(self, path: Path) -> dict:
         if path.exists():
             try:
-                return json.loads(path.read_text(encoding="utf-8"))
+                # Accept UTF-8 with BOM so files edited on Windows (for example
+                # via PowerShell/Notepad) remain readable by the pairing store.
+                return json.loads(path.read_text(encoding="utf-8-sig"))
             except (json.JSONDecodeError, OSError):
                 return {}
         return {}

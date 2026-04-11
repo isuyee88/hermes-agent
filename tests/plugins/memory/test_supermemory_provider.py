@@ -402,6 +402,29 @@ def test_multi_container_system_prompt_includes_instructions(monkeypatch, tmp_pa
     assert "Use docs for documentation context." in block
 
 
+def test_system_prompt_prioritizes_memory_lookup_for_prior_context(monkeypatch, tmp_path):
+    monkeypatch.setenv("SUPERMEMORY_API_KEY", "test-key")
+    monkeypatch.setattr("plugins.memory.supermemory._SupermemoryClient", FakeClient)
+    p = SupermemoryMemoryProvider()
+    p.initialize("s1", hermes_home=str(tmp_path), platform="telegram")
+
+    block = p.system_prompt_block()
+
+    assert "earlier conversations" in block
+    assert "project names" in block
+    assert "before using filesystem, terminal, or web search" in block
+    assert "refined memory query" in block
+
+
+def test_search_schema_mentions_prior_memory_lookup():
+    from plugins.memory.supermemory import SEARCH_SCHEMA
+
+    description = SEARCH_SCHEMA["description"]
+    assert "filesystem or web search" in description
+    assert "project names" in description
+    assert "short keywords" in description
+
+
 def test_get_config_schema_minimal():
     """get_config_schema only returns the API key field."""
     p = SupermemoryMemoryProvider()

@@ -14,6 +14,7 @@ class DummyTelegramAdapter(BasePlatformAdapter):
     def __init__(self):
         super().__init__(PlatformConfig(enabled=True, token="fake-token"), Platform.TELEGRAM)
         self.sent = []
+        self.attachments = []
         self.typing = []
         self.processing_hooks = []
 
@@ -37,6 +38,46 @@ class DummyTelegramAdapter(BasePlatformAdapter):
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         self.typing.append({"chat_id": chat_id, "metadata": metadata})
         return None
+
+    async def send_image(self, chat_id, image_url, caption=None, reply_to=None, metadata=None):
+        self.attachments.append(
+            {
+                "kind": "image_url",
+                "chat_id": chat_id,
+                "image_url": image_url,
+                "caption": caption,
+                "reply_to": reply_to,
+                "metadata": metadata,
+            }
+        )
+        return SendResult(success=True, message_id="img-url")
+
+    async def send_image_file(self, chat_id, image_path, caption=None, reply_to=None, metadata=None):
+        self.attachments.append(
+            {
+                "kind": "image_file",
+                "chat_id": chat_id,
+                "image_path": image_path,
+                "caption": caption,
+                "reply_to": reply_to,
+                "metadata": metadata,
+            }
+        )
+        return SendResult(success=True, message_id="img-file")
+
+    async def send_document(self, chat_id, file_path, caption=None, file_name=None, reply_to=None, metadata=None):
+        self.attachments.append(
+            {
+                "kind": "document",
+                "chat_id": chat_id,
+                "file_path": file_path,
+                "caption": caption,
+                "file_name": file_name,
+                "reply_to": reply_to,
+                "metadata": metadata,
+            }
+        )
+        return SendResult(success=True, message_id="doc-1")
 
     async def get_chat_info(self, chat_id: str):
         return {"id": chat_id}
@@ -219,4 +260,79 @@ class TestBasePlatformTopicSessions:
         assert adapter.processing_hooks == [
             ("start", "1"),
             ("complete", "1", False),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_process_message_background_routes_local_document_path_as_attachment(self, monkeypatch):
+        adapter = DummyTelegramAdapter()
+
+        async def handler(_event):
+            await asyncio.sleep(0)
+            return "Report ready\n/tmp/output/report.pdf"
+
+        async def hold_typing(_chat_id, interval=2.0, metadata=None):
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr("os.path.isfile", lambda p: p == "/tmp/output/report.pdf")
+
+        adapter.set_message_handler(handler)
+        adapter._keep_typing = hold_typing
+
+        event = _make_event("-1001", "17585")
+        await adapter._process_message_background(event, build_session_key(event.source))
+
+        assert adapter.sent == [
+            {
+                "chat_id": "-1001",
+                "content": "Report ready",
+                "reply_to": "1",
+                "metadata": {"thread_id": "17585"},
+            }
+        ]
+        assert adapter.attachments == [
+            {
+                "kind": "document",
+                "chat_id": "-1001",
+                "file_path": "/tmp/output/report.pdf",
+                "caption": None,
+                "file_name": None,
+                "reply_to": None,
+                "metadata": {"thread_id": "17585"},
+            }
+        ]
+
+    @pytest.mark.asyncio
+    async def test_process_message_background_routes_image_url_as_native_attachment(self):
+        adapter = DummyTelegramAdapter()
+
+        async def handler(_event):
+            await asyncio.sleep(0)
+            return "Here is the chart\n![chart](https://example.com/chart.png)"
+
+        async def hold_typing(_chat_id, interval=2.0, metadata=None):
+            await asyncio.Event().wait()
+
+        adapter.set_message_handler(handler)
+        adapter._keep_typing = hold_typing
+
+        event = _make_event("-1001", "17585")
+        await adapter._process_message_background(event, build_session_key(event.source))
+
+        assert adapter.sent == [
+            {
+                "chat_id": "-1001",
+                "content": "Here is the chart",
+                "reply_to": "1",
+                "metadata": {"thread_id": "17585"},
+            }
+        ]
+        assert adapter.attachments == [
+            {
+                "kind": "image_url",
+                "chat_id": "-1001",
+                "image_url": "https://example.com/chart.png",
+                "caption": "chart",
+                "reply_to": None,
+                "metadata": {"thread_id": "17585"},
+            }
         ]

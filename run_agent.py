@@ -513,6 +513,8 @@ class AIAgent:
         checkpoint_max_snapshots: int = 50,
         pass_session_id: bool = False,
         persist_session: bool = True,
+        trace_session_key: str = None,
+        trace_metadata: Dict[str, Any] = None,
     ):
         """
         Initialize the AI Agent.
@@ -549,6 +551,8 @@ class AIAgent:
                 Example: [{"role": "user", "content": "Hi!"}, {"role": "assistant", "content": "Hello!"}]
             platform (str): The interface platform the user is on (e.g. "cli", "telegram", "discord", "whatsapp").
                 Used to inject platform-specific formatting hints into the system prompt.
+            trace_session_key (str): Stable session identifier for OpenRouter broadcast tracing.
+            trace_metadata (Dict): Optional sanitized metadata to attach to OpenRouter trace payloads.
             skip_context_files (bool): If True, skip auto-injection of SOUL.md, AGENTS.md, and .cursorrules
                 into the system prompt. Use this for batch processing and data generation to avoid
                 polluting trajectories with user-specific persona or project instructions.
@@ -567,6 +571,8 @@ class AIAgent:
         self.ephemeral_system_prompt = ephemeral_system_prompt
         self.platform = platform  # "cli", "telegram", "discord", "whatsapp", etc.
         self._user_id = user_id  # Platform user identifier (gateway sessions)
+        self._trace_session_key = str(trace_session_key or "").strip()
+        self._trace_metadata = dict(trace_metadata or {})
         # Pluggable print function — CLI replaces this with _cprint so that
         # raw ANSI status lines are routed through prompt_toolkit's renderer
         # instead of going directly to stdout where patch_stdout's StdoutProxy
@@ -1197,6 +1203,10 @@ class AIAgent:
         self.session_estimated_cost_usd = 0.0
         self.session_cost_status = "unknown"
         self.session_cost_source = "none"
+        self.session_billed_cost_usd = 0.0
+        self.session_upstream_inference_cost_usd = 0.0
+        self.session_cache_discount_usd = 0.0
+        self._last_provider_usage_metadata: dict[str, Any] = {}
         
         # ── Ollama num_ctx injection ──
         # Ollama defaults to 2048 context regardless of the model's capabilities.
@@ -1290,6 +1300,10 @@ class AIAgent:
         self.session_estimated_cost_usd = 0.0
         self.session_cost_status = "unknown"
         self.session_cost_source = "none"
+        self.session_billed_cost_usd = 0.0
+        self.session_upstream_inference_cost_usd = 0.0
+        self.session_cache_discount_usd = 0.0
+        self._last_provider_usage_metadata = {}
         
         # Turn counter (added after reset_session_state was first written — #2635)
         self._user_turn_count = 0
@@ -2341,6 +2355,90 @@ class AIAgent:
         summary["prompt_tokens"] = cu.prompt_tokens
         summary["total_tokens"] = cu.total_tokens
         return summary
+
+    @staticmethod
+    def _read_response_value(obj: Any, *path: str) -> Any:
+        current = obj
+        for part in path:
+            if current is None:
+                return None
+            if isinstance(current, dict):
+                current = current.get(part)
+                continue
+            current = getattr(current, part, None)
+        return current
+
+    @staticmethod
+    def _coerce_float(value: Any) -> Optional[float]:
+        if value in (None, ""):
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _extract_openrouter_usage_metadata(self, response: Any) -> Optional[Dict[str, Any]]:
+        """Extract OpenRouter-specific observability fields from a response object.
+
+        These fields are useful for session-stickiness audits and cache/cost
+        analysis, but only some of them are officially documented today. We keep
+        undocumented fields as best-effort observability, never as control-plane
+        inputs.
+        """
+        if response is None:
+            return None
+        base_url = str(getattr(self, "base_url", "") or "").lower()
+        provider = str(getattr(self, "provider", "") or "").lower()
+        if provider != "openrouter" and "openrouter.ai" not in base_url:
+            return None
+
+        raw_usage = getattr(response, "usage", None)
+        prompt_tokens_details = self._read_response_value(raw_usage, "prompt_tokens_details")
+        cost_details = self._read_response_value(raw_usage, "cost_details")
+
+        payload: Dict[str, Any] = {
+            "generation_id": getattr(response, "id", None),
+            "response_model": getattr(response, "model", None),
+            "request_id": getattr(response, "request_id", None) or getattr(response, "_request_id", None),
+            "cost": self._coerce_float(self._read_response_value(raw_usage, "cost")),
+            "upstream_inference_cost": self._coerce_float(
+                self._read_response_value(raw_usage, "upstream_inference_cost")
+                or self._read_response_value(cost_details, "upstream_inference_cost")
+            ),
+            "cache_discount": self._coerce_float(
+                self._read_response_value(raw_usage, "cache_discount")
+                or self._read_response_value(cost_details, "cache_discount")
+            ),
+            "cached_tokens": self._read_response_value(prompt_tokens_details, "cached_tokens"),
+            "cache_write_tokens": self._read_response_value(prompt_tokens_details, "cache_write_tokens"),
+            "usage": self._coerce_float(self._read_response_value(raw_usage, "usage")),
+            "usage_upstream": self._coerce_float(
+                self._read_response_value(raw_usage, "usage_upstream")
+            ),
+        }
+
+        usage_data = self._read_response_value(raw_usage, "usage_data")
+        usage_cache = self._read_response_value(raw_usage, "usage_cache")
+        if usage_data is not None:
+            payload["usage_data"] = usage_data
+        if usage_cache is not None:
+            payload["usage_cache"] = usage_cache
+
+        if raw_usage:
+            canonical_usage = normalize_usage(
+                raw_usage,
+                provider=self.provider,
+                api_mode=self.api_mode,
+            )
+            payload["input_tokens"] = canonical_usage.input_tokens
+            payload["output_tokens"] = canonical_usage.output_tokens
+            payload["prompt_tokens"] = canonical_usage.prompt_tokens
+            payload["completion_tokens"] = canonical_usage.output_tokens
+            payload["total_tokens"] = canonical_usage.total_tokens
+            payload["reasoning_tokens"] = canonical_usage.reasoning_tokens
+
+        filtered = {key: value for key, value in payload.items() if value is not None}
+        return filtered or None
 
     def _dump_api_request_debug(
         self,
@@ -4507,7 +4605,17 @@ class AIAgent:
                 # Accumulate tool call deltas — notify display on first name
                 if delta and delta.tool_calls:
                     for tc_delta in delta.tool_calls:
-                        raw_idx = tc_delta.index if tc_delta.index is not None else 0
+                        raw_idx_value = tc_delta.index
+                        if raw_idx_value is None:
+                            raw_idx = 0
+                        else:
+                            try:
+                                raw_idx = int(raw_idx_value)
+                            except (TypeError, ValueError):
+                                # Some providers may emit non-numeric index values.
+                                # Normalize to an integer slot to avoid mixed-type
+                                # comparisons in max()/sorted() when assembling tool calls.
+                                raw_idx = 0
                         delta_id = tc_delta.id or ""
 
                         # Ollama fix: detect a new tool call reusing the same
@@ -5562,6 +5670,13 @@ class AIAgent:
                 pass  # fail open — let OpenRouter pick its default
 
         extra_body = {}
+        broadcast_payload = self._build_openrouter_broadcast_payload()
+        if broadcast_payload.get("user"):
+            api_kwargs["user"] = broadcast_payload["user"]
+        if broadcast_payload.get("session_id"):
+            extra_body["session_id"] = broadcast_payload["session_id"]
+        if broadcast_payload.get("trace"):
+            extra_body["trace"] = broadcast_payload["trace"]
 
         _is_openrouter = self._is_openrouter_url()
         _is_github_models = (
@@ -5623,6 +5738,53 @@ class AIAgent:
             api_kwargs["extra_headers"] = {"x-grok-conv-id": self.session_id}
 
         return api_kwargs
+
+    @staticmethod
+    def _env_flag(name: str, default: bool = False) -> bool:
+        value = os.getenv(name)
+        if value is None or value == "":
+            return default
+        return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+    @staticmethod
+    def _hash_trace_identifier(value: str) -> str:
+        return hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
+
+    def _build_openrouter_broadcast_payload(self) -> dict[str, Any]:
+        if not self._is_openrouter_url():
+            return {}
+        if not self._env_flag("OPENROUTER_BROADCAST_ENABLED", default=False):
+            return {}
+
+        trace_session_key = self._trace_session_key or ""
+        payload: dict[str, Any] = {}
+        if self.platform and self._user_id:
+            payload["user"] = f"{self.platform}:{self._hash_trace_identifier(str(self._user_id))}"
+        if trace_session_key:
+            payload["session_id"] = trace_session_key
+
+        trace_payload: dict[str, Any] = {}
+        if self.platform:
+            trace_payload["platform"] = self.platform
+        if trace_session_key:
+            trace_payload["session_key"] = trace_session_key
+        if self.provider:
+            trace_payload["route_provider"] = self.provider
+        if self.model:
+            trace_payload["route_model"] = self.model
+
+        privacy_mode = self._env_flag("OPENROUTER_BROADCAST_PRIVACY_MODE", default=True)
+        for key, value in (self._trace_metadata or {}).items():
+            if value is None:
+                continue
+            if privacy_mode and key in {"chat_id", "user_id", "file_path", "open_id", "raw_user_id"}:
+                continue
+            if isinstance(value, (str, int, float, bool)):
+                trace_payload[key] = value
+
+        if trace_payload:
+            payload["trace"] = trace_payload
+        return payload
 
     def _supports_reasoning_extra_body(self) -> bool:
         """Return True when reasoning extra_body is safe to send for this route/model.
@@ -7975,6 +8137,28 @@ class AIAgent:
                             hit_pct = (cached / prompt * 100) if prompt > 0 else 0
                             if not self.quiet_mode:
                                 self._vprint(f"{self.log_prefix}   💾 Cache: {cached:,}/{prompt:,} tokens ({hit_pct:.0f}% hit, {written:,} written)")
+
+                    provider_usage = self._extract_openrouter_usage_metadata(response)
+                    self._last_provider_usage_metadata = provider_usage or {}
+                    if provider_usage:
+                        billed_cost = self._coerce_float(provider_usage.get("cost"))
+                        if billed_cost is not None:
+                            self.session_billed_cost_usd += billed_cost
+                        upstream_cost = self._coerce_float(provider_usage.get("upstream_inference_cost"))
+                        if upstream_cost is not None:
+                            self.session_upstream_inference_cost_usd += upstream_cost
+                        cache_discount = self._coerce_float(provider_usage.get("cache_discount"))
+                        if cache_discount is not None:
+                            self.session_cache_discount_usd += cache_discount
+                        logger.info(
+                            "OpenRouter usage: generation_id=%s cost=%s upstream_inference_cost=%s cache_discount=%s cached_tokens=%s cache_write_tokens=%s",
+                            provider_usage.get("generation_id", ""),
+                            provider_usage.get("cost", ""),
+                            provider_usage.get("upstream_inference_cost", ""),
+                            provider_usage.get("cache_discount", ""),
+                            provider_usage.get("cached_tokens", ""),
+                            provider_usage.get("cache_write_tokens", ""),
+                        )
                     
                     has_retried_429 = False  # Reset on success
                     self._touch_activity(f"API call #{api_call_count} completed")
@@ -8639,6 +8823,7 @@ class AIAgent:
                         message_count=len(api_messages),
                         response_model=getattr(response, "model", None),
                         usage=self._usage_summary_for_api_request_hook(response),
+                        provider_usage=self._extract_openrouter_usage_metadata(response),
                         assistant_content_chars=len(_assistant_text),
                         assistant_tool_call_count=len(_assistant_tool_calls),
                     )
@@ -9359,6 +9544,12 @@ class AIAgent:
             "estimated_cost_usd": self.session_estimated_cost_usd,
             "cost_status": self.session_cost_status,
             "cost_source": self.session_cost_source,
+            "provider_usage": dict(self._last_provider_usage_metadata or {}),
+            "provider_usage_totals": {
+                "billed_cost_usd": self.session_billed_cost_usd,
+                "upstream_inference_cost_usd": self.session_upstream_inference_cost_usd,
+                "cache_discount_usd": self.session_cache_discount_usd,
+            },
         }
         self._response_was_previewed = False
         

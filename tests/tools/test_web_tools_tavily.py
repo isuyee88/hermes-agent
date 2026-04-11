@@ -27,8 +27,8 @@ class TestTavilyRequest:
             with pytest.raises(ValueError, match="TAVILY_API_KEY"):
                 _tavily_request("search", {"query": "test"})
 
-    def test_posts_with_api_key_in_body(self):
-        """api_key is injected into the JSON payload."""
+    def test_posts_with_bearer_auth_header(self):
+        """Bearer auth is sent in the request headers."""
         mock_response = MagicMock()
         mock_response.json.return_value = {"results": []}
         mock_response.raise_for_status = MagicMock()
@@ -41,8 +41,10 @@ class TestTavilyRequest:
                 mock_post.assert_called_once()
                 call_kwargs = mock_post.call_args
                 payload = call_kwargs.kwargs.get("json") or call_kwargs[1].get("json")
-                assert payload["api_key"] == "tvly-test-key"
                 assert payload["query"] == "hello"
+                headers = call_kwargs.kwargs.get("headers") or call_kwargs[1].get("headers")
+                assert headers["Authorization"] == "Bearer tvly-test-key"
+                assert headers["Content-Type"] == "application/json"
                 assert "api.tavily.com/search" in call_kwargs.args[0]
 
     def test_raises_on_http_error(self):

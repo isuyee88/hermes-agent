@@ -882,7 +882,17 @@ class TelegramAdapter(BasePlatformAdapter):
                                 continue
                         raise
                 message_ids.append(str(msg.message_id))
-            
+
+            logger.info(
+                "[%s] Sent Telegram message to chat_id=%s thread_id=%s reply_to=%s chunks=%d first_message_id=%s",
+                self.name,
+                chat_id,
+                thread_id,
+                reply_to,
+                len(chunks),
+                message_ids[0] if message_ids else None,
+            )
+
             return SendResult(
                 success=True,
                 message_id=message_ids[0] if message_ids else None,

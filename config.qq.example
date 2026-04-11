@@ -1,0 +1,26 @@
+# QQ Official Bot webhook configuration example
+#
+# Configure these values in Modal Secrets, ~/.hermes/.env, or your deployment
+# environment. Hermes normalizes QQ webhook events into the native gateway flow.
+
+QQ_APP_ID="replace_me"
+QQ_APP_SECRET="replace_me"
+QQ_CONNECTION_MODE="webhook"
+
+# Public callback configuration for self-hosted webhook mode.
+# Modal's ASGI deployment exposes /qq/webhook directly and does not need these.
+QQ_WEBHOOK_HOST="0.0.0.0"
+QQ_WEBHOOK_PORT="8080"
+QQ_WEBHOOK_PATH="/qq/webhook"
+
+# Optional access controls
+# Restrict specific QQ users/openids if desired.
+QQ_ALLOWED_USERS=""
+QQ_ALLOW_ALL_USERS="false"
+
+# Optional home target for cron / notifications.
+# Examples:
+#   QQ_HOME_CHANNEL="c2c:USER_OPENID"
+#   QQ_HOME_CHANNEL="group:GROUP_OPENID"
+#   QQ_HOME_CHANNEL="guild:CHANNEL_ID"
+QQ_HOME_CHANNEL=""

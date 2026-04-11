@@ -766,9 +766,16 @@ class TestPromptBuilderConstants:
     def test_platform_hints_known_platforms(self):
         assert "whatsapp" in PLATFORM_HINTS
         assert "telegram" in PLATFORM_HINTS
+        assert "feishu" in PLATFORM_HINTS
         assert "discord" in PLATFORM_HINTS
         assert "cron" in PLATFORM_HINTS
         assert "cli" in PLATFORM_HINTS
+
+    def test_feishu_platform_hint_describes_native_media_delivery(self):
+        hint = PLATFORM_HINTS["feishu"].lower()
+        assert "media:/absolute/path/to/file" in hint
+        assert "native image" in hint
+        assert ".pdf" in hint
 
 
 # =========================================================================

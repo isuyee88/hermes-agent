@@ -482,6 +482,45 @@ class TestSendToPlatformWhatsapp:
         async_mock.assert_awaited_once_with({"bridge_port": 3000}, chat_id, "hello from hermes")
 
 
+class TestSendToPlatformFeishu:
+    def test_feishu_media_attaches_to_last_chunk(self):
+        sent_calls = []
+
+        async def fake_send(pconfig, chat_id, message, media_files=None, thread_id=None):
+            sent_calls.append(media_files or [])
+            return {"success": True, "platform": "feishu", "chat_id": chat_id, "message_id": str(len(sent_calls))}
+
+        long_msg = "word " * 2000
+        media = [("/tmp/report.pdf", False)]
+        with patch("tools.send_message_tool._send_feishu", fake_send):
+            asyncio.run(
+                _send_to_platform(
+                    Platform.FEISHU,
+                    SimpleNamespace(enabled=True, token=None, extra={}),
+                    "oc_test_chat",
+                    long_msg,
+                    media_files=media,
+                )
+            )
+
+        assert len(sent_calls) >= 1
+        assert all(call == [] for call in sent_calls[:-1])
+        assert sent_calls[-1] == media
+
+    def test_media_only_error_mentions_feishu_support(self):
+        result = asyncio.run(
+            _send_to_platform(
+                Platform.DISCORD,
+                SimpleNamespace(enabled=True, token="tok", extra={}),
+                "ch",
+                "",
+                media_files=[("/tmp/file.pdf", False)],
+            )
+        )
+
+        assert "telegram and feishu" in result["error"]
+
+
 class TestSendTelegramHtmlDetection:
     """Verify that messages containing HTML tags are sent with parse_mode=HTML
     and that plain / markdown messages use MarkdownV2."""

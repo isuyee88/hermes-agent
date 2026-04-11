@@ -382,7 +382,11 @@ STORE_SCHEMA = {
 
 SEARCH_SCHEMA = {
     "name": "supermemory_search",
-    "description": "Search long-term memory by semantic similarity.",
+    "description": (
+        "Search long-term memory by semantic similarity. Use this before filesystem or web search "
+        "when the user asks about prior conversations, remembered facts, project names, short "
+        "keywords, or terms they may have mentioned before."
+    ),
     "parameters": {
         "type": "object",
         "properties": {
@@ -534,6 +538,15 @@ class SupermemoryMemoryProvider(MemoryProvider):
             "# Supermemory",
             f"Active. Container: {self._container_tag}.",
             "Use supermemory_search, supermemory_store, supermemory_forget, and supermemory_profile for explicit memory operations.",
+            (
+                "When the user asks about earlier conversations, remembered facts, preferences, project names, "
+                "or a short keyword that may refer to prior work, call supermemory_search or supermemory_profile "
+                "before using filesystem, terminal, or web search."
+            ),
+            (
+                "If supermemory_search returns partial or weak matches, try one refined memory query before "
+                "giving up or switching to other tools."
+            ),
         ]
         if self._enable_custom_containers and self._custom_containers:
             tags_str = ", ".join(self._allowed_containers)

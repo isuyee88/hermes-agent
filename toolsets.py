@@ -58,6 +58,14 @@ _HERMES_CORE_TOOLS = [
     "cronjob",
     # Cross-platform messaging (gated on gateway running via check_fn)
     "send_message",
+    # Feishu/Lark collaboration APIs (gated on FEISHU_APP_ID / FEISHU_APP_SECRET)
+    "feishu_doc_create", "feishu_doc_get", "feishu_doc_append_markdown",
+    "feishu_lookup_user", "feishu_sheet_create", "feishu_sheet_read_range",
+    "feishu_sheet_write_range", "feishu_bitable_get_schema",
+    "feishu_bitable_list_records", "feishu_bitable_upsert_records",
+    "feishu_message_send", "feishu_chat_lookup", "feishu_file_upload",
+    "feishu_file_send", "feishu_file_download",
+    "feishu_model_registry_sync", "feishu_model_registry_publish_card",
     # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
     "ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service",
 ]
@@ -129,6 +137,20 @@ TOOLSETS = {
     "messaging": {
         "description": "Cross-platform messaging: send messages to Telegram, Discord, Slack, SMS, etc.",
         "tools": ["send_message"],
+        "includes": []
+    },
+
+    "feishu": {
+        "description": "Feishu/Lark collaboration tools for docs, sheets, bitable, messaging, files, and model registry operations",
+        "tools": [
+            "feishu_doc_create", "feishu_doc_get", "feishu_doc_append_markdown",
+            "feishu_lookup_user", "feishu_sheet_create", "feishu_sheet_read_range",
+            "feishu_sheet_write_range", "feishu_bitable_get_schema",
+            "feishu_bitable_list_records", "feishu_bitable_upsert_records",
+            "feishu_message_send", "feishu_chat_lookup", "feishu_file_upload",
+            "feishu_file_send", "feishu_file_download",
+            "feishu_model_registry_sync", "feishu_model_registry_publish_card",
+        ],
         "includes": []
     },
     
@@ -286,6 +308,12 @@ TOOLSETS = {
         "tools": _HERMES_CORE_TOOLS,
         "includes": []
     },
+
+    "hermes-qq": {
+        "description": "QQ official bot toolset - webhook-first QQ messaging access",
+        "tools": _HERMES_CORE_TOOLS,
+        "includes": []
+    },
     
     "hermes-discord": {
         "description": "Discord bot toolset - full access (terminal has safety checks via dangerous command approval)",
@@ -374,7 +402,7 @@ TOOLSETS = {
     "hermes-gateway": {
         "description": "Gateway toolset - union of all messaging platform tools",
         "tools": [],
-        "includes": ["hermes-telegram", "hermes-discord", "hermes-whatsapp", "hermes-slack", "hermes-signal", "hermes-bluebubbles", "hermes-homeassistant", "hermes-email", "hermes-sms", "hermes-mattermost", "hermes-matrix", "hermes-dingtalk", "hermes-feishu", "hermes-wecom", "hermes-webhook"]
+        "includes": ["hermes-telegram", "hermes-qq", "hermes-discord", "hermes-whatsapp", "hermes-slack", "hermes-signal", "hermes-bluebubbles", "hermes-homeassistant", "hermes-email", "hermes-sms", "hermes-mattermost", "hermes-matrix", "hermes-dingtalk", "hermes-feishu", "hermes-wecom", "hermes-webhook"]
     }
 }
 

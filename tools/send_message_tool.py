@@ -17,6 +17,7 @@ from agent.redact import redact_sensitive_text
 logger = logging.getLogger(__name__)
 
 _TELEGRAM_TOPIC_TARGET_RE = re.compile(r"^\s*(-?\d+)(?::(\d+))?\s*$")
+_QQ_TARGET_RE = re.compile(r"^\s*(guild|dm|group|c2c):(.+)\s*$")
 _FEISHU_TARGET_RE = re.compile(r"^\s*((?:oc|ou|on|chat|open)_[-A-Za-z0-9]+)(?::([-A-Za-z0-9_]+))?\s*$")
 _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 _VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".3gp"}
@@ -65,7 +66,7 @@ SEND_MESSAGE_SCHEMA = {
             },
             "target": {
                 "type": "string",
-                "description": "Delivery target. Format: 'platform' (uses home channel), 'platform:#channel-name', 'platform:chat_id', or Telegram topic 'telegram:chat_id:thread_id'. Examples: 'telegram', 'telegram:-1001234567890:17585', 'discord:#bot-home', 'slack:#engineering', 'signal:+15551234567'"
+                "description": "Delivery target. Format: 'platform' (uses home channel), 'platform:#channel-name', 'platform:chat_id', or Telegram topic 'telegram:chat_id:thread_id'. QQ explicit targets use 'qq:group:GROUP_OPENID', 'qq:c2c:USER_OPENID', 'qq:guild:CHANNEL_ID', or 'qq:dm:GUILD_ID'. Examples: 'telegram', 'telegram:-1001234567890:17585', 'qq:c2c:USER_OPENID', 'qq:group:GROUP_OPENID', 'discord:#bot-home', 'slack:#engineering', 'signal:+15551234567'"
             },
             "message": {
                 "type": "string",
@@ -144,6 +145,7 @@ def _handle_send(args):
 
     platform_map = {
         "telegram": Platform.TELEGRAM,
+        "qq": Platform.QQ,
         "discord": Platform.DISCORD,
         "slack": Platform.SLACK,
         "whatsapp": Platform.WHATSAPP,
@@ -227,6 +229,10 @@ def _parse_target_ref(platform_name: str, target_ref: str):
         match = _TELEGRAM_TOPIC_TARGET_RE.fullmatch(target_ref)
         if match:
             return match.group(1), match.group(2), True
+    if platform_name == "qq":
+        match = _QQ_TARGET_RE.fullmatch(target_ref)
+        if match:
+            return f"{match.group(1)}:{match.group(2)}", None, True
     if platform_name == "feishu":
         match = _FEISHU_TARGET_RE.fullmatch(target_ref)
         if match:
@@ -310,6 +316,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     from gateway.config import Platform
     from gateway.platforms.base import BasePlatformAdapter
     from gateway.platforms.telegram import TelegramAdapter
+    from gateway.platforms.qq import QQAdapter
     from gateway.platforms.discord import DiscordAdapter
     from gateway.platforms.slack import SlackAdapter
 
@@ -325,6 +332,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     # Platform message length limits (from adapter class attributes)
     _MAX_LENGTHS = {
         Platform.TELEGRAM: TelegramAdapter.MAX_MESSAGE_LENGTH,
+        Platform.QQ: QQAdapter.MAX_MESSAGE_LENGTH,
         Platform.DISCORD: DiscordAdapter.MAX_MESSAGE_LENGTH,
         Platform.SLACK: SlackAdapter.MAX_MESSAGE_LENGTH,
     }
@@ -339,28 +347,37 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     else:
         chunks = [message]
 
-    # --- Telegram: special handling for media attachments ---
-    if platform == Platform.TELEGRAM:
+    # --- Platforms with native media attachment support ---
+    if platform in {Platform.TELEGRAM, Platform.FEISHU}:
         last_result = None
         for i, chunk in enumerate(chunks):
             is_last = (i == len(chunks) - 1)
-            result = await _send_telegram(
-                pconfig.token,
-                chat_id,
-                chunk,
-                media_files=media_files if is_last else [],
-                thread_id=thread_id,
-            )
+            if platform == Platform.TELEGRAM:
+                result = await _send_telegram(
+                    pconfig.token,
+                    chat_id,
+                    chunk,
+                    media_files=media_files if is_last else [],
+                    thread_id=thread_id,
+                )
+            else:
+                result = await _send_feishu(
+                    pconfig,
+                    chat_id,
+                    chunk,
+                    media_files=media_files if is_last else [],
+                    thread_id=thread_id,
+                )
             if isinstance(result, dict) and result.get("error"):
                 return result
             last_result = result
         return last_result
 
-    # --- Non-Telegram platforms ---
+    # --- Platforms without native media attachment support in send_message ---
     if media_files and not message.strip():
         return {
             "error": (
-                f"send_message MEDIA delivery is currently only supported for telegram; "
+                f"send_message MEDIA delivery is currently only supported for telegram and feishu; "
                 f"target {platform.value} had only media attachments"
             )
         }
@@ -368,7 +385,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     if media_files:
         warning = (
             f"MEDIA attachments were omitted for {platform.value}; "
-            "native send_message media delivery is currently only supported for telegram"
+            "native send_message media delivery is currently only supported for telegram and feishu"
         )
 
     last_result = None
@@ -395,6 +412,8 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             result = await _send_dingtalk(pconfig.extra, chat_id, chunk)
         elif platform == Platform.FEISHU:
             result = await _send_feishu(pconfig, chat_id, chunk, thread_id=thread_id)
+        elif platform == Platform.QQ:
+            result = await _send_qq(pconfig, chat_id, chunk)
         elif platform == Platform.WECOM:
             result = await _send_wecom(pconfig.extra, chat_id, chunk)
         elif platform == Platform.BLUEBUBBLES:
@@ -536,6 +555,27 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
         return {"error": "python-telegram-bot not installed. Run: pip install python-telegram-bot"}
     except Exception as e:
         return _error(f"Telegram send failed: {e}")
+
+
+async def _send_qq(pconfig, chat_id, message):
+    try:
+        from gateway.platforms.qq import QQAdapter, check_qq_requirements
+
+        if not check_qq_requirements():
+            return {"error": "QQ dependencies not installed. Run: pip install 'hermes-agent[messaging]'"}
+
+        adapter = QQAdapter(pconfig)
+        result = await adapter.send(chat_id, message)
+        if not result.success:
+            return {"error": result.error or "QQ send failed"}
+        return {
+            "success": True,
+            "platform": "qq",
+            "chat_id": chat_id,
+            "message_id": result.message_id,
+        }
+    except Exception as exc:
+        return _error(f"QQ send failed: {exc}")
 
 
 async def _send_discord(token, chat_id, message):

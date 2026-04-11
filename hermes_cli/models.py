@@ -467,6 +467,7 @@ def check_nous_free_tier() -> bool:
 
 _PROVIDER_LABELS = {
     "openrouter": "OpenRouter",
+    "nvidia": "NVIDIA",
     "openai-codex": "OpenAI Codex",
     "copilot-acp": "GitHub Copilot ACP",
     "nous": "Nous Portal",
@@ -489,6 +490,9 @@ _PROVIDER_LABELS = {
 }
 
 _PROVIDER_ALIASES = {
+    "ngc": "nvidia",
+    "nvidia-ai": "nvidia",
+    "nvidia-nim": "nvidia",
     "glm": "zai",
     "z-ai": "zai",
     "z.ai": "zai",
@@ -766,7 +770,7 @@ def list_available_providers() -> list[dict[str, str]]:
     """
     # Canonical providers in display order
     _PROVIDER_ORDER = [
-        "openrouter", "nous", "openai-codex", "copilot", "copilot-acp",
+        "openrouter", "nvidia", "nous", "openai-codex", "copilot", "copilot-acp",
         "gemini", "huggingface",
         "zai", "kimi-coding", "minimax", "minimax-cn", "kilocode", "anthropic", "alibaba",
         "qwen-oauth",
@@ -791,6 +795,10 @@ def list_available_providers() -> list[dict[str, str]]:
                 has_creds = bool(custom_base_url.strip())
             elif pid == "openrouter":
                 has_creds = has_usable_secret(os.getenv("OPENROUTER_API_KEY", ""))
+            elif pid == "nvidia":
+                has_creds = has_usable_secret(
+                    os.getenv("NVIDIA_API_KEY", "") or os.getenv("NGC_API_KEY", "")
+                )
             else:
                 status = get_auth_status(pid)
                 has_creds = bool(status.get("logged_in") or status.get("configured"))
