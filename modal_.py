@@ -1744,6 +1744,7 @@ async def _initialize_feishu_gateway_runtime(settings: RuntimeSettings) -> _Feis
     adapter._mark_connected()
     adapter.set_message_handler(runner._handle_message)
     adapter.set_session_store(runner.session_store)
+    adapter.set_menu_action_handler(runner._handle_feishu_menu_action)
 
     runner.adapters[Platform.FEISHU] = adapter
     runner.delivery_router.adapters = runner.adapters

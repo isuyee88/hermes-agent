@@ -1104,6 +1104,7 @@ class FeishuAdapter(BasePlatformAdapter):
         self._approval_counter = itertools.count(1)
         self._model_picker_state: Dict[str, Dict[str, Any]] = {}
         self._model_picker_counter = itertools.count(1)
+        self._menu_action_handler: Optional[Callable[..., Awaitable[bool] | bool]] = None
         self._load_seen_message_ids()
         self._load_model_picker_state()
 
@@ -1612,6 +1613,7 @@ class FeishuAdapter(BasePlatformAdapter):
         session_key: str,
         on_model_selected,
         metadata: Optional[Dict[str, Any]] = None,
+        selected_provider: Optional[str] = None,
     ) -> SendResult:
         """Send an interactive Feishu card for provider/model selection."""
         if not self._client:
@@ -1619,12 +1621,26 @@ class FeishuAdapter(BasePlatformAdapter):
 
         try:
             picker_id = f"fp{next(self._model_picker_counter)}"
-            card = self._build_model_picker_provider_card(
-                providers=providers,
-                current_model=current_model,
-                current_provider=current_provider,
-                picker_id=picker_id,
-            )
+            picker_state = {
+                "picker_id": picker_id,
+                "providers": list(providers or []),
+                "current_model": current_model,
+                "current_provider": current_provider,
+                "selected_provider": selected_provider or None,
+            }
+            if selected_provider:
+                card = self._build_model_picker_model_card(
+                    state=picker_state,
+                    provider_slug=selected_provider,
+                    page=0,
+                )
+            else:
+                card = self._build_model_picker_provider_card(
+                    providers=providers,
+                    current_model=current_model,
+                    current_provider=current_provider,
+                    picker_id=picker_id,
+                )
             payload = json.dumps(card, ensure_ascii=False)
             response = await self._feishu_send_with_retry(
                 chat_id=chat_id,
@@ -1644,7 +1660,7 @@ class FeishuAdapter(BasePlatformAdapter):
                     "on_model_selected": on_model_selected,
                     "current_model": current_model,
                     "current_provider": current_provider,
-                    "selected_provider": None,
+                    "selected_provider": selected_provider or None,
                     "model_page": 0,
                     "allowed_user_id": str((metadata or {}).get("user_id") or "").strip(),
                 }
@@ -2157,6 +2173,32 @@ class FeishuAdapter(BasePlatformAdapter):
         )
         chat_lock = self._get_chat_lock(chat_id)
         async with chat_lock:
+            menu_handler = self._menu_action_handler
+            if callable(menu_handler):
+                try:
+                    handled = menu_handler(
+                        event_key=event_key,
+                        source=source,
+                        chat_id=chat_id,
+                        open_id=open_id,
+                        adapter=self,
+                    )
+                    if asyncio.iscoroutine(handled):
+                        handled = await handled
+                    if handled:
+                        logger.info(
+                            "[Feishu] Fast-path handled bot menu event_key=%s from %s in %s",
+                            event_key,
+                            open_id,
+                            chat_id,
+                        )
+                        return
+                except Exception:
+                    logger.warning(
+                        "[Feishu] Fast-path menu handler failed for event_key=%s; falling back to command routing",
+                        event_key,
+                        exc_info=True,
+                    )
             logger.info(
                 "[Feishu] Routing bot menu event_key=%s from %s in %s as %s",
                 event_key,
@@ -2165,6 +2207,9 @@ class FeishuAdapter(BasePlatformAdapter):
                 synthetic_text,
             )
             await self.handle_message(synthetic_event)
+
+    def set_menu_action_handler(self, handler: Callable[..., Awaitable[bool] | bool]) -> None:
+        self._menu_action_handler = handler
 
     async def send_voice(
         self,
@@ -4223,7 +4268,7 @@ class FeishuAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]],
     ) -> Any:
         reply_in_thread = bool((metadata or {}).get("thread_id"))
-        receive_id_type = str((metadata or {}).get("receive_id_type") or "chat_id").strip() or "chat_id"
+        receive_id_type = self._resolve_receive_id_type(chat_id=chat_id, metadata=metadata)
         if reply_to:
             body = self._build_reply_message_body(
                 content=payload,
@@ -4242,6 +4287,20 @@ class FeishuAdapter(BasePlatformAdapter):
         )
         request = self._build_create_message_request(receive_id_type, body)
         return await asyncio.to_thread(self._client.im.v1.message.create, request)
+
+    @staticmethod
+    def _resolve_receive_id_type(*, chat_id: str, metadata: Optional[Dict[str, Any]]) -> str:
+        explicit = str((metadata or {}).get("receive_id_type") or "").strip().lower()
+        if explicit:
+            return explicit
+        normalized_chat_id = str(chat_id or "").strip()
+        if normalized_chat_id.startswith("ou_"):
+            return "open_id"
+        if normalized_chat_id.startswith("on_"):
+            return "union_id"
+        if normalized_chat_id.startswith("u_"):
+            return "user_id"
+        return "chat_id"
 
     @staticmethod
     def _response_succeeded(response: Any) -> bool:

@@ -3437,6 +3437,34 @@ class TestFeishuModelPickerAndMenu(unittest.TestCase):
         self.assertEqual(event.source.chat_id, "oc_chat")
         self.assertIsNone(event.message_id)
 
+    @patch.dict(os.environ, {}, clear=True)
+    def test_bot_menu_event_prefers_fast_path_handler(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter.handle_message = AsyncMock()
+        adapter._resolve_sender_profile = AsyncMock(
+            return_value={"user_id": "ou_user", "user_name": "Alice", "user_id_alt": None}
+        )
+        adapter.get_chat_info = AsyncMock(return_value={"chat_id": "oc_chat", "name": "Feishu DM", "type": "dm"})
+        handler = AsyncMock(return_value=True)
+        adapter.set_menu_action_handler(handler)
+
+        data = SimpleNamespace(
+            header=SimpleNamespace(event_id="evt_menu"),
+            event=SimpleNamespace(
+                event_key="provider_openrouter",
+                operator=SimpleNamespace(operator_id=SimpleNamespace(open_id="ou_user")),
+                chat=SimpleNamespace(chat_id="oc_chat", chat_type="p2p"),
+            ),
+        )
+
+        asyncio.run(adapter._handle_bot_menu_event(data))
+
+        handler.assert_awaited_once()
+        adapter.handle_message.assert_not_awaited()
+
     @patch.dict(os.environ, {"HERMES_FEISHU_MENU_OPEN_BY_OPEN_ID": "true"}, clear=True)
     def test_bot_menu_event_falls_back_to_open_id_when_chat_missing(self):
         from gateway.config import PlatformConfig
@@ -3510,6 +3538,38 @@ class TestFeishuModelPickerAndMenu(unittest.TestCase):
                     payload='{"type":"template"}',
                     reply_to=None,
                     metadata={"receive_id_type": "open_id"},
+                )
+            )
+
+        self.assertTrue(response.success())
+        self.assertEqual(captured["request"].receive_id_type, "open_id")
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_send_raw_message_infers_open_id_receive_type_from_chat_id(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        captured = {}
+
+        class _MessageAPI:
+            def create(self, request):
+                captured["request"] = request
+                return SimpleNamespace(success=lambda: True, data=SimpleNamespace(message_id="om_open_id"))
+
+        adapter._client = SimpleNamespace(im=SimpleNamespace(v1=SimpleNamespace(message=_MessageAPI())))
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct):
+            response = asyncio.run(
+                adapter._send_raw_message(
+                    chat_id="ou_user",
+                    msg_type="text",
+                    payload='{"text":"hello"}',
+                    reply_to=None,
+                    metadata=None,
                 )
             )
 

@@ -1227,6 +1227,236 @@ class GatewayRunner:
             lines.append(f"More: `/model more --provider {provider_slug}`")
         return "\n".join(lines)
 
+    def _build_model_picker_send_metadata(self, source: SessionSource) -> dict[str, Any] | None:
+        metadata: dict[str, Any] = {}
+        if source.thread_id:
+            metadata["thread_id"] = source.thread_id
+        if source.user_id:
+            metadata["user_id"] = source.user_id
+        if (
+            source.platform == Platform.FEISHU
+            and source.chat_type == "dm"
+            and source.chat_id
+            and source.chat_id.startswith("ou_")
+        ):
+            metadata["receive_id_type"] = "open_id"
+        return metadata or None
+
+    def _build_model_picker_selection_handler(
+        self,
+        *,
+        session_key: str,
+        source: SessionSource,
+        current_model: str,
+        current_provider: str,
+        current_base_url: str,
+        current_api_key: str,
+    ):
+        from hermes_cli.model_switch import switch_model as _switch_model
+
+        async def _on_model_selected(_chat_id: str, model_id: str, provider_slug: str) -> str:
+            target_session_keys = {session_key}
+            if (
+                _chat_id
+                and source.chat_type == "dm"
+                and source.platform == Platform.FEISHU
+                and _chat_id != source.chat_id
+            ):
+                target_source = SessionSource(
+                    platform=source.platform,
+                    chat_id=_chat_id,
+                    chat_name=source.chat_name,
+                    chat_type=source.chat_type,
+                    user_id=source.user_id,
+                    user_name=source.user_name,
+                    thread_id=source.thread_id,
+                    chat_topic=source.chat_topic,
+                    user_id_alt=source.user_id_alt,
+                    chat_id_alt=source.chat_id_alt,
+                )
+                target_session_keys.add(
+                    build_session_key(
+                        target_source,
+                        group_sessions_per_user=self.config.session.group_sessions_per_user,
+                        thread_sessions_per_user=self.config.session.thread_sessions_per_user,
+                    )
+                )
+
+            result = _switch_model(
+                raw_input=model_id,
+                current_provider=current_provider,
+                current_model=current_model,
+                current_base_url=current_base_url,
+                current_api_key=current_api_key,
+                is_global=False,
+                explicit_provider=provider_slug,
+            )
+            if not result.success:
+                return f"Error: {result.error_message}"
+
+            _cache_lock = getattr(self, "_agent_cache_lock", None)
+            _cache = getattr(self, "_agent_cache", None)
+            if _cache_lock and _cache is not None:
+                with _cache_lock:
+                    cached_entries = [_cache.get(target_key) for target_key in target_session_keys]
+            else:
+                cached_entries = []
+            for cached_entry in cached_entries:
+                if cached_entry and cached_entry[0] is not None:
+                    try:
+                        cached_entry[0].switch_model(
+                            new_model=result.new_model,
+                            new_provider=result.target_provider,
+                            api_key=result.api_key,
+                            base_url=result.base_url,
+                            api_mode=result.api_mode,
+                        )
+                    except Exception as exc:
+                        logger.warning("Picker model switch failed for cached agent: %s", exc)
+
+            if not hasattr(self, "_pending_model_notes"):
+                self._pending_model_notes = {}
+            note_text = (
+                f"[Note: model was just switched from {current_model} to {result.new_model} "
+                f"via {result.provider_label or result.target_provider}. "
+                f"Adjust your self-identification accordingly.]"
+            )
+            if not hasattr(self, "_session_model_overrides"):
+                self._session_model_overrides = {}
+            for target_key in target_session_keys:
+                self._pending_model_notes[target_key] = note_text
+                self._session_model_overrides[target_key] = {
+                    "model": result.new_model,
+                    "provider": result.target_provider,
+                    "api_key": result.api_key,
+                    "base_url": result.base_url,
+                    "api_mode": result.api_mode,
+                }
+                if getattr(self, "session_store", None) is not None:
+                    self.session_store.update_session(
+                        target_key,
+                        route_lease=self._build_session_route_lease(
+                            {
+                                "provider": result.target_provider,
+                                "model": result.new_model,
+                                "base_url": result.base_url,
+                                "api_mode": result.api_mode,
+                            },
+                            selection_reason="explicit_override",
+                        ),
+                        route_debug=self._build_route_debug_payload(
+                            session_key=target_key,
+                            provider=result.target_provider,
+                            model=result.new_model,
+                            base_url=result.base_url,
+                            selection_reason="explicit_override",
+                        ),
+                        route_metrics=self._increment_route_metric(
+                            getattr(self._get_session_entry(target_key), "route_metrics", {}) or {},
+                            "explicit_override",
+                        ),
+                    )
+
+            lines = [f"Model switched to `{result.new_model}`"]
+            lines.append(f"Provider: {result.provider_label or result.target_provider}")
+            lines.append("Route mode: `explicit override`")
+            lines.append("Manual lock: `yes`")
+            mi = result.model_info
+            if mi:
+                if mi.context_window:
+                    lines.append(f"Context: {mi.context_window:,} tokens")
+                if mi.max_output:
+                    lines.append(f"Max output: {mi.max_output:,} tokens")
+                if mi.has_cost_data():
+                    lines.append(f"Cost: {mi.format_cost()}")
+                lines.append(f"Capabilities: {mi.format_capabilities()}")
+            lines.append("_(session only - use `/model <name> --global` to persist)_")
+            return "\n".join(lines)
+
+        return _on_model_selected
+
+    async def _handle_feishu_menu_action(
+        self,
+        *,
+        event_key: str,
+        source: SessionSource,
+        chat_id: str,
+        open_id: str,
+        adapter: Any,
+    ) -> bool:
+        if event_key not in {
+            "model_picker",
+            "model_status",
+            "provider_status",
+            "provider_openrouter",
+            "provider_nvidia",
+            "route_status",
+        }:
+            return False
+
+        current_model, current_provider, current_base_url, current_api_key, _user_provs = self._load_model_runtime_config()
+        session_key = self._session_key_for_source(source)
+        route_state = self._get_active_route_state(
+            session_key,
+            current_model=current_model,
+            current_provider=current_provider,
+            current_base_url=current_base_url,
+            current_api_key=current_api_key,
+        )
+        current_model = route_state["current_model"]
+        current_provider = route_state["current_provider"]
+        current_base_url = route_state["current_base_url"]
+        current_api_key = route_state["current_api_key"]
+        metadata = self._build_model_picker_send_metadata(source)
+
+        if event_key == "route_status":
+            result = await adapter.send(
+                chat_id=chat_id,
+                content="\n".join(self._render_route_status_lines(route_state)),
+                metadata=metadata,
+            )
+            return bool(result.success)
+
+        selected_provider = {
+            "provider_openrouter": "openrouter",
+            "provider_nvidia": "nvidia",
+        }.get(event_key)
+
+        providers = self._get_chat_provider_records(
+            session_key=session_key,
+            current_model=current_model,
+            current_provider=current_provider,
+            authenticated_only=False,
+            max_models=0,
+        )
+        if not providers:
+            result = await adapter.send(
+                chat_id=chat_id,
+                content="No provider/model data is available yet. Try again after the next sync.",
+                metadata=metadata,
+            )
+            return bool(result.success)
+
+        on_model_selected = self._build_model_picker_selection_handler(
+            session_key=session_key,
+            source=source,
+            current_model=current_model,
+            current_provider=current_provider,
+            current_base_url=current_base_url,
+            current_api_key=current_api_key,
+        )
+        result = await adapter.send_model_picker(
+            chat_id=chat_id,
+            providers=providers,
+            current_model=current_model,
+            current_provider=current_provider,
+            session_key=session_key,
+            on_model_selected=on_model_selected,
+            metadata=metadata,
+            selected_provider=selected_provider,
+        )
+        return bool(result.success)
+
     def _build_session_route_lease(
         self,
         route: dict[str, Any],
