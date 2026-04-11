@@ -11,7 +11,7 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Tuple
-from urllib.parse import quote, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 import httpx
 
@@ -21,6 +21,8 @@ _TOKEN_CACHE: Dict[str, Dict[str, Any]] = {}
 _TOKEN_CACHE_LOCK = threading.Lock()
 _DOC_URL_RE = re.compile(r"/docx/([A-Za-z0-9]+)")
 _SHEET_URL_RE = re.compile(r"/sheets/([A-Za-z0-9]+)")
+_BITABLE_APP_URL_RE = re.compile(r"/base/([^/?]+)")
+_BITABLE_WIKI_URL_RE = re.compile(r"(?:^|/)wiki/([A-Za-z0-9]+)")
 _TRUNCATE_RAW_CONTENT_AT = 12_000
 _FEISHU_FILE_UPLOAD_TYPE = "stream"
 _FEISHU_DOC_UPLOAD_TYPES = {
@@ -295,6 +297,51 @@ def extract_spreadsheet_token(value: str) -> str:
         if match:
             return match.group(1)
     return raw
+
+
+def extract_bitable_reference(value: str) -> Dict[str, str]:
+    raw = str(value or "").strip()
+    if not raw:
+        return {}
+    normalized = raw
+    if "://" not in normalized and normalized.startswith("wiki/"):
+        normalized = f"https://wiki.local/{normalized.lstrip('/')}"
+    elif "://" not in normalized and normalized.startswith("/wiki/"):
+        normalized = f"https://wiki.local{normalized}"
+
+    parsed = urlparse(normalized) if "://" in normalized else None
+    path = parsed.path if parsed else raw
+    query = parsed.query if parsed else ""
+    result: Dict[str, str] = {}
+
+    if parsed:
+        query_params = parse_qs(query)
+        table_id = query_params.get("table", [""])[0]
+        view_id = query_params.get("view", [""])[0]
+        if table_id:
+            result["table_id"] = str(table_id).strip()
+        if view_id:
+            result["view_id"] = str(view_id).strip()
+
+    app_match = _BITABLE_APP_URL_RE.search(path)
+    if app_match:
+        result["app_token"] = app_match.group(1)
+        return result
+
+    wiki_match = _BITABLE_WIKI_URL_RE.search(path)
+    if wiki_match:
+        result["wiki_token"] = wiki_match.group(1)
+        return result
+
+    if raw.startswith("tbl"):
+        result["table_id"] = raw
+    elif raw.startswith("vew"):
+        result["view_id"] = raw
+    elif raw.startswith("wiki/"):
+        parts = [segment for segment in raw.split("/") if segment]
+        if len(parts) >= 2:
+            result["wiki_token"] = parts[1]
+    return result
 
 
 def truncate_text(text: str, *, limit: int = _TRUNCATE_RAW_CONTENT_AT) -> tuple[str, bool]:
@@ -648,11 +695,72 @@ def resolve_user_identifier(client: FeishuOpenApiClient, args: Dict[str, Any]) -
     return user_id, "open_id"
 
 
-def resolve_bitable_target(args: Dict[str, Any]) -> Tuple[str, str]:
-    app_token = str(args.get("app_token") or os.getenv("FEISHU_BITABLE_APP_TOKEN") or "").strip()
-    table_id = str(args.get("table_id") or os.getenv("FEISHU_BITABLE_TABLE_ID") or "").strip()
-    if not app_token or not table_id:
-        raise ValueError("Bitable target is not configured. Provide app_token/table_id or set FEISHU_BITABLE_APP_TOKEN and FEISHU_BITABLE_TABLE_ID.")
+def resolve_bitable_target(
+    args: Dict[str, Any],
+    client: "FeishuOpenApiClient | None" = None,
+    *,
+    require_table_id: bool = True,
+) -> Tuple[str, str]:
+    reference_sources = [
+        args.get("bitable_url"),
+        args.get("wiki_url"),
+        args.get("wiki_link"),
+        args.get("source_url"),
+        os.getenv("FEISHU_BITABLE_URL"),
+        os.getenv("FEISHU_BITABLE_WIKI_URL"),
+    ]
+    parsed_reference: Dict[str, str] = {}
+    for raw_value in reference_sources:
+        parsed_reference = extract_bitable_reference(str(raw_value or "").strip())
+        if parsed_reference:
+            break
+
+    app_value = str(args.get("app_token") or os.getenv("FEISHU_BITABLE_APP_TOKEN") or "").strip()
+    app_reference = extract_bitable_reference(app_value)
+    if parsed_reference.get("app_token"):
+        app_token = parsed_reference["app_token"]
+    elif app_reference.get("app_token"):
+        app_token = app_reference["app_token"]
+    elif app_reference.get("wiki_token") or app_reference.get("table_id") or app_reference.get("view_id"):
+        app_token = ""
+    else:
+        app_token = app_value
+
+    wiki_token = str(
+        args.get("wiki_token")
+        or parsed_reference.get("wiki_token")
+        or app_reference.get("wiki_token")
+        or os.getenv("FEISHU_BITABLE_WIKI_TOKEN")
+        or ""
+    ).strip()
+    table_id = str(
+        args.get("table_id")
+        or parsed_reference.get("table_id")
+        or app_reference.get("table_id")
+        or os.getenv("FEISHU_BITABLE_TABLE_ID")
+        or ""
+    ).strip()
+
+    if not app_token and wiki_token:
+        resolver = client or build_feishu_client()
+        payload = resolver.request_json(
+            "GET",
+            "/open-apis/wiki/v2/spaces/get_node",
+            params={"token": wiki_token},
+        )
+        node = payload.get("node") or {}
+        obj_type = str(node.get("obj_type") or "").strip().lower()
+        resolved_token = str(node.get("obj_token") or "").strip()
+        if obj_type != "bitable" or not resolved_token:
+            raise ValueError(
+                f"Wiki token '{wiki_token}' does not point to a Bitable node. Resolved obj_type={obj_type or 'unknown'}."
+            )
+        app_token = resolved_token
+
+    if not app_token or (require_table_id and not table_id):
+        raise ValueError(
+            "Bitable target is not configured. Provide app_token/table_id, a wiki token/link + table_id, or set FEISHU_BITABLE_APP_TOKEN / FEISHU_BITABLE_WIKI_TOKEN and FEISHU_BITABLE_TABLE_ID."
+        )
     return app_token, table_id
 
 
@@ -1006,12 +1114,22 @@ def load_feishu_model_registry(force_refresh: bool = False) -> Dict[str, Any]:
 
 def get_feishu_capability_snapshot(*, probe: bool = False) -> Dict[str, Any]:
     app_id, app_secret, domain = get_feishu_config()
+    bitable_app_token = str(os.getenv("FEISHU_BITABLE_APP_TOKEN") or "").strip()
+    bitable_wiki_token = str(os.getenv("FEISHU_BITABLE_WIKI_TOKEN") or "").strip()
+    bitable_table_id = str(os.getenv("FEISHU_BITABLE_TABLE_ID") or "").strip()
     payload: Dict[str, Any] = {
         "configured": bool(app_id and app_secret),
         "domain": domain,
         "base_url": get_feishu_base_url(),
         "tool_capabilities": sorted(get_feishu_tool_capabilities()),
-        "bitable_configured": bool(os.getenv("FEISHU_BITABLE_APP_TOKEN") and os.getenv("FEISHU_BITABLE_TABLE_ID")),
+        "bitable_configured": bool((bitable_app_token or bitable_wiki_token) and bitable_table_id),
+        "bitable_resolution_mode": (
+            "app_token"
+            if bitable_app_token
+            else "wiki_token"
+            if bitable_wiki_token
+            else "unconfigured"
+        ),
         "model_registry_mirror_enabled": str(os.getenv("FEISHU_MODEL_REGISTRY_MIRROR_ENABLED", "") or "").strip().lower() in {"1", "true", "yes"},
         "default_workspace": str(os.getenv("HERMES_FEISHU_DEFAULT_WORKSPACE", "") or "").strip(),
         "routing_state_present": get_routing_state_path().exists(),
@@ -1033,7 +1151,7 @@ def get_feishu_capability_snapshot(*, probe: bool = False) -> Dict[str, Any]:
             payload["home_channel_probe"] = {"ok": False, "error": str(exc)}
     if payload["bitable_configured"]:
         try:
-            app_token, table_id = resolve_bitable_target({})
+            app_token, table_id = resolve_bitable_target({}, build_feishu_client())
             schema = build_feishu_client().request_json(
                 "GET",
                 f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/fields",

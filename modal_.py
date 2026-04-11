@@ -1260,6 +1260,7 @@ class RuntimeSettings:
     nvidia_base_url: Optional[str]
     enabled_toolsets: list[str]
     disabled_toolsets: list[str]
+    feishu_bitable_wiki_token: Optional[str] = None
 
     @classmethod
     def from_env(cls) -> "RuntimeSettings":
@@ -1283,6 +1284,7 @@ class RuntimeSettings:
             feishu_verification_token=os.getenv("FEISHU_VERIFICATION_TOKEN"),
             feishu_encrypt_key=os.getenv("FEISHU_ENCRYPT_KEY"),
             feishu_bitable_app_token=os.getenv("FEISHU_BITABLE_APP_TOKEN"),
+            feishu_bitable_wiki_token=os.getenv("FEISHU_BITABLE_WIKI_TOKEN"),
             feishu_bitable_table_id=os.getenv("FEISHU_BITABLE_TABLE_ID"),
             feishu_model_registry_mirror_enabled=_is_truthy(os.getenv("FEISHU_MODEL_REGISTRY_MIRROR_ENABLED"), default=False),
             feishu_tool_capabilities=_split_csv(os.getenv("HERMES_FEISHU_TOOL_CAPABILITIES")),
@@ -1307,6 +1309,7 @@ def _serialize_settings_for_log(settings: RuntimeSettings) -> dict[str, Any]:
     payload["feishu_verification_token"] = _mask_secret(settings.feishu_verification_token)
     payload["feishu_encrypt_key"] = _mask_secret(settings.feishu_encrypt_key)
     payload["feishu_bitable_app_token"] = _mask_secret(settings.feishu_bitable_app_token)
+    payload["feishu_bitable_wiki_token"] = _mask_secret(settings.feishu_bitable_wiki_token)
     payload["feishu_bitable_table_id"] = _mask_secret(settings.feishu_bitable_table_id)
     payload["qq_app_id"] = _mask_secret(settings.qq_app_id)
     payload["qq_app_secret"] = _mask_secret(settings.qq_app_secret)
@@ -3063,9 +3066,10 @@ def _sync_feishu_model_registry_impl(*, force_refresh: bool = False, mirror_to_b
             "mirrored": False,
         }
         if should_mirror:
-            app_token, table_id = resolve_bitable_target({})
+            client = build_feishu_client()
+            app_token, table_id = resolve_bitable_target({}, client)
             result["bitable_mirror"] = mirror_model_registry_to_bitable(
-                build_feishu_client(),
+                client,
                 registry_payload,
                 app_token=app_token,
                 table_id=table_id,
@@ -3090,15 +3094,21 @@ def _prepare_feishu_model_registry_bitable_impl(
 ) -> dict[str, Any]:
     _prepare_runtime_environment()
     try:
-        from tools.feishu_api import build_feishu_client, ensure_model_registry_bitable_schema
+        from tools.feishu_api import build_feishu_client, ensure_model_registry_bitable_schema, resolve_bitable_target
 
-        resolved_app_token = str(app_token or os.getenv("FEISHU_BITABLE_APP_TOKEN") or "").strip()
-        if not resolved_app_token:
-            return {"status": "error", "error": "FEISHU_BITABLE_APP_TOKEN is not configured"}
+        client = build_feishu_client()
+        resolved_app_token, resolved_table_id = resolve_bitable_target(
+            {
+                "app_token": app_token,
+                "table_id": table_id,
+            },
+            client,
+            require_table_id=False,
+        )
         return ensure_model_registry_bitable_schema(
-            build_feishu_client(),
+            client,
             app_token=resolved_app_token,
-            table_id=str(table_id or "").strip() or None,
+            table_id=resolved_table_id or None,
             table_name=str(table_name or "Hermes Model Registry").strip() or "Hermes Model Registry",
             create_missing_table=create_missing_table,
             create_missing_fields=create_missing_fields,

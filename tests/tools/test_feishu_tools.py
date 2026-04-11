@@ -12,10 +12,12 @@ from tools.feishu_api import (
     build_model_registry,
     check_feishu_available,
     ensure_model_registry_bitable_schema,
+    extract_bitable_reference,
     extract_document_id,
     get_model_registry_path,
     mirror_model_registry_to_bitable,
     normalize_document_summary,
+    resolve_bitable_target,
 )
 from tools.feishu_tools import (
     feishu_bitable_get_schema_tool,
@@ -31,6 +33,7 @@ from tools.feishu_tools import (
     feishu_lookup_user_tool,
     feishu_message_send_tool,
     feishu_model_registry_publish_card_tool,
+    feishu_model_registry_prepare_bitable_tool,
     feishu_model_registry_sync_tool,
     feishu_sheet_create_tool,
     feishu_sheet_read_range_tool,
@@ -86,6 +89,21 @@ class TestDocumentHelpers:
 
     def test_extract_document_id_from_token(self):
         assert extract_document_id("doxcnAbCdEf12345") == "doxcnAbCdEf12345"
+
+    def test_extract_bitable_reference_from_wiki_url(self):
+        assert extract_bitable_reference(
+            "wiki/B5tywV8uLiSGZckFCNvckOpMn6g?table=tblUtsdxN5HTFztl&view=vewMiw6ttA"
+        ) == {
+            "wiki_token": "B5tywV8uLiSGZckFCNvckOpMn6g",
+            "table_id": "tblUtsdxN5HTFztl",
+            "view_id": "vewMiw6ttA",
+        }
+
+    def test_extract_bitable_reference_from_base_url(self):
+        assert extract_bitable_reference("https://example.feishu.cn/base/appAbc123?table=tbl001") == {
+            "app_token": "appAbc123",
+            "table_id": "tbl001",
+        }
 
     def test_normalize_document_summary_truncates_raw_content(self):
         result = normalize_document_summary(
@@ -208,6 +226,47 @@ class TestFeishuLookupAndSheets:
 
 
 class TestFeishuBitableAndMessages:
+    @patch.dict(
+        "os.environ",
+        {"FEISHU_BITABLE_WIKI_TOKEN": "wiki_123", "FEISHU_BITABLE_TABLE_ID": "tbl_from_env"},
+        clear=False,
+    )
+    def test_resolve_bitable_target_from_wiki_token(self):
+        client = FakeClient()
+
+        def _request_json(method, path, **kwargs):
+            client.calls.append((method, path, kwargs))
+            return {"node": {"obj_type": "bitable", "obj_token": "app_resolved_123"}}
+
+        client.request_json = _request_json
+
+        app_token, table_id = resolve_bitable_target({}, client)
+
+        assert app_token == "app_resolved_123"
+        assert table_id == "tbl_from_env"
+        assert client.calls == [
+            (
+                "GET",
+                "/open-apis/wiki/v2/spaces/get_node",
+                {"params": {"token": "wiki_123"}},
+            )
+        ]
+
+    def test_resolve_bitable_target_prefers_direct_app_token(self):
+        client = FakeClient()
+
+        app_token, table_id = resolve_bitable_target(
+            {
+                "app_token": "https://example.feishu.cn/base/app_direct_123?table=tbl_inline",
+                "table_id": "tbl_override",
+            },
+            client,
+        )
+
+        assert app_token == "app_direct_123"
+        assert table_id == "tbl_override"
+        assert client.calls == []
+
     def test_bitable_get_list_and_upsert(self):
         client = FakeClient()
         responses = iter(
@@ -536,3 +595,34 @@ class TestFeishuFilesAndRegistry:
         assert synced["bitable_mirror"]["updated"] == 2
         assert published["message_id"] == "om_card_123"
         assert published["card_providers"] == ["nvidia", "openrouter"]
+
+    def test_model_registry_prepare_bitable_accepts_wiki_url(self):
+        client = FakeClient()
+
+        def _request_json(method, path, **kwargs):
+            client.calls.append((method, path, kwargs))
+            return {"node": {"obj_type": "bitable", "obj_token": "app_from_wiki"}}
+
+        client.request_json = _request_json
+
+        with patch("tools.feishu_tools._client", return_value=client), patch(
+            "tools.feishu_tools.ensure_model_registry_bitable_schema",
+            return_value={"status": "ok", "table_id": "tbl_target"},
+        ):
+            result = json.loads(
+                feishu_model_registry_prepare_bitable_tool(
+                    {
+                        "bitable_url": "wiki/B5tywV8uLiSGZckFCNvckOpMn6g?table=tblUtsdxN5HTFztl",
+                        "table_name": "Hermes Model Registry",
+                    }
+                )
+            )
+
+        assert result["status"] == "ok"
+        assert client.calls == [
+            (
+                "GET",
+                "/open-apis/wiki/v2/spaces/get_node",
+                {"params": {"token": "B5tywV8uLiSGZckFCNvckOpMn6g"}},
+            )
+        ]

@@ -124,7 +124,7 @@ FEISHU_BITABLE_GET_SCHEMA_SCHEMA = _schema(
     "feishu_bitable_get_schema",
     "Inspect Feishu Bitable table metadata and field definitions.",
     {
-        "app_token": {"type": "string", "description": "Bitable app token. Falls back to FEISHU_BITABLE_APP_TOKEN."},
+        "app_token": {"type": "string", "description": "Bitable app token, or a wiki/base URL that resolves into one. Falls back to FEISHU_BITABLE_APP_TOKEN."},
         "table_id": {"type": "string", "description": "Bitable table id. Falls back to FEISHU_BITABLE_TABLE_ID."},
     },
 )
@@ -133,7 +133,7 @@ FEISHU_BITABLE_LIST_RECORDS_SCHEMA = _schema(
     "feishu_bitable_list_records",
     "List Bitable records with optional view/filter/pagination.",
     {
-        "app_token": {"type": "string", "description": "Bitable app token. Falls back to FEISHU_BITABLE_APP_TOKEN."},
+        "app_token": {"type": "string", "description": "Bitable app token, or a wiki/base URL that resolves into one. Falls back to FEISHU_BITABLE_APP_TOKEN."},
         "table_id": {"type": "string", "description": "Bitable table id. Falls back to FEISHU_BITABLE_TABLE_ID."},
         "view_id": {"type": "string", "description": "Optional view id."},
         "field_names": {"type": "array", "items": {"type": "string"}, "description": "Optional list of field names to keep."},
@@ -146,7 +146,7 @@ FEISHU_BITABLE_UPSERT_RECORDS_SCHEMA = _schema(
     "feishu_bitable_upsert_records",
     "Create or update Bitable records. If record_id is present it updates, otherwise it creates.",
     {
-        "app_token": {"type": "string", "description": "Bitable app token. Falls back to FEISHU_BITABLE_APP_TOKEN."},
+        "app_token": {"type": "string", "description": "Bitable app token, or a wiki/base URL that resolves into one. Falls back to FEISHU_BITABLE_APP_TOKEN."},
         "table_id": {"type": "string", "description": "Bitable table id. Falls back to FEISHU_BITABLE_TABLE_ID."},
         "records": {"type": "array", "description": "List of record payloads: {'record_id'?: str, 'fields': {...}}", "items": {"type": "object"}},
     },
@@ -212,8 +212,10 @@ FEISHU_MODEL_REGISTRY_SYNC_SCHEMA = _schema(
     {
         "force_refresh": {"type": "boolean", "description": "Force rebuilding local registry from current routing state.", "default": False},
         "mirror_to_bitable": {"type": "boolean", "description": "Mirror the registry into Bitable after rebuilding.", "default": False},
-        "app_token": {"type": "string", "description": "Optional Bitable app token override."},
+        "app_token": {"type": "string", "description": "Optional Bitable app token override, or a wiki/base URL that resolves into one."},
         "table_id": {"type": "string", "description": "Optional Bitable table id override."},
+        "wiki_token": {"type": "string", "description": "Optional wiki token when the Bitable is mounted under wiki."},
+        "bitable_url": {"type": "string", "description": "Optional wiki/base URL. Hermes extracts app_token and table_id when possible."},
     },
 )
 
@@ -221,8 +223,10 @@ FEISHU_MODEL_REGISTRY_PREPARE_BITABLE_SCHEMA = _schema(
     "feishu_model_registry_prepare_bitable",
     "Create or validate the recommended Feishu Bitable table, fields, and views for Hermes model registry mirroring.",
     {
-        "app_token": {"type": "string", "description": "Bitable app token. Falls back to FEISHU_BITABLE_APP_TOKEN."},
+        "app_token": {"type": "string", "description": "Bitable app token, or a wiki/base URL that resolves into one. Falls back to FEISHU_BITABLE_APP_TOKEN."},
         "table_id": {"type": "string", "description": "Optional target table id. If omitted, Hermes finds or creates the table by name."},
+        "wiki_token": {"type": "string", "description": "Optional wiki token when the Bitable is mounted under wiki."},
+        "bitable_url": {"type": "string", "description": "Optional wiki/base URL. Hermes extracts app_token and table_id when possible."},
         "table_name": {"type": "string", "description": "Table name to find or create.", "default": "Hermes Model Registry"},
         "create_missing_table": {"type": "boolean", "description": "Create the table if it does not exist.", "default": True},
         "create_missing_fields": {"type": "boolean", "description": "Create missing recommended fields.", "default": True},
@@ -616,6 +620,7 @@ def feishu_model_registry_sync_tool(args: Dict[str, Any], **_kw: Any) -> str:
     )
     try:
         registry_payload = build_model_registry(force_refresh=force_refresh)
+        client = _client()
         result: Dict[str, Any] = {
             "success": True,
             "registry_path": str(get_model_registry_path()),
@@ -624,9 +629,9 @@ def feishu_model_registry_sync_tool(args: Dict[str, Any], **_kw: Any) -> str:
             "source": registry_payload.get("source"),
         }
         if mirror_to_bitable:
-            app_token, table_id = resolve_bitable_target(args)
+            app_token, table_id = resolve_bitable_target(args, client)
             result["bitable_mirror"] = mirror_model_registry_to_bitable(
-                _client(),
+                client,
                 registry_payload,
                 app_token=app_token,
                 table_id=table_id,
@@ -639,13 +644,12 @@ def feishu_model_registry_sync_tool(args: Dict[str, Any], **_kw: Any) -> str:
 
 def feishu_model_registry_prepare_bitable_tool(args: Dict[str, Any], **_kw: Any) -> str:
     try:
-        app_token = str(args.get("app_token") or os.getenv("FEISHU_BITABLE_APP_TOKEN") or "").strip()
-        if not app_token:
-            return tool_error("app_token is required or set FEISHU_BITABLE_APP_TOKEN")
+        client = _client()
+        app_token, table_id = resolve_bitable_target(args, client, require_table_id=False)
         result = ensure_model_registry_bitable_schema(
-            _client(),
+            client,
             app_token=app_token,
-            table_id=str(args.get("table_id") or "").strip() or None,
+            table_id=table_id or None,
             table_name=str(args.get("table_name") or "Hermes Model Registry").strip() or "Hermes Model Registry",
             create_missing_table=bool(args.get("create_missing_table", True)),
             create_missing_fields=bool(args.get("create_missing_fields", True)),
