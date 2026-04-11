@@ -1978,6 +1978,11 @@ def _extract_feishu_event_metadata(payload: dict[str, Any]) -> tuple[str, str]:
     return event_id, event_type
 
 
+def _should_inline_feishu_control_event(event_type: str) -> bool:
+    normalized = str(event_type or "").strip().lower()
+    return normalized in {"application.bot.menu_v6", "card.action.trigger"}
+
+
 async def _await_feishu_pending_batches(adapter: Any) -> None:
     timeout_raw = os.getenv("HERMES_FEISHU_WEBHOOK_DRAIN_TIMEOUT_SECONDS", "6").strip()
     try:
@@ -3578,6 +3583,15 @@ def create_web_app():
                 event_type or "unknown",
                 event_id or "none",
             )
+            if _should_inline_feishu_control_event(event_type):
+                _append_feishu_trace("webhook.inline_control", payload)
+                logger.warning(
+                    "[Feishu] webhook inline control event_type=%s event_id=%s",
+                    event_type or "unknown",
+                    event_id or "none",
+                )
+                await _dispatch_feishu_payload(payload, await_background_tasks=True)
+                return JSONResponse({"code": 0, "msg": "accepted"})
             context = _extract_feishu_queue_context(payload)
             enqueue_result = await _enqueue_chat_event_async(
                 platform="feishu",

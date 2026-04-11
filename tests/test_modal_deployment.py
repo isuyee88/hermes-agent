@@ -1425,6 +1425,61 @@ def test_dispatch_feishu_update_processes_message_synchronously(monkeypatch):
     assert handled["spawned"]["partition"] == handled["enqueued"]["partition"]
 
 
+def test_feishu_menu_event_bypasses_chat_queue(monkeypatch):
+    module = _load_module()
+    handled = {"dispatched": None, "enqueued": False, "spawned": False}
+    monkeypatch.setenv("FEISHU_APP_ID", "cli_feishu_app")
+    monkeypatch.setenv("FEISHU_APP_SECRET", "feishu-secret-123")
+    payload = {
+        "header": {
+            "event_type": "application.bot.menu_v6",
+            "event_id": "evt_menu_inline",
+            "token": "verify-token",
+        },
+        "event": {
+            "event_key": "model_picker",
+            "operator": {"operator_id": {"open_id": "ou_user"}},
+        },
+    }
+
+    async def _fake_parse(_request):
+        return object(), payload
+
+    async def _fake_dispatch(raw_payload, await_background_tasks=False):
+        handled["dispatched"] = {
+            "payload": raw_payload,
+            "await_background_tasks": await_background_tasks,
+        }
+
+    async def _fake_spawn_aio(**kwargs):
+        handled["spawned"] = kwargs
+
+    async def _fake_enqueue(**kwargs):
+        handled["enqueued"] = True
+        return {"status": "enqueued", "queue_depth": 1}
+
+    monkeypatch.setattr(module, "_parse_feishu_webhook_request", _fake_parse)
+    monkeypatch.setattr(module, "_dispatch_feishu_payload", _fake_dispatch)
+    monkeypatch.setattr(module, "_enqueue_chat_event_async", _fake_enqueue)
+    monkeypatch.setattr(module, "_mark_feishu_event_seen", lambda _event_id: True)
+    monkeypatch.setattr(
+        module,
+        "process_chat_queue",
+        types.SimpleNamespace(spawn=types.SimpleNamespace(aio=_fake_spawn_aio)),
+        raising=False,
+    )
+
+    client = TestClient(module.create_web_app())
+    response = client.post("/feishu/webhook", json=payload)
+
+    assert response.status_code == 200
+    assert response.json() == {"code": 0, "msg": "accepted"}
+    assert handled["dispatched"]["payload"]["header"]["event_id"] == "evt_menu_inline"
+    assert handled["dispatched"]["await_background_tasks"] is True
+    assert handled["enqueued"] is False
+    assert handled["spawned"] is False
+
+
 def test_validate_feishu_webhook_impl_builds_signed_encrypted_request(monkeypatch):
     module = _load_module()
     monkeypatch.setenv("FEISHU_APP_ID", "cli_feishu_app")
