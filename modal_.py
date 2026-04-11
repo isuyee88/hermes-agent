@@ -62,6 +62,7 @@ SESSIONS_DIR = DATA_ROOT / "sessions"
 UPDATES_PATH = DATA_ROOT / "telegram_updates.json"
 FEISHU_EVENTS_PATH = DATA_ROOT / "feishu_events.json"
 FEISHU_TRACE_PATH = DATA_ROOT / "feishu_trace.jsonl"
+FEISHU_SYNC_STATE_PATH = DATA_ROOT / "feishu_sync_state.json"
 HERMES_HOME_DIR = Path(os.getenv("HERMES_HOME", "/data/hermes-home"))
 DEFAULT_CONFIG_SOURCE = Path(__file__).with_name("config.modal.yaml")
 DEFAULT_SUPERMEMORY_CONFIG_SOURCE = Path(__file__).with_name("supermemory.modal.json")
@@ -83,6 +84,9 @@ ROUTING_STATE_PATH = DATA_ROOT / "free_model_routing.json"
 CHAT_QUEUE_CLAIMS_PATH = DATA_ROOT / "chat_queue_claims.json"
 CRON_QUEUE_CLAIMS_PATH = DATA_ROOT / "cron_queue_claims.json"
 TELEGRAM_WEBHOOK_SYNC_STATE_PATH = DATA_ROOT / "telegram_webhook_sync.json"
+DEFAULT_FEISHU_MODEL_REGISTRY_SYNC_INTERVAL_SECONDS = int(
+    os.getenv("FEISHU_MODEL_REGISTRY_SYNC_INTERVAL_SECONDS", "1800")
+)
 DEFAULT_OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 DEFAULT_NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
 DEFAULT_NVIDIA_POPULAR_MODELS_URL = "https://build.nvidia.com/models?orderBy=weightPopular%3ADESC"
@@ -1261,6 +1265,10 @@ class RuntimeSettings:
     enabled_toolsets: list[str]
     disabled_toolsets: list[str]
     feishu_bitable_wiki_token: Optional[str] = None
+    feishu_model_registry_sync_interval_seconds: int = DEFAULT_FEISHU_MODEL_REGISTRY_SYNC_INTERVAL_SECONDS
+    feishu_mcp_enabled: bool = False
+    feishu_mcp_prefer_official: bool = True
+    feishu_mcp_server_name: Optional[str] = None
 
     @classmethod
     def from_env(cls) -> "RuntimeSettings":
@@ -1287,8 +1295,12 @@ class RuntimeSettings:
             feishu_bitable_wiki_token=os.getenv("FEISHU_BITABLE_WIKI_TOKEN"),
             feishu_bitable_table_id=os.getenv("FEISHU_BITABLE_TABLE_ID"),
             feishu_model_registry_mirror_enabled=_is_truthy(os.getenv("FEISHU_MODEL_REGISTRY_MIRROR_ENABLED"), default=False),
+            feishu_model_registry_sync_interval_seconds=_get_feishu_sync_interval_seconds(),
             feishu_tool_capabilities=_split_csv(os.getenv("HERMES_FEISHU_TOOL_CAPABILITIES")),
             feishu_default_workspace=os.getenv("HERMES_FEISHU_DEFAULT_WORKSPACE"),
+            feishu_mcp_enabled=_is_truthy(os.getenv("HERMES_FEISHU_MCP_ENABLED"), default=False),
+            feishu_mcp_prefer_official=_is_truthy(os.getenv("HERMES_FEISHU_MCP_PREFER_OFFICIAL"), default=True),
+            feishu_mcp_server_name=os.getenv("HERMES_FEISHU_MCP_SERVER_NAME"),
             qq_app_id=os.getenv("QQ_APP_ID"),
             qq_app_secret=os.getenv("QQ_APP_SECRET"),
             nvidia_api_key=os.getenv("NVIDIA_API_KEY") or os.getenv("NGC_API_KEY"),
@@ -1493,6 +1505,54 @@ def _load_telegram_webhook_sync_state() -> dict[str, Any]:
 
 def _save_telegram_webhook_sync_state(payload: dict[str, Any]) -> None:
     _atomic_json_write(TELEGRAM_WEBHOOK_SYNC_STATE_PATH, payload)
+
+
+def _load_feishu_sync_state() -> dict[str, Any]:
+    payload = _load_json_file(FEISHU_SYNC_STATE_PATH, {})
+    return payload if isinstance(payload, dict) else {}
+
+
+def _save_feishu_sync_state(payload: dict[str, Any]) -> None:
+    _atomic_json_write(FEISHU_SYNC_STATE_PATH, payload)
+
+
+def _get_feishu_sync_interval_seconds() -> int:
+    raw = str(os.getenv("FEISHU_MODEL_REGISTRY_SYNC_INTERVAL_SECONDS", "") or "").strip()
+    if not raw:
+        return DEFAULT_FEISHU_MODEL_REGISTRY_SYNC_INTERVAL_SECONDS
+    try:
+        return max(60, int(raw))
+    except Exception:
+        return DEFAULT_FEISHU_MODEL_REGISTRY_SYNC_INTERVAL_SECONDS
+
+
+def _mask_runtime_identifier(value: str | None) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    if len(raw) <= 10:
+        return _mask_secret(raw)
+    return f"{raw[:4]}...{raw[-4:]}"
+
+
+def _compact_feishu_schema_status(result: dict[str, Any]) -> dict[str, Any]:
+    existing_field_names = result.get("existing_field_names") if isinstance(result.get("existing_field_names"), list) else []
+    existing_view_names = result.get("existing_view_names") if isinstance(result.get("existing_view_names"), list) else []
+    return {
+        "status": result.get("status"),
+        "app_token": str(result.get("app_token") or ""),
+        "app_token_masked": _mask_runtime_identifier(result.get("app_token")),
+        "table_id": str(result.get("table_id") or ""),
+        "table_name": result.get("table_name"),
+        "created_table": bool(result.get("created_table")),
+        "created_field_count": len(result.get("created_fields") or []),
+        "created_view_count": len(result.get("created_views") or []),
+        "field_count": len(existing_field_names),
+        "view_count": len(existing_view_names),
+        "missing_required_fields": list(result.get("missing_required_fields") or []),
+        "missing_optional_fields": list(result.get("missing_optional_fields") or []),
+        "missing_views": list(result.get("missing_views") or []),
+    }
 
 
 def _telegram_webhook_retry_after_seconds(exc: Exception) -> int:
@@ -3048,39 +3108,123 @@ def _build_feishu_model_registry_debug_state(*, force_refresh: bool = False) -> 
         }
 
 
-def _sync_feishu_model_registry_impl(*, force_refresh: bool = False, mirror_to_bitable: bool | None = None) -> dict[str, Any]:
+def _run_feishu_registry_sync_cycle(
+    *,
+    force_refresh: bool = False,
+    mirror_to_bitable: bool | None = None,
+    ensure_schema: bool = True,
+) -> dict[str, Any]:
     _prepare_runtime_environment()
+    state = _load_feishu_sync_state()
+    now = int(time.time())
+    settings = RuntimeSettings.from_env()
+    should_mirror = (
+        mirror_to_bitable
+        if mirror_to_bitable is not None
+        else settings.feishu_model_registry_mirror_enabled
+    )
+    state.update(
+        {
+            "last_attempt_at": now,
+            "sync_interval_seconds": settings.feishu_model_registry_sync_interval_seconds,
+            "mirror_enabled": bool(should_mirror),
+        }
+    )
     try:
-        from tools.feishu_api import build_feishu_client, build_model_registry, mirror_model_registry_to_bitable, resolve_bitable_target
+        from tools.feishu_api import (
+            build_feishu_client,
+            build_model_registry,
+            ensure_model_registry_bitable_schema,
+            mirror_model_registry_to_bitable,
+            resolve_bitable_target,
+        )
 
         registry_payload = build_model_registry(force_refresh=force_refresh)
-        should_mirror = (
-            mirror_to_bitable
-            if mirror_to_bitable is not None
-            else _is_truthy(os.getenv("FEISHU_MODEL_REGISTRY_MIRROR_ENABLED"), default=False)
-        )
         result: dict[str, Any] = {
             "status": "ok",
             "entry_count": len(registry_payload.get("entries") or []),
             "registry": registry_payload,
             "mirrored": False,
         }
+        state["last_registry_entry_count"] = result["entry_count"]
+
         if should_mirror:
             client = build_feishu_client()
             app_token, table_id = resolve_bitable_target({}, client)
-            result["bitable_mirror"] = mirror_model_registry_to_bitable(
+            state["target"] = {
+                "app_token": app_token,
+                "app_token_masked": _mask_runtime_identifier(app_token),
+                "table_id": table_id,
+                "resolution_mode": "app_token" if settings.feishu_bitable_app_token else "wiki_token",
+            }
+            if ensure_schema:
+                schema_result = ensure_model_registry_bitable_schema(
+                    client,
+                    app_token=app_token,
+                    table_id=table_id or None,
+                    table_name="Hermes Model Registry",
+                    create_missing_table=True,
+                    create_missing_fields=True,
+                    create_missing_views=True,
+                )
+                result["bitable_schema"] = schema_result
+                compact_schema = _compact_feishu_schema_status(schema_result)
+                compact_schema["checked_at"] = now
+                state["schema"] = compact_schema
+
+            mirror_result = mirror_model_registry_to_bitable(
                 client,
                 registry_payload,
                 app_token=app_token,
                 table_id=table_id,
             )
+            result["bitable_mirror"] = mirror_result
             result["mirrored"] = True
+            state["last_success_at"] = now
+            state["last_status"] = "ok"
+            state["last_error"] = ""
+            state["last_sync"] = {
+                "status": "ok",
+                "mirrored": True,
+                "created": int(mirror_result.get("created") or 0),
+                "updated": int(mirror_result.get("updated") or 0),
+                "upserted": int(mirror_result.get("created") or 0) + int(mirror_result.get("updated") or 0),
+                "hidden": int(mirror_result.get("hidden") or 0),
+                "entry_count": result["entry_count"],
+                "completed_at": now,
+            }
+        else:
+            state["last_success_at"] = now
+            state["last_status"] = "ok"
+            state["last_error"] = ""
+            state["last_sync"] = {
+                "status": "ok",
+                "mirrored": False,
+                "entry_count": result["entry_count"],
+                "completed_at": now,
+            }
+
+        state["next_due_at"] = now + settings.feishu_model_registry_sync_interval_seconds
+        _save_feishu_sync_state(state)
         return result
     except Exception as exc:
+        state["last_status"] = "error"
+        state["last_error"] = str(exc)
+        state["last_error_at"] = now
+        state["next_due_at"] = now + min(settings.feishu_model_registry_sync_interval_seconds, 300)
+        _save_feishu_sync_state(state)
         return {
             "status": "error",
             "error": str(exc),
         }
+
+
+def _sync_feishu_model_registry_impl(*, force_refresh: bool = False, mirror_to_bitable: bool | None = None) -> dict[str, Any]:
+    return _run_feishu_registry_sync_cycle(
+        force_refresh=force_refresh,
+        mirror_to_bitable=mirror_to_bitable,
+        ensure_schema=True,
+    )
 
 
 def _prepare_feishu_model_registry_bitable_impl(
@@ -3093,6 +3237,8 @@ def _prepare_feishu_model_registry_bitable_impl(
     create_missing_views: bool = True,
 ) -> dict[str, Any]:
     _prepare_runtime_environment()
+    state = _load_feishu_sync_state()
+    now = int(time.time())
     try:
         from tools.feishu_api import build_feishu_client, ensure_model_registry_bitable_schema, resolve_bitable_target
 
@@ -3105,7 +3251,7 @@ def _prepare_feishu_model_registry_bitable_impl(
             client,
             require_table_id=False,
         )
-        return ensure_model_registry_bitable_schema(
+        result = ensure_model_registry_bitable_schema(
             client,
             app_token=resolved_app_token,
             table_id=resolved_table_id or None,
@@ -3114,11 +3260,129 @@ def _prepare_feishu_model_registry_bitable_impl(
             create_missing_fields=create_missing_fields,
             create_missing_views=create_missing_views,
         )
+        state["target"] = {
+            "app_token": resolved_app_token,
+            "app_token_masked": _mask_runtime_identifier(resolved_app_token),
+            "table_id": str(result.get("table_id") or resolved_table_id or ""),
+            "resolution_mode": "app_token" if RuntimeSettings.from_env().feishu_bitable_app_token else "wiki_token",
+        }
+        compact_schema = _compact_feishu_schema_status(result)
+        compact_schema["checked_at"] = now
+        state["schema"] = compact_schema
+        state["last_status"] = "ok"
+        state["last_error"] = ""
+        _save_feishu_sync_state(state)
+        return result
     except Exception as exc:
+        state["last_status"] = "error"
+        state["last_error"] = str(exc)
+        state["last_error_at"] = now
+        _save_feishu_sync_state(state)
         return {
             "status": "error",
             "error": str(exc),
         }
+
+
+def _build_feishu_sync_state_debug_state() -> dict[str, Any]:
+    _prepare_runtime_environment()
+    state = _load_feishu_sync_state()
+    settings = RuntimeSettings.from_env()
+    payload: dict[str, Any] = {
+        "configured": bool(
+            (settings.feishu_bitable_app_token or settings.feishu_bitable_wiki_token)
+            and settings.feishu_bitable_table_id
+        ),
+        "mirror_enabled": settings.feishu_model_registry_mirror_enabled,
+        "sync_interval_seconds": settings.feishu_model_registry_sync_interval_seconds,
+        "state_file": str(FEISHU_SYNC_STATE_PATH),
+        "last_attempt_at": state.get("last_attempt_at"),
+        "last_success_at": state.get("last_success_at"),
+        "last_status": state.get("last_status") or "",
+        "last_error": state.get("last_error") or "",
+        "next_due_at": state.get("next_due_at"),
+        "last_registry_entry_count": state.get("last_registry_entry_count"),
+        "target": state.get("target") or {},
+        "schema": state.get("schema") or {},
+        "last_sync": state.get("last_sync") or {},
+    }
+    try:
+        from tools.feishu_api import build_feishu_client, resolve_bitable_target
+
+        if payload["configured"]:
+            client = build_feishu_client()
+            app_token, table_id = resolve_bitable_target({}, client)
+            payload["resolved_target"] = {
+                "app_token": app_token,
+                "app_token_masked": _mask_runtime_identifier(app_token),
+                "table_id": table_id,
+            }
+    except Exception as exc:
+        payload["resolved_target_error"] = str(exc)
+    return payload
+
+
+def _build_feishu_mcp_debug_state(*, probe: bool = False) -> dict[str, Any]:
+    _prepare_runtime_environment()
+    settings = RuntimeSettings.from_env()
+    state: dict[str, Any] = {
+        "enabled": settings.feishu_mcp_enabled,
+        "prefer_official": settings.feishu_mcp_prefer_official,
+        "configured_server_name": str(settings.feishu_mcp_server_name or "").strip(),
+        "native_fallback_available": bool(settings.feishu_app_id and settings.feishu_app_secret),
+        "resolved_server_name": "",
+        "server_configured": False,
+        "connected": False,
+        "registered_tool_count": 0,
+        "registered_tools_sample": [],
+        "available_toolsets": [],
+    }
+    try:
+        from tools.mcp_tool import _load_mcp_config, discover_mcp_tools, get_mcp_status
+        from tools.registry import registry
+
+        if probe and settings.feishu_mcp_enabled:
+            try:
+                discover_mcp_tools()
+            except Exception as exc:
+                state["probe_error"] = str(exc)
+
+        configured = _load_mcp_config()
+        server_names = list(configured.keys())
+        state["configured_servers"] = server_names
+        resolved_server = str(settings.feishu_mcp_server_name or "").strip()
+        if not resolved_server:
+            for candidate in server_names:
+                lowered = candidate.lower()
+                if "feishu" in lowered or "lark" in lowered:
+                    resolved_server = candidate
+                    break
+        state["resolved_server_name"] = resolved_server
+        state["server_configured"] = resolved_server in configured
+
+        statuses = {item.get("name"): item for item in get_mcp_status()}
+        server_status = statuses.get(resolved_server) if resolved_server else None
+        if isinstance(server_status, dict):
+            state["connected"] = bool(server_status.get("connected"))
+            state["status"] = server_status
+
+        if resolved_server:
+            normalized = resolved_server.replace("-", "_").replace(".", "_")
+            prefix = f"mcp_{normalized}_"
+            tool_names = [name for name in registry.get_all_tool_names() if name.startswith(prefix)]
+            state["registered_tool_count"] = len(tool_names)
+            state["registered_tools_sample"] = tool_names[:25]
+            toolsets = sorted(
+                {
+                    registry.get_toolset_for_tool(name)
+                    for name in tool_names
+                    if registry.get_toolset_for_tool(name)
+                }
+            )
+            state["available_toolsets"] = toolsets
+    except Exception as exc:
+        state["error"] = str(exc)
+    return state
 
 
 def _debug_session_route_state(session_key: str) -> dict[str, Any]:
@@ -3500,6 +3764,28 @@ def create_web_app():
         except Exception as exc:
             logger.warning("Telegram webhook startup sync failed: %s", exc)
 
+    @app.on_event("startup")
+    async def _startup_prepare_feishu_registry_schema() -> None:
+        _prepare_runtime_environment()
+        settings = RuntimeSettings.from_env()
+        if not settings.feishu_model_registry_mirror_enabled:
+            return
+        if not settings.feishu_bitable_table_id or not (
+            settings.feishu_bitable_app_token or settings.feishu_bitable_wiki_token
+        ):
+            return
+        try:
+            result = await asyncio.to_thread(_prepare_feishu_model_registry_bitable_impl)
+            logger.info(
+                "Feishu registry schema startup prepare: status=%s table=%s created_table=%s missing_required=%s",
+                result.get("status"),
+                result.get("table_id"),
+                result.get("created_table"),
+                len(result.get("missing_required_fields") or []),
+            )
+        except Exception as exc:
+            logger.warning("Feishu registry schema startup prepare failed: %s", exc)
+
     @app.get("/healthz")
     async def healthz() -> dict[str, Any]:
         _prepare_runtime_environment()
@@ -3537,6 +3823,8 @@ def create_web_app():
             "cron": _cron_status_impl(limit=5),
             "memory_provider": memory_provider,
             "model_routing": _build_model_routing_debug_state(force_refresh=False, allow_network=False),
+            "feishu_sync": _build_feishu_sync_state_debug_state(),
+            "feishu_mcp": _build_feishu_mcp_debug_state(probe=False),
             "runtime_config": _sync_runtime_config(),
             "gateway_import_ok": gateway_import_ok,
             "gateway_import_error": gateway_import_error,
@@ -3920,6 +4208,8 @@ if modal is not None:
             "cron": _cron_status_impl(limit=5),
             "memory_provider": memory_provider,
             "model_routing": _build_model_routing_debug_state(force_refresh=False, allow_network=False),
+            "feishu_sync": _build_feishu_sync_state_debug_state(),
+            "feishu_mcp": _build_feishu_mcp_debug_state(probe=False),
             "runtime_config": _sync_runtime_config(),
             "gateway_import_ok": gateway_import_ok,
             "gateway_import_error": gateway_import_error,
@@ -4102,6 +4392,24 @@ if modal is not None:
     )
     def debug_feishu_model_registry(force_refresh: bool = False) -> dict[str, Any]:
         return _build_feishu_model_registry_debug_state(force_refresh=force_refresh)
+
+    @app.function(
+        image=image,
+        volumes={"/data": volume},
+        secrets=secrets,
+        timeout=30,
+    )
+    def debug_feishu_sync_state() -> dict[str, Any]:
+        return _build_feishu_sync_state_debug_state()
+
+    @app.function(
+        image=image,
+        volumes={"/data": volume},
+        secrets=secrets,
+        timeout=30,
+    )
+    def debug_feishu_mcp_state(probe: bool = False) -> dict[str, Any]:
+        return _build_feishu_mcp_debug_state(probe=probe)
 
     @app.function(
         image=image,
@@ -4310,15 +4618,27 @@ if modal is not None:
         volumes={"/data": volume},
         secrets=secrets,
         timeout=300,
-        schedule=modal.Period(minutes=30),
+        schedule=modal.Period(minutes=5),
     )
     def feishu_model_registry_heartbeat() -> dict[str, Any]:
         settings = RuntimeSettings.from_env()
         if not settings.feishu_model_registry_mirror_enabled:
             return {"status": "skipped", "reason": "mirror_disabled"}
-        if not settings.feishu_bitable_app_token or not settings.feishu_bitable_table_id:
+        if not settings.feishu_bitable_table_id or not (
+            settings.feishu_bitable_app_token or settings.feishu_bitable_wiki_token
+        ):
             return {"status": "skipped", "reason": "bitable_not_configured"}
-        return _sync_feishu_model_registry_impl(force_refresh=True, mirror_to_bitable=True)
+        sync_state = _load_feishu_sync_state()
+        now = int(time.time())
+        next_due_at = int(sync_state.get("next_due_at") or 0)
+        if next_due_at and now < next_due_at:
+            return {
+                "status": "skipped",
+                "reason": "not_due",
+                "next_due_at": next_due_at,
+                "seconds_until_due": next_due_at - now,
+            }
+        return _run_feishu_registry_sync_cycle(force_refresh=True, mirror_to_bitable=True, ensure_schema=True)
 
     @app.function(
         image=image,

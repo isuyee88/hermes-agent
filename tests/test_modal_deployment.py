@@ -478,6 +478,82 @@ def test_debug_feishu_capabilities_and_registry_helpers(monkeypatch):
     assert registry["entry_count"] == 1
 
 
+def test_debug_feishu_sync_state_helper(monkeypatch, tmp_path):
+    module = _load_module()
+    module.DATA_ROOT = tmp_path / "data"
+    module.SESSIONS_DIR = module.DATA_ROOT / "sessions"
+    module.UPDATES_PATH = module.DATA_ROOT / "telegram_updates.json"
+    module.FEISHU_SYNC_STATE_PATH = module.DATA_ROOT / "feishu_sync_state.json"
+    module.HERMES_HOME_DIR = tmp_path / "home"
+    module._ensure_runtime_dirs()
+    monkeypatch.setattr(module, "_prepare_runtime_environment", lambda: None)
+    monkeypatch.setenv("FEISHU_BITABLE_WIKI_TOKEN", "wiki_token_123")
+    monkeypatch.setenv("FEISHU_BITABLE_TABLE_ID", "tbl_123")
+    monkeypatch.setenv("FEISHU_MODEL_REGISTRY_SYNC_INTERVAL_SECONDS", "900")
+    module._save_feishu_sync_state(
+        {
+            "last_attempt_at": 100,
+            "last_success_at": 120,
+            "last_status": "ok",
+            "last_sync": {"status": "ok", "mirrored": True, "created": 2},
+            "schema": {"status": "ok", "table_id": "tbl_123"},
+        }
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "tools.feishu_api",
+        types.SimpleNamespace(
+            build_feishu_client=lambda: object(),
+            resolve_bitable_target=lambda _args, _client: ("app_token_123", "tbl_123"),
+        ),
+    )
+
+    payload = module._build_feishu_sync_state_debug_state()
+
+    assert payload["configured"] is True
+    assert payload["sync_interval_seconds"] == 900
+    assert payload["schema"]["table_id"] == "tbl_123"
+    assert payload["resolved_target"]["table_id"] == "tbl_123"
+
+
+def test_debug_feishu_mcp_state_helper(monkeypatch):
+    module = _load_module()
+    monkeypatch.setattr(module, "_prepare_runtime_environment", lambda: None)
+    monkeypatch.setenv("HERMES_FEISHU_MCP_ENABLED", "true")
+    monkeypatch.setenv("HERMES_FEISHU_MCP_PREFER_OFFICIAL", "true")
+    monkeypatch.setenv("HERMES_FEISHU_MCP_SERVER_NAME", "feishu")
+    monkeypatch.setitem(
+        sys.modules,
+        "tools.mcp_tool",
+        types.SimpleNamespace(
+            _load_mcp_config=lambda: {"feishu": {"enabled": True, "url": "https://example.test/mcp"}},
+            get_mcp_status=lambda: [{"name": "feishu", "connected": True, "tools": 3}],
+            discover_mcp_tools=lambda: ["mcp_feishu_docs_list", "mcp_feishu_bitable_query"],
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "tools.registry",
+        types.SimpleNamespace(
+            registry=types.SimpleNamespace(
+                get_all_tool_names=lambda: [
+                    "mcp_feishu_docs_list",
+                    "mcp_feishu_bitable_query",
+                    "feishu_doc_create",
+                ],
+                get_toolset_for_tool=lambda name: "mcp-feishu" if name.startswith("mcp_feishu_") else "feishu",
+            )
+        ),
+    )
+
+    payload = module._build_feishu_mcp_debug_state(probe=True)
+
+    assert payload["enabled"] is True
+    assert payload["resolved_server_name"] == "feishu"
+    assert payload["connected"] is True
+    assert payload["registered_tool_count"] == 2
+
+
 def test_health_check_reports_feishu_configured(monkeypatch):
     module = _load_module()
     monkeypatch.setenv("FEISHU_APP_ID", "cli_feishu_app")

@@ -14,7 +14,13 @@ prerequisites:
 
 # Feishu Workbench
 
-This skill teaches Hermes how to use the native Feishu tool surface as a workbench, not just a chat channel.
+This skill teaches Hermes how to use Feishu as a workbench, not just a chat channel.
+
+When both tool surfaces are available, prefer them in this order:
+
+1. Official Feishu MCP/CLI tools for workspace-style operations such as Docs, Sheets, Bitable, Contacts, and structured workbench actions.
+2. Native Hermes `feishu_*` tools as fallback for the same operations when the official MCP/CLI server is unavailable or missing permissions.
+3. Native Hermes Feishu platform sending for bot replies, interactive cards, model-picker controls, and attachment delivery back into the current conversation.
 
 ## When To Use
 
@@ -28,6 +34,10 @@ Use this skill when the user wants Hermes to:
 - download a Feishu attachment for later vision, OCR, or transcription
 
 ## Preferred Tool Mapping
+
+- Official Feishu MCP/CLI
+  - Prefer any discovered `mcp_feishu_*` or tools from the configured Feishu MCP server for workspace data operations.
+  - Use these first for Docs, Sheets, Bitable, Contacts, or other structured Feishu APIs when they are available in the current tool list.
 
 - Docs
   - `feishu_doc_create`
@@ -61,11 +71,15 @@ Use this skill when the user wants Hermes to:
 ## Working Rules
 
 1. Prefer native Feishu tools over raw HTTP or handwritten curl when a matching Hermes tool exists.
-2. For document/report delivery, first create or update the artifact, then send the resulting link or file back to the user in Feishu.
-3. For files generated locally, prefer the cross-platform `MEDIA:/absolute/path` convention or the explicit `feishu_file_send` tool.
-4. For large tables, read or write the smallest range possible. Do not dump full sheets unless the user explicitly asks.
-5. For Bitable writes, inspect schema first if the field names are uncertain.
-6. For destructive or risky operations, ask the user before changing shared workspace data.
+2. If official Feishu MCP/CLI tools are present, prefer them for workbench CRUD and data queries before falling back to native `feishu_*` wrappers.
+3. For document/report delivery, first create or update the artifact, then send the resulting link or file back to the user in Feishu.
+4. For files generated locally, prefer the cross-platform `MEDIA:/absolute/path` convention or the explicit `feishu_file_send` tool.
+5. For large tables, read or write the smallest range possible. Do not dump full sheets unless the user explicitly asks.
+6. For Bitable writes, inspect schema first if the field names are uncertain.
+7. The Bitable model registry is an operations mirror, not the live source of truth for routing. Do not treat table edits as automatic route changes unless the user explicitly asks for manual sync or review.
+8. Do not silently switch models. Model changes must come from explicit user intent, model picker controls, or a clearly requested `/model` command flow.
+9. Do not bypass native Hermes Feishu sending for the final bot reply in the active chat. Workspace operations can use MCP/CLI; the conversational reply path stays native.
+10. For destructive or risky operations, ask the user before changing shared workspace data.
 
 ## Recommended Patterns
 
@@ -85,8 +99,16 @@ Use this skill when the user wants Hermes to:
 1. Refresh registry with `feishu_model_registry_sync`
 2. Publish an interactive summary with `feishu_model_registry_publish_card`
 
+### Workspace-first, chat-native workflow
+
+1. Use official Feishu MCP/CLI tools first to inspect or update Docs, Sheets, Bitable, or Contacts
+2. If the MCP/CLI path is unavailable, fall back to native `feishu_*` tools
+3. Deliver the final result to the active chat with native Hermes Feishu sending or `MEDIA:/absolute/path`
+
 ## Avoid
 
 - Do not assume Feishu Drive permissions are required for normal chat attachment sending.
 - Do not hardcode Feishu API URLs in prompts when a Hermes tool already wraps the operation.
 - Do not switch models silently when the user is explicitly using Feishu model picker or provider controls.
+- Do not treat the Bitable mirror as the real-time routing database.
+- Do not send control-plane card or menu actions back through the chat LLM path if a direct handler exists.
