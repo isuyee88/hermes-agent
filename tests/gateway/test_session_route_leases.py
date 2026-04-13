@@ -76,6 +76,81 @@ def test_resolve_turn_agent_config_prefers_active_route_lease():
     assert turn["runtime"]["provider"] == "openrouter"
 
 
+def test_resolve_turn_agent_config_rehydrates_provider_specific_credentials_for_route_lease(monkeypatch):
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._session_model_overrides = {}
+    runner.session_store = SimpleNamespace(
+        _entries={
+            "feishu:oc_123": SimpleNamespace(
+                route_lease={
+                    "provider": "custom",
+                    "model": "moonshotai/kimi-k2.5",
+                    "base_url": "https://integrate.api.nvidia.com/v1",
+                    "api_mode": "chat_completions",
+                    "api_key_source": "custom",
+                    "lease_expires_at": 9999999999,
+                },
+                route_metrics={},
+            )
+        }
+    )
+
+    monkeypatch.setenv("NVIDIA_API_KEY", "nvapi-test")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
+
+    turn = runner._resolve_turn_agent_config(
+        "hello",
+        "openrouter/free",
+        {
+            "api_key": "sk-or-test",
+            "base_url": "https://openrouter.ai/api/v1",
+            "provider": "openrouter",
+            "api_mode": "chat_completions",
+            "_session_key": "feishu:oc_123",
+        },
+    )
+
+    assert turn["route_selection"] == "sticky_hit"
+    assert turn["model"] == "moonshotai/kimi-k2.5"
+    assert turn["runtime"]["provider"] == "nvidia"
+    assert turn["runtime"]["base_url"] == "https://integrate.api.nvidia.com/v1"
+    assert turn["runtime"]["api_key"] == "nvapi-test"
+
+
+def test_resolve_turn_agent_config_normalizes_custom_override_with_nvidia_base_url(monkeypatch):
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._session_model_overrides = {
+        "feishu:oc_123": {
+            "model": "moonshotai/kimi-k2.5",
+            "provider": "custom",
+            "base_url": "https://integrate.api.nvidia.com/v1/",
+            "api_key": "sk-stale-custom",
+            "api_mode": "chat_completions",
+        }
+    }
+    runner.session_store = SimpleNamespace(_entries={})
+
+    monkeypatch.setenv("NVIDIA_API_KEY", "nvapi-test")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
+
+    turn = runner._resolve_turn_agent_config(
+        "hello",
+        "openrouter/free",
+        {
+            "api_key": "sk-or-test",
+            "base_url": "https://openrouter.ai/api/v1",
+            "provider": "openrouter",
+            "api_mode": "chat_completions",
+            "_session_key": "feishu:oc_123",
+        },
+    )
+
+    assert turn["route_selection"] == "explicit_override"
+    assert turn["runtime"]["provider"] == "nvidia"
+    assert turn["runtime"]["base_url"] == "https://integrate.api.nvidia.com/v1/"
+    assert turn["runtime"]["api_key"] == "nvapi-test"
+
+
 def test_resolve_turn_agent_config_prefers_session_override_over_lease():
     runner = GatewayRunner.__new__(GatewayRunner)
     runner._session_model_overrides = {

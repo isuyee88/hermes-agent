@@ -80,6 +80,13 @@ class TestLoadMCPConfig:
             result = _load_mcp_config()
             assert result == {}
 
+    def test_discover_mcp_tools_can_be_suppressed(self):
+        from tools.mcp_tool import discover_mcp_tools, suppress_mcp_discovery
+
+        with patch("tools.mcp_tool._load_mcp_config", side_effect=AssertionError("should not load config")):
+            with suppress_mcp_discovery("test"):
+                assert discover_mcp_tools() == []
+
 
 # ---------------------------------------------------------------------------
 # Schema conversion

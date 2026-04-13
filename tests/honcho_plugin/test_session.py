@@ -361,3 +361,35 @@ class TestDialecticInputGuard:
         # The query passed to chat() should be truncated
         actual_query = mock_peer.chat.call_args[0][0]
         assert len(actual_query) <= 100
+
+
+# ---------------------------------------------------------------------------
+# System prompt command injection
+# ---------------------------------------------------------------------------
+
+
+class TestSystemPromptCommandInjection:
+    def test_tools_mode_includes_management_commands_without_session(self):
+        provider = HonchoMemoryProvider()
+        provider._recall_mode = "tools"
+        provider._config = SimpleNamespace()
+
+        block = provider.system_prompt_block()
+
+        assert "Management commands:" in block
+        assert "honcho status | mode | sessions | map | identity" in block
+        assert "Session: pending. Mode: tools." in block
+
+    def test_hybrid_mode_includes_management_commands_and_session_key(self):
+        provider = HonchoMemoryProvider()
+        provider._recall_mode = "hybrid"
+        provider._config = SimpleNamespace()
+        provider._manager = MagicMock()
+        provider._session_key = "project-main"
+        provider._first_turn_context = ""
+
+        block = provider.system_prompt_block()
+
+        assert "Active (hybrid mode)." in block
+        assert "Management commands:" in block
+        assert "Session: project-main. Mode: hybrid." in block

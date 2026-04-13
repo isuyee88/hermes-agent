@@ -4,7 +4,12 @@ import argparse
 import json
 import os
 
-from tools.feishu_api import build_feishu_client, ensure_model_registry_bitable_schema, resolve_bitable_target
+from tools.feishu_api import (
+    bootstrap_model_registry_bitable,
+    build_feishu_client,
+    ensure_model_registry_bitable_schema,
+    resolve_bitable_target,
+)
 
 
 def main() -> int:
@@ -16,11 +21,53 @@ def main() -> int:
     parser.add_argument("--bitable-url", default="", help="Optional wiki/base URL. Hermes will extract app_token and table_id when possible.")
     parser.add_argument("--table-id", default="", help="Existing table id. Falls back to FEISHU_BITABLE_TABLE_ID. If omitted, the script finds or creates by table name.")
     parser.add_argument("--table-name", default="Hermes Model Registry", help="Target table name.")
+    parser.add_argument(
+        "--create-app",
+        action="store_true",
+        help="Create a dedicated Feishu Bitable app first, then initialize the Hermes model registry schema inside it.",
+    )
+    parser.add_argument(
+        "--app-name",
+        default="Hermes Model Registry",
+        help="Name for a newly created Bitable app when --create-app is used.",
+    )
+    parser.add_argument(
+        "--folder-token",
+        default="",
+        help="Optional Feishu folder token used when creating a dedicated Bitable app.",
+    )
+    parser.add_argument(
+        "--time-zone",
+        default="Asia/Shanghai",
+        help="Time zone used for a newly created Bitable app when --create-app is used.",
+    )
+    parser.add_argument(
+        "--no-reuse-default-table",
+        action="store_true",
+        help="When creating a dedicated Bitable app, create a new Hermes registry table instead of reusing the app's default table.",
+    )
     parser.add_argument("--no-create-table", action="store_true", help="Validate only; do not create the table.")
     parser.add_argument("--no-create-fields", action="store_true", help="Validate only; do not create missing fields.")
     parser.add_argument("--no-create-views", action="store_true", help="Validate only; do not create missing views.")
     args = parser.parse_args()
     client = build_feishu_client()
+
+    if args.create_app:
+        try:
+            result = bootstrap_model_registry_bitable(
+                client,
+                app_name=args.app_name,
+                table_name=args.table_name,
+                folder_token=args.folder_token or None,
+                time_zone=args.time_zone or None,
+                reuse_default_table=not args.no_reuse_default_table,
+            )
+        except Exception as exc:
+            print(json.dumps({"status": "error", "error": str(exc)}, ensure_ascii=False, indent=2))
+            return 1
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0 if result.get("status") in {"ok", "partial"} else 1
+
     try:
         app_token, table_id = resolve_bitable_target(
             {

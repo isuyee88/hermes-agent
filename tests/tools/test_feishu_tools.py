@@ -9,7 +9,9 @@ from unittest.mock import patch
 import httpx
 
 from tools.feishu_api import (
+    FeishuOpenApiClient,
     build_model_registry,
+    bootstrap_model_registry_bitable,
     check_feishu_available,
     ensure_model_registry_bitable_schema,
     extract_bitable_reference,
@@ -27,17 +29,24 @@ from tools.feishu_tools import (
     feishu_doc_append_markdown_tool,
     feishu_doc_create_tool,
     feishu_doc_get_tool,
+    feishu_doc_replace_markdown_tool,
+    feishu_audio_send_tool,
     feishu_file_download_tool,
+    feishu_image_send_tool,
+    feishu_image_upload_tool,
     feishu_file_send_tool,
     feishu_file_upload_tool,
     feishu_lookup_user_tool,
     feishu_message_send_tool,
+    feishu_model_registry_list_tool,
+    feishu_model_registry_bootstrap_bitable_tool,
     feishu_model_registry_publish_card_tool,
     feishu_model_registry_prepare_bitable_tool,
     feishu_model_registry_sync_tool,
     feishu_sheet_create_tool,
     feishu_sheet_read_range_tool,
     feishu_sheet_write_range_tool,
+    feishu_video_send_tool,
 )
 
 
@@ -160,6 +169,78 @@ class TestFeishuDocTools:
 
         assert result["success"] is True
         assert result["inserted_blocks"] == 2
+
+    def test_doc_replace_markdown_clears_existing_children_then_inserts(self):
+        client = FakeClient()
+        responses = iter(
+            [
+                {"block": {"block_id": "doxcnProject123", "children": ["blk_1", "blk_2"]}},
+                {"document_revision_id": 8},
+                {"document_revision_id": 9},
+            ]
+        )
+
+        def _request_json(method, path, **kwargs):
+            client.calls.append((method, path, kwargs))
+            return next(responses)
+
+        client.request_json = _request_json
+        with patch("tools.feishu_tools._client", return_value=client):
+            result = json.loads(
+                feishu_doc_replace_markdown_tool(
+                    {"document_id_or_url": "doxcnProject123", "markdown": "Replacement line 1\nReplacement line 2"}
+                )
+            )
+
+        assert result["success"] is True
+        assert result["update_mode"] == "replace"
+        assert result["cleared_blocks"] == 2
+        assert result["inserted_blocks"] == 2
+        assert client.calls == [
+            (
+                "GET",
+                "/open-apis/docx/v1/documents/doxcnProject123/blocks/doxcnProject123",
+                {},
+            ),
+            (
+                "DELETE",
+                "/open-apis/docx/v1/documents/doxcnProject123/blocks/doxcnProject123/children/batch_delete",
+                {"json_body": {"start_index": 0, "end_index": 1}},
+            ),
+            (
+                "POST",
+                "/open-apis/docx/v1/documents/doxcnProject123/blocks/doxcnProject123/children",
+                {"json_body": {"children": [
+                    {"block_type": 2, "paragraph": {"elements": [{"text_run": {"content": "Replacement line 1"}, "type": "text_run"}]}},
+                    {"block_type": 2, "paragraph": {"elements": [{"text_run": {"content": "Replacement line 2"}, "type": "text_run"}]}},
+                ], "index": 0}},
+            ),
+        ]
+
+    def test_doc_replace_markdown_supports_clear_only(self):
+        client = FakeClient()
+        responses = iter(
+            [
+                {"block": {"block_id": "doxcnProject123", "children": ["blk_1"]}},
+                {"document_revision_id": 11},
+            ]
+        )
+
+        def _request_json(method, path, **kwargs):
+            client.calls.append((method, path, kwargs))
+            return next(responses)
+
+        client.request_json = _request_json
+        with patch("tools.feishu_tools._client", return_value=client):
+            result = json.loads(
+                feishu_doc_replace_markdown_tool(
+                    {"document_id_or_url": "doxcnProject123", "markdown": ""}
+                )
+            )
+
+        assert result["success"] is True
+        assert result["cleared_only"] is True
+        assert result["inserted_blocks"] == 0
 
 
 class TestFeishuLookupAndSheets:
@@ -366,6 +447,72 @@ class TestFeishuBitableAndMessages:
             "Hidden or Inactive",
         ]
 
+    def test_bootstrap_model_registry_bitable_creates_dedicated_app_and_schema(self):
+        client = FakeClient()
+        responses = iter(
+            [
+                {
+                    "app": {
+                        "app_token": "app_bootstrap_123",
+                        "default_table_id": "tbl_default_123",
+                        "url": "https://example.feishu.cn/base/app_bootstrap_123",
+                    }
+                },
+                {"items": [{"table_id": "tbl_default_123", "name": "数据表"}], "has_more": False},
+                {"items": [{"field_name": "文本"}]},
+                {"field": {"field_id": "fld_model", "field_name": "Model"}},
+                {"field": {"field_id": "fld_provider", "field_name": "Provider"}},
+                {"field": {"field_id": "fld_display", "field_name": "Display Name"}},
+                {"field": {"field_id": "fld_status", "field_name": "Status"}},
+                {"field": {"field_id": "fld_hidden", "field_name": "Hidden"}},
+                {"field": {"field_id": "fld_available", "field_name": "Is Available"}},
+                {"field": {"field_id": "fld_free", "field_name": "Is Free"}},
+                {"field": {"field_id": "fld_rank", "field_name": "Rank"}},
+                {"field": {"field_id": "fld_hint", "field_name": "Selection Hint"}},
+                {"field": {"field_id": "fld_pinned", "field_name": "Manual Pinned"}},
+                {"field": {"field_id": "fld_recent", "field_name": "Recent Used"}},
+                {"field": {"field_id": "fld_recent_count", "field_name": "Recent Used Count"}},
+                {"field": {"field_id": "fld_command", "field_name": "Generated Command"}},
+                {"field": {"field_id": "fld_probe", "field_name": "Last Probe At"}},
+                {"field": {"field_id": "fld_recent_at", "field_name": "Recent Used At"}},
+                {"field": {"field_id": "fld_sync", "field_name": "Last Sync At"}},
+                {"field": {"field_id": "fld_latency", "field_name": "Latency Ms"}},
+                {"field": {"field_id": "fld_context", "field_name": "Context Window"}},
+                {"field": {"field_id": "fld_reasoning", "field_name": "Reasoning"}},
+                {"field": {"field_id": "fld_failures", "field_name": "Consecutive Failures"}},
+                {"field": {"field_id": "fld_failure_kind", "field_name": "Failure Kind"}},
+                {"field": {"field_id": "fld_error_code", "field_name": "Last Error Code"}},
+                {"field": {"field_id": "fld_error_message", "field_name": "Last Error Message"}},
+                {"field": {"field_id": "fld_failed_at", "field_name": "Last Failed At"}},
+                {"field": {"field_id": "fld_source", "field_name": "Source"}},
+                {"items": [], "has_more": False},
+                {"view": {"view_id": "vew_all", "view_name": "All Models"}},
+                {"view": {"view_id": "vew_recommended", "view_name": "Recommended"}},
+                {"view": {"view_id": "vew_recent", "view_name": "Recent Used"}},
+                {"view": {"view_id": "vew_hidden", "view_name": "Hidden or Inactive"}},
+            ]
+        )
+
+        def _request_json(method, path, **kwargs):
+            client.calls.append((method, path, kwargs))
+            return next(responses)
+
+        client.request_json = _request_json
+
+        result = bootstrap_model_registry_bitable(
+            client,
+            app_name="Hermes Dedicated Mirror",
+            table_name="Hermes Model Registry",
+        )
+
+        assert result["status"] == "ok"
+        assert result["env"] == {
+            "FEISHU_BITABLE_APP_TOKEN": "app_bootstrap_123",
+            "FEISHU_BITABLE_TABLE_ID": "tbl_default_123",
+        }
+        assert result["schema"]["table_id"] == "tbl_default_123"
+        assert result["app"]["app_token"] == "app_bootstrap_123"
+
     def test_message_send_and_chat_lookup(self):
         client = FakeClient()
         client.send_message = lambda **_kwargs: {"message_id": "om_123"}
@@ -381,6 +528,115 @@ class TestFeishuBitableAndMessages:
         assert sent["success"] is True
         assert sent["message_id"] == "om_123"
         assert chat["chat"]["chat_id"] == "oc_123"
+
+    def test_message_send_auto_detects_open_id_target(self):
+        client = FakeClient()
+
+        def _send_message(**kwargs):
+            client.calls.append(("send_message", kwargs))
+            return {"message_id": "om_open_123"}
+
+        client.send_message = _send_message
+
+        with patch("tools.feishu_tools._client", return_value=client):
+            sent = json.loads(
+                feishu_message_send_tool(
+                    {"chat_id": "ou_1234567890", "message": "Hello from menu fallback", "msg_type": "text"}
+                )
+            )
+
+        assert sent["success"] is True
+        assert sent["receive_id"] == "ou_1234567890"
+        assert sent["receive_id_type"] == "open_id"
+        assert client.calls == [
+            (
+                "send_message",
+                {
+                    "receive_id": "ou_1234567890",
+                    "receive_id_type": "open_id",
+                    "msg_type": "text",
+                    "content": json.dumps({"text": "Hello from menu fallback"}, ensure_ascii=False),
+                },
+            )
+        ]
+
+    def test_message_send_supports_resource_messages(self):
+        client = FakeClient()
+
+        def _send_message(**kwargs):
+            client.calls.append(("send_message", kwargs))
+            return {"message_id": "om_resource_123"}
+
+        client.send_message = _send_message
+
+        with patch("tools.feishu_tools._client", return_value=client):
+            image_result = json.loads(
+                feishu_message_send_tool(
+                    {
+                        "receive_id": "oc_123",
+                        "msg_type": "image",
+                        "image_key": "img_123",
+                    }
+                )
+            )
+            audio_result = json.loads(
+                feishu_message_send_tool(
+                    {
+                        "receive_id": "u_123",
+                        "msg_type": "audio",
+                        "file_key": "file_audio_123",
+                    }
+                )
+            )
+
+        assert image_result["success"] is True
+        assert image_result["receive_id_type"] == "chat_id"
+        assert audio_result["success"] is True
+        assert audio_result["receive_id_type"] == "user_id"
+        assert client.calls == [
+            (
+                "send_message",
+                {
+                    "receive_id": "oc_123",
+                    "receive_id_type": "chat_id",
+                    "msg_type": "image",
+                    "content": json.dumps({"image_key": "img_123"}, ensure_ascii=False),
+                },
+            ),
+            (
+                "send_message",
+                {
+                    "receive_id": "u_123",
+                    "receive_id_type": "user_id",
+                    "msg_type": "audio",
+                    "content": json.dumps({"file_key": "file_audio_123"}, ensure_ascii=False),
+                },
+            ),
+        ]
+
+    def test_api_client_send_message_passes_receive_id_type(self):
+        client = object.__new__(FeishuOpenApiClient)
+        captured = {}
+
+        def _request_json(method, path, **kwargs):
+            captured["method"] = method
+            captured["path"] = path
+            captured["kwargs"] = kwargs
+            return {"message_id": "om_api_123"}
+
+        client.request_json = _request_json
+
+        result = client.send_message(
+            receive_id="ou_1234567890",
+            msg_type="text",
+            content=json.dumps({"text": "hello"}, ensure_ascii=False),
+        )
+
+        assert result["message_id"] == "om_api_123"
+        assert captured["method"] == "POST"
+        assert captured["path"] == "/open-apis/im/v1/messages"
+        assert captured["kwargs"]["params"] == {"receive_id_type": "open_id"}
+        assert captured["kwargs"]["json_body"]["receive_id"] == "ou_1234567890"
 
 
 class TestFeishuFilesAndRegistry:
@@ -431,6 +687,9 @@ class TestFeishuFilesAndRegistry:
         ), patch("tools.feishu_api.get_sessions_dir", return_value=sessions_dir), patch(
             "tools.feishu_api.load_json",
             side_effect=lambda path, default: routing_state if str(path).endswith("free_model_routing.json") else json.loads(Path(path).read_text(encoding="utf-8")) if Path(path).exists() else default,
+        ), patch(
+            "agent.models_dev.list_agentic_models",
+            side_effect=lambda provider: ["openai/gpt-4.1-mini"] if provider == "openrouter" else ["meta/llama-3.1-70b-instruct"] if provider == "nvidia" else [],
         ):
             payload = build_model_registry(force_refresh=True)
 
@@ -441,6 +700,8 @@ class TestFeishuFilesAndRegistry:
         assert nvidia["recent_used"] is True
         assert nvidia["recent_used_count"] == 1
         assert nvidia["status"] == "active"
+        assert ("openrouter", "openai/gpt-4.1-mini") in by_key
+        assert ("nvidia", "meta/llama-3.1-70b-instruct") in by_key
 
         invalid = by_key[("openrouter", "google/gemma-3-27b-it:free")]
         assert invalid["hidden"] is True
@@ -556,6 +817,53 @@ class TestFeishuFilesAndRegistry:
         assert downloaded["local_path"] == str(target)
         assert target.read_bytes() == b"downloaded"
 
+    def test_image_upload_and_send(self, tmp_path):
+        source = tmp_path / "chart.png"
+        source.write_bytes(b"pngdata")
+
+        client = FakeClient()
+        client.upload_im_image = lambda **_kwargs: {"image_key": "img_123"}
+        client.send_uploaded_image_message = lambda **_kwargs: {"message_id": "om_img_123"}
+
+        with patch("tools.feishu_tools._client", return_value=client):
+            uploaded = json.loads(feishu_image_upload_tool({"file_path": str(source)}))
+            sent = json.loads(
+                feishu_image_send_tool({"chat_id": "oc_123", "file_path": str(source), "caption": "Latest chart"})
+            )
+
+        assert uploaded["image_key"] == "img_123"
+        assert sent["image_key"] == "img_123"
+        assert sent["message_id"] == "om_img_123"
+
+    def test_audio_and_video_send(self, tmp_path):
+        audio = tmp_path / "sample.ogg"
+        video = tmp_path / "demo.mp4"
+        audio.write_bytes(b"audiodata")
+        video.write_bytes(b"videodata")
+
+        client = FakeClient()
+        sent_calls = []
+        client.upload_im_file = lambda **kwargs: {"file_key": f"file_{kwargs['file_name']}"}
+
+        def _send_uploaded_file_message(**kwargs):
+            sent_calls.append(kwargs)
+            return {"message_id": f"om_{kwargs['outbound_message_type']}"}
+
+        client.send_uploaded_file_message = _send_uploaded_file_message
+
+        with patch("tools.feishu_tools._client", return_value=client):
+            audio_result = json.loads(
+                feishu_audio_send_tool({"chat_id": "oc_123", "file_path": str(audio), "caption": "Voice note"})
+            )
+            video_result = json.loads(
+                feishu_video_send_tool({"chat_id": "oc_123", "file_path": str(video), "caption": "Demo clip"})
+            )
+
+        assert audio_result["message_id"] == "om_audio"
+        assert video_result["message_id"] == "om_media"
+        assert sent_calls[0]["outbound_message_type"] == "audio"
+        assert sent_calls[1]["outbound_message_type"] == "media"
+
     def test_model_registry_sync_and_publish_card(self, tmp_path):
         registry_payload = {
             "status": "ok",
@@ -563,12 +871,17 @@ class TestFeishuFilesAndRegistry:
             "refreshed_at": 123,
             "source": "routing_state",
             "entries": [
-                {"provider": "openrouter", "model": "m1", "is_available": True, "is_free": True, "selection_hint": "recommended"},
-                {"provider": "nvidia", "model": "m2", "is_available": True, "is_free": True, "selection_hint": "fallback"},
+                {"provider": "openrouter", "model": "m1", "is_available": True, "is_free": True, "selection_hint": "recommended", "recent_used": True},
+                {"provider": "nvidia", "model": "m2", "is_available": True, "is_free": True, "selection_hint": "fallback", "recent_used": False},
             ],
         }
         client = FakeClient()
-        client.send_message = lambda **_kwargs: {"message_id": "om_card_123"}
+
+        def _send_message(**kwargs):
+            client.calls.append(("send_message", kwargs))
+            return {"message_id": "om_card_123"}
+
+        client.send_message = _send_message
         with patch("tools.feishu_tools._client", return_value=client), patch(
             "tools.feishu_tools.build_model_registry",
             return_value=registry_payload,
@@ -595,6 +908,60 @@ class TestFeishuFilesAndRegistry:
         assert synced["bitable_mirror"]["updated"] == 2
         assert published["message_id"] == "om_card_123"
         assert published["card_providers"] == ["nvidia", "openrouter"]
+        assert published["interaction_mode"] == "registry_switch_model"
+        sent = next(call for call in client.calls if call[0] == "send_message")
+        card = json.loads(sent[1]["content"])
+        action_rows = [item for item in card["elements"] if item.get("tag") == "action"]
+        button_values = [action["value"] for row in action_rows for action in row.get("actions", [])]
+        assert any(value.get("hermes_action") == "registry_switch_model" for value in button_values)
+        assert any(value.get("provider") == "openrouter" and value.get("model") == "m1" for value in button_values)
+        assert any(value.get("provider") == "nvidia" and value.get("model") == "m2" for value in button_values)
+
+    def test_model_registry_list_filters_provider_and_recent(self):
+        registry_payload = {
+            "status": "ok",
+            "generated_at": 123,
+            "source": "routing_state",
+            "entries": [
+                {
+                    "provider": "openrouter",
+                    "model": "m1",
+                    "display_name": "Model 1",
+                    "status": "active",
+                    "is_available": True,
+                    "is_free": True,
+                    "selection_hint": "recommended",
+                    "recent_used": False,
+                    "recent_used_count": 0,
+                    "generated_command": "/model m1 --provider openrouter",
+                },
+                {
+                    "provider": "nvidia",
+                    "model": "m2",
+                    "display_name": "Model 2",
+                    "status": "active",
+                    "is_available": True,
+                    "is_free": True,
+                    "selection_hint": "candidate",
+                    "recent_used": True,
+                    "recent_used_count": 4,
+                    "generated_command": "/model m2 --provider nvidia",
+                },
+            ],
+        }
+
+        with patch("tools.feishu_tools.build_model_registry", return_value=registry_payload):
+            result = json.loads(
+                feishu_model_registry_list_tool(
+                    {"provider": "nvidia", "recent_only": True, "available_only": True, "limit": 10}
+                )
+            )
+
+        assert result["success"] is True
+        assert result["count"] == 1
+        assert result["entries"][0]["provider"] == "nvidia"
+        assert result["entries"][0]["model"] == "m2"
+        assert result["entries"][0]["generated_command"] == "/model m2 --provider nvidia"
 
     def test_model_registry_prepare_bitable_accepts_wiki_url(self):
         client = FakeClient()
@@ -626,3 +993,32 @@ class TestFeishuFilesAndRegistry:
                 {"params": {"token": "B5tywV8uLiSGZckFCNvckOpMn6g"}},
             )
         ]
+
+    def test_model_registry_bootstrap_bitable_tool_returns_env_suggestions(self):
+        client = FakeClient()
+
+        with patch("tools.feishu_tools._client", return_value=client), patch(
+            "tools.feishu_tools.bootstrap_model_registry_bitable",
+            return_value={
+                "status": "ok",
+                "app": {"app_token": "app_bootstrap_123"},
+                "schema": {"table_id": "tbl_bootstrap_123"},
+                "env": {
+                    "FEISHU_BITABLE_APP_TOKEN": "app_bootstrap_123",
+                    "FEISHU_BITABLE_TABLE_ID": "tbl_bootstrap_123",
+                },
+            },
+        ):
+            result = json.loads(
+                feishu_model_registry_bootstrap_bitable_tool(
+                    {
+                        "app_name": "Hermes Workbench",
+                        "table_name": "Hermes Model Registry",
+                        "reuse_default_table": True,
+                    }
+                )
+            )
+
+        assert result["status"] == "ok"
+        assert result["env"]["FEISHU_BITABLE_APP_TOKEN"] == "app_bootstrap_123"
+        assert result["schema"]["table_id"] == "tbl_bootstrap_123"

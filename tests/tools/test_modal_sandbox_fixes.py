@@ -243,6 +243,10 @@ class TestEnsurepipFix:
             "_resolve_modal_image should include ensurepip fix "
             "for Modal's legacy image builder"
         )
+        assert "libsecret-1-0" in source, (
+            "_resolve_modal_image should install libsecret-1-0 for Debian/Ubuntu "
+            "images so token storage dependencies do not hard-fail at runtime"
+        )
         assert "setup_dockerfile_commands" in source, (
             "_resolve_modal_image should use setup_dockerfile_commands "
             "to fix pip before Modal's bootstrap"

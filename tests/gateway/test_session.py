@@ -354,6 +354,47 @@ class TestBuildSessionContextPrompt:
         assert "**User:** Alice" in prompt
         assert "Multi-user thread" not in prompt
 
+    def test_feishu_prompt_includes_default_bitable_target(self, monkeypatch):
+        config = GatewayConfig(
+            platforms={
+                Platform.FEISHU: PlatformConfig(enabled=True, token="fake"),
+            },
+        )
+        monkeypatch.setenv("FEISHU_BITABLE_APP_TOKEN", "app_token_demo")
+        monkeypatch.setenv("FEISHU_BITABLE_TABLE_ID", "tbl_demo")
+        source = SessionSource(
+            platform=Platform.FEISHU,
+            chat_id="oc_demo",
+            chat_type="dm",
+            user_name="Alice",
+        )
+        ctx = build_session_context(source, config)
+        prompt = build_session_context_prompt(ctx)
+
+        assert "Feishu workbench defaults" in prompt
+        assert "Do not ask the user for a table link" in prompt
+        assert "`app_token_demo`" in prompt
+        assert "`tbl_demo`" in prompt
+
+    def test_non_feishu_prompt_does_not_include_bitable_defaults(self, monkeypatch):
+        config = GatewayConfig(
+            platforms={
+                Platform.TELEGRAM: PlatformConfig(enabled=True, token="fake"),
+            },
+        )
+        monkeypatch.setenv("FEISHU_BITABLE_APP_TOKEN", "app_token_demo")
+        monkeypatch.setenv("FEISHU_BITABLE_TABLE_ID", "tbl_demo")
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="123",
+            chat_type="dm",
+            user_name="Alice",
+        )
+        ctx = build_session_context(source, config)
+        prompt = build_session_context_prompt(ctx)
+
+        assert "Feishu workbench defaults" not in prompt
+
 
 class TestSessionStoreRewriteTranscript:
     """Regression: /retry and /undo must persist truncated history to disk."""

@@ -25,6 +25,7 @@ _BITABLE_APP_URL_RE = re.compile(r"/base/([^/?]+)")
 _BITABLE_WIKI_URL_RE = re.compile(r"(?:^|/)wiki/([A-Za-z0-9]+)")
 _TRUNCATE_RAW_CONTENT_AT = 12_000
 _FEISHU_FILE_UPLOAD_TYPE = "stream"
+_FEISHU_IMAGE_UPLOAD_TYPE = "message"
 _FEISHU_DOC_UPLOAD_TYPES = {
     ".pdf": "pdf",
     ".doc": "doc",
@@ -46,6 +47,7 @@ _DEFAULT_FEISHU_TOOL_CAPABILITIES = {
     "model_registry",
 }
 _SUPPORTED_MESSAGE_RESOURCE_TYPES = {"file", "image", "audio", "media"}
+_SUPPORTED_MESSAGE_RECEIVE_ID_TYPES = {"chat_id", "open_id", "user_id", "union_id", "email"}
 _MODEL_REGISTRY_FILE_NAME = "feishu_model_registry.json"
 _MODEL_REGISTRY_SCHEMA_VERSION = 2
 _MODEL_REGISTRY_SESSIONS_DIR_NAME = "sessions"
@@ -247,6 +249,41 @@ def _build_recent_model_usage(limit: int = 500) -> dict[tuple[str, str], dict[st
             row["last_error_message"] = error_text
             row["last_failed_at"] = max(int(row.get("last_failed_at") or 0), updated_at)
             row["failure_kind"] = _normalize_failure_kind(error_text, failure_reason)
+    try:
+        from tools.model_registry_refresh import load_model_failure_ledger
+
+        for key, failure in load_model_failure_ledger().items():
+            provider, model = key
+            row = usage.setdefault(
+                key,
+                {
+                    "recent_used_count": 0,
+                    "recent_used_at": 0,
+                    "last_error_message": "",
+                    "last_error_code": "",
+                    "last_failed_at": 0,
+                    "consecutive_failures": 0,
+                    "failure_kind": "",
+                    "selection_reason": "",
+                },
+            )
+            row["consecutive_failures"] = max(
+                int(row.get("consecutive_failures") or 0),
+                int(failure.get("consecutive_failures") or 0),
+            )
+            row["last_error_code"] = str(failure.get("last_error_code") or row.get("last_error_code") or "").strip()
+            failure_message = str(failure.get("last_error_message") or "").strip()
+            if failure_message:
+                row["last_error_message"] = failure_message
+            row["last_failed_at"] = max(
+                int(row.get("last_failed_at") or 0),
+                int(failure.get("last_failed_at") or 0),
+            )
+            failure_kind = str(failure.get("failure_kind") or "").strip()
+            if failure_kind:
+                row["failure_kind"] = failure_kind
+    except Exception:
+        logger.warning("Failed merging model failure ledger into Feishu registry usage", exc_info=True)
     return usage
 
 
@@ -612,19 +649,49 @@ class FeishuOpenApiClient:
             )
         return payload.get("data", {}) or {}
 
+    def upload_im_image(self, *, file_path: Path) -> Dict[str, Any]:
+        resolved_name = str(file_path.name)
+        with file_path.open("rb") as fh:
+            response = httpx.post(
+                f"{self.base_url}/open-apis/im/v1/images",
+                headers=self._auth_headers(),
+                data={"image_type": _FEISHU_IMAGE_UPLOAD_TYPE},
+                files={"image": (resolved_name, fh, mimetypes.guess_type(resolved_name)[0] or "application/octet-stream")},
+                timeout=self.timeout,
+            )
+        response.raise_for_status()
+        payload = response.json()
+        if payload.get("code", 0) != 0:
+            raise FeishuOpenApiError(
+                str(payload.get("msg") or "Feishu image upload failed"),
+                code=payload.get("code"),
+                log_id=str(payload.get("log_id") or ""),
+                status_code=response.status_code,
+            )
+        return payload.get("data", {}) or {}
+
     def send_message(
         self,
         *,
-        chat_id: str,
+        chat_id: str | None = None,
+        receive_id: str | None = None,
+        receive_id_type: str | None = None,
         msg_type: str,
         content: str,
     ) -> Dict[str, Any]:
+        resolved_receive_id = str(receive_id or chat_id or "").strip()
+        if not resolved_receive_id:
+            raise ValueError("receive_id or chat_id is required")
+        resolved_receive_id_type = resolve_message_receive_id_type(
+            resolved_receive_id,
+            explicit_type=receive_id_type,
+        )
         return self.request_json(
             "POST",
             "/open-apis/im/v1/messages",
-            params={"receive_id_type": "chat_id"},
+            params={"receive_id_type": resolved_receive_id_type},
             json_body={
-                "receive_id": chat_id,
+                "receive_id": resolved_receive_id,
                 "msg_type": msg_type,
                 "content": content,
                 "uuid": str(uuid.uuid4()),
@@ -638,30 +705,76 @@ class FeishuOpenApiClient:
         file_key: str,
         caption: str | None = None,
         file_name: str | None = None,
+        outbound_message_type: str = "file",
+    ) -> Dict[str, Any]:
+        attachment_response = self.send_message(
+            receive_id=chat_id,
+            msg_type=str(outbound_message_type or "file").strip() or "file",
+            content=json.dumps({"file_key": file_key}, ensure_ascii=False),
+        )
+        if caption:
+            caption_response = self.send_message(
+                receive_id=chat_id,
+                msg_type="text",
+                content=json.dumps({"text": caption}, ensure_ascii=False),
+            )
+            if isinstance(attachment_response, dict) and isinstance(caption_response, dict):
+                attachment_response = {
+                    **attachment_response,
+                    "caption_message_id": caption_response.get("message_id"),
+                }
+        return attachment_response
+
+    def send_uploaded_image_message(
+        self,
+        *,
+        chat_id: str,
+        image_key: str,
+        caption: str | None = None,
     ) -> Dict[str, Any]:
         if caption:
             content = json.dumps(
                 {
                     "zh_cn": {
-                        "title": file_name or "Attachment",
+                        "title": "Image",
                         "content": [
                             [{"tag": "text", "text": caption}],
-                            [{"tag": "media", "file_key": file_key, "file_name": file_name or "attachment"}],
+                            [{"tag": "img", "image_key": image_key}],
                         ],
                     }
                 },
                 ensure_ascii=False,
             )
-            return self.send_message(chat_id=chat_id, msg_type="post", content=content)
+            return self.send_message(receive_id=chat_id, msg_type="post", content=content)
         return self.send_message(
-            chat_id=chat_id,
-            msg_type="file",
-            content=json.dumps({"file_key": file_key}, ensure_ascii=False),
+            receive_id=chat_id,
+            msg_type="image",
+            content=json.dumps({"image_key": image_key}, ensure_ascii=False),
         )
 
 
 def build_feishu_client() -> FeishuOpenApiClient:
     return FeishuOpenApiClient()
+
+
+def resolve_message_receive_id_type(receive_id: str, *, explicit_type: str | None = None) -> str:
+    normalized_explicit = str(explicit_type or "").strip().lower()
+    if normalized_explicit:
+        if normalized_explicit not in _SUPPORTED_MESSAGE_RECEIVE_ID_TYPES:
+            allowed = ", ".join(sorted(_SUPPORTED_MESSAGE_RECEIVE_ID_TYPES))
+            raise ValueError(f"Unsupported receive_id_type '{explicit_type}'. Expected one of: {allowed}")
+        return normalized_explicit
+
+    normalized_receive_id = str(receive_id or "").strip()
+    if normalized_receive_id.startswith("ou_"):
+        return "open_id"
+    if normalized_receive_id.startswith("on_"):
+        return "union_id"
+    if normalized_receive_id.startswith("u_"):
+        return "user_id"
+    if "@" in normalized_receive_id and "." in normalized_receive_id.rsplit("@", 1)[-1]:
+        return "email"
+    return "chat_id"
 
 
 def resolve_user_identifier(client: FeishuOpenApiClient, args: Dict[str, Any]) -> Tuple[str, str]:
@@ -815,6 +928,29 @@ def list_bitable_views(client: "FeishuOpenApiClient", *, app_token: str, table_i
         if not page_token:
             break
     return views
+
+
+def create_bitable_app(
+    client: "FeishuOpenApiClient",
+    *,
+    app_name: str,
+    folder_token: str | None = None,
+    time_zone: str | None = None,
+) -> dict[str, Any]:
+    body: Dict[str, Any] = {"name": app_name}
+    normalized_folder_token = str(folder_token or "").strip()
+    normalized_time_zone = str(time_zone or "").strip()
+    if normalized_folder_token:
+        body["folder_token"] = normalized_folder_token
+    if normalized_time_zone:
+        body["time_zone"] = normalized_time_zone
+    payload = client.request_json(
+        "POST",
+        "/open-apis/bitable/v1/apps",
+        json_body=body,
+    )
+    app = payload.get("app") if isinstance(payload.get("app"), dict) else payload
+    return app if isinstance(app, dict) else {}
 
 
 def create_bitable_table(
@@ -994,6 +1130,45 @@ def ensure_model_registry_bitable_schema(
     }
 
 
+def bootstrap_model_registry_bitable(
+    client: "FeishuOpenApiClient",
+    *,
+    app_name: str = "Hermes Model Registry",
+    table_name: str = _DEFAULT_MODEL_REGISTRY_TABLE_NAME,
+    folder_token: str | None = None,
+    time_zone: str | None = None,
+    reuse_default_table: bool = True,
+) -> Dict[str, Any]:
+    app = create_bitable_app(
+        client,
+        app_name=app_name,
+        folder_token=folder_token,
+        time_zone=time_zone,
+    )
+    app_token = str(app.get("app_token") or "").strip()
+    if not app_token:
+        raise RuntimeError("Feishu did not return app_token when creating the Bitable app")
+    default_table_id = str(app.get("default_table_id") or "").strip()
+    schema = ensure_model_registry_bitable_schema(
+        client,
+        app_token=app_token,
+        table_id=default_table_id if reuse_default_table and default_table_id else None,
+        table_name=table_name,
+        create_missing_table=True,
+        create_missing_fields=True,
+        create_missing_views=True,
+    )
+    return {
+        "status": schema.get("status") or "ok",
+        "app": app,
+        "schema": schema,
+        "env": {
+            "FEISHU_BITABLE_APP_TOKEN": app_token,
+            "FEISHU_BITABLE_TABLE_ID": str(schema.get("table_id") or "").strip(),
+        },
+    }
+
+
 def build_model_registry(force_refresh: bool = False) -> Dict[str, Any]:
     ensure_feishu_data_dir()
     registry_path = get_model_registry_path()
@@ -1029,9 +1204,26 @@ def build_model_registry(force_refresh: bool = False) -> Dict[str, Any]:
     registry_entries: list[dict[str, Any]] = []
     now = int(time.time())
     try:
-        from agent.models_dev import get_model_info
+        from agent.models_dev import get_model_info, list_agentic_models
     except Exception:
         get_model_info = None
+        list_agentic_models = None
+
+    if list_agentic_models is not None:
+        for provider in ("openrouter", "nvidia"):
+            try:
+                discovered_models = [
+                    str(item).strip()
+                    for item in list_agentic_models(provider)
+                    if str(item).strip()
+                ]
+            except Exception:
+                discovered_models = []
+            if not discovered_models:
+                continue
+            existing = provider_candidates.get(provider, [])
+            provider_candidates[provider] = list(dict.fromkeys([*existing, *discovered_models]))
+
     usage_map = _build_recent_model_usage(limit=500)
 
     for provider, candidates in provider_candidates.items():

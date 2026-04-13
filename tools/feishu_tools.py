@@ -9,6 +9,7 @@ from typing import Any, Dict, Iterable
 
 from tools.feishu_api import (
     FeishuOpenApiClient,
+    bootstrap_model_registry_bitable,
     build_download_target_path,
     build_feishu_client,
     build_model_registry,
@@ -26,6 +27,7 @@ from tools.feishu_api import (
     normalize_document_summary,
     normalize_user_profile,
     quote_range,
+    resolve_message_receive_id_type,
     resolve_bitable_target,
     resolve_user_identifier,
     validate_message_resource_type,
@@ -73,6 +75,19 @@ FEISHU_DOC_APPEND_MARKDOWN_SCHEMA = _schema(
     {
         "document_id_or_url": {"type": "string", "description": "Doc token like doxcn... or a full doc URL."},
         "markdown": {"type": "string", "description": "Markdown or plain text to append."},
+    },
+    required=["document_id_or_url", "markdown"],
+)
+
+FEISHU_DOC_REPLACE_MARKDOWN_SCHEMA = _schema(
+    "feishu_doc_replace_markdown",
+    "Replace the root content of an existing Feishu Docx document with markdown/plain text. Use this when the document should be refreshed instead of appended to.",
+    {
+        "document_id_or_url": {"type": "string", "description": "Doc token like doxcn... or a full doc URL."},
+        "markdown": {
+            "type": "string",
+            "description": "Markdown or plain text to become the new document body. Use an empty string to clear the document body.",
+        },
     },
     required=["document_id_or_url", "markdown"],
 )
@@ -155,14 +170,18 @@ FEISHU_BITABLE_UPSERT_RECORDS_SCHEMA = _schema(
 
 FEISHU_MESSAGE_SEND_SCHEMA = _schema(
     "feishu_message_send",
-    "Send a Feishu message to a chat. Supports text, post, and interactive card payloads.",
+    "Send a Feishu message to a chat or user target. Supports text, post, interactive cards, and native image/file/audio/media payloads.",
     {
-        "chat_id": {"type": "string", "description": "Target chat open_chat_id / chat_id."},
-        "message": {"type": "string", "description": "Message text or pre-built JSON content for interactive cards."},
-        "msg_type": {"type": "string", "description": "text, post, or interactive. Defaults to text.", "default": "text"},
+        "chat_id": {"type": "string", "description": "Backward-compatible target id. Can be a chat_id or a user id such as open_id when used with receive_id_type or auto-detection."},
+        "receive_id": {"type": "string", "description": "Preferred target id for the message. Can be chat_id, open_id, user_id, union_id, or email."},
+        "receive_id_type": {"type": "string", "description": "Optional target id type: chat_id, open_id, user_id, union_id, or email. Auto-detected from the id when omitted."},
+        "message": {"type": "string", "description": "Message text, or pre-built JSON content for post/interactive/resource messages."},
+        "msg_type": {"type": "string", "description": "text, post, interactive, image, file, audio, or media. Defaults to text.", "default": "text"},
         "title": {"type": "string", "description": "Optional title when msg_type=post."},
+        "resource_key": {"type": "string", "description": "Generic image_key/file_key for native resource messages."},
+        "file_key": {"type": "string", "description": "Feishu file key for file/audio/media messages."},
+        "image_key": {"type": "string", "description": "Feishu image key for image messages."},
     },
-    required=["chat_id", "message"],
 )
 
 FEISHU_CHAT_LOOKUP_SCHEMA = _schema(
@@ -182,6 +201,15 @@ FEISHU_FILE_UPLOAD_SCHEMA = _schema(
     required=["file_path"],
 )
 
+FEISHU_IMAGE_UPLOAD_SCHEMA = _schema(
+    "feishu_image_upload",
+    "Upload a local image into Feishu IM image storage and return the resulting image_key.",
+    {
+        "file_path": {"type": "string", "description": "Absolute or workspace-relative local image path."},
+    },
+    required=["file_path"],
+)
+
 FEISHU_FILE_SEND_SCHEMA = _schema(
     "feishu_file_send",
     "Upload a local file and send it into a Feishu chat as a native attachment.",
@@ -190,6 +218,41 @@ FEISHU_FILE_SEND_SCHEMA = _schema(
         "file_path": {"type": "string", "description": "Absolute or workspace-relative local file path."},
         "file_name": {"type": "string", "description": "Optional file name override."},
         "caption": {"type": "string", "description": "Optional caption sent alongside the file."},
+    },
+    required=["chat_id", "file_path"],
+)
+
+FEISHU_IMAGE_SEND_SCHEMA = _schema(
+    "feishu_image_send",
+    "Upload a local image and send it into a Feishu chat as a native image message.",
+    {
+        "chat_id": {"type": "string", "description": "Target chat open_chat_id / chat_id."},
+        "file_path": {"type": "string", "description": "Absolute or workspace-relative local image path."},
+        "caption": {"type": "string", "description": "Optional caption sent alongside the image."},
+    },
+    required=["chat_id", "file_path"],
+)
+
+FEISHU_AUDIO_SEND_SCHEMA = _schema(
+    "feishu_audio_send",
+    "Upload a local audio file and send it into a Feishu chat as a native audio message.",
+    {
+        "chat_id": {"type": "string", "description": "Target chat open_chat_id / chat_id."},
+        "file_path": {"type": "string", "description": "Absolute or workspace-relative local audio path."},
+        "caption": {"type": "string", "description": "Optional caption sent alongside the audio."},
+        "file_name": {"type": "string", "description": "Optional file name override."},
+    },
+    required=["chat_id", "file_path"],
+)
+
+FEISHU_VIDEO_SEND_SCHEMA = _schema(
+    "feishu_video_send",
+    "Upload a local video file and send it into a Feishu chat as a native video or media message.",
+    {
+        "chat_id": {"type": "string", "description": "Target chat open_chat_id / chat_id."},
+        "file_path": {"type": "string", "description": "Absolute or workspace-relative local video path."},
+        "caption": {"type": "string", "description": "Optional caption sent alongside the video."},
+        "file_name": {"type": "string", "description": "Optional file name override."},
     },
     required=["chat_id", "file_path"],
 )
@@ -219,6 +282,19 @@ FEISHU_MODEL_REGISTRY_SYNC_SCHEMA = _schema(
     },
 )
 
+FEISHU_MODEL_REGISTRY_LIST_SCHEMA = _schema(
+    "feishu_model_registry_list",
+    "List Hermes model registry entries from the local native registry cache. Prefer this for default model/provider questions instead of querying the mirrored Feishu Bitable table.",
+    {
+        "provider": {"type": "string", "description": "Optional provider slug filter such as openrouter or nvidia."},
+        "force_refresh": {"type": "boolean", "description": "Force rebuilding the local registry before listing.", "default": False},
+        "available_only": {"type": "boolean", "description": "Keep only currently available models.", "default": True},
+        "recent_only": {"type": "boolean", "description": "Keep only recently used models.", "default": False},
+        "include_hidden": {"type": "boolean", "description": "Include hidden or inactive entries.", "default": False},
+        "limit": {"type": "integer", "description": "Maximum number of entries to return.", "default": 20},
+    },
+)
+
 FEISHU_MODEL_REGISTRY_PREPARE_BITABLE_SCHEMA = _schema(
     "feishu_model_registry_prepare_bitable",
     "Create or validate the recommended Feishu Bitable table, fields, and views for Hermes model registry mirroring.",
@@ -231,6 +307,18 @@ FEISHU_MODEL_REGISTRY_PREPARE_BITABLE_SCHEMA = _schema(
         "create_missing_table": {"type": "boolean", "description": "Create the table if it does not exist.", "default": True},
         "create_missing_fields": {"type": "boolean", "description": "Create missing recommended fields.", "default": True},
         "create_missing_views": {"type": "boolean", "description": "Create missing recommended views.", "default": True},
+    },
+)
+
+FEISHU_MODEL_REGISTRY_BOOTSTRAP_BITABLE_SCHEMA = _schema(
+    "feishu_model_registry_bootstrap_bitable",
+    "Create a dedicated Feishu Bitable app for Hermes model registry mirroring, then prepare the recommended table schema and return the app/table env suggestions.",
+    {
+        "app_name": {"type": "string", "description": "Name of the new Bitable app.", "default": "Hermes Model Registry"},
+        "table_name": {"type": "string", "description": "Name of the registry table to prepare.", "default": "Hermes Model Registry"},
+        "folder_token": {"type": "string", "description": "Optional destination folder token for the new Bitable app."},
+        "time_zone": {"type": "string", "description": "Optional Bitable timezone such as Asia/Shanghai."},
+        "reuse_default_table": {"type": "boolean", "description": "Reuse the default table created by Feishu when possible.", "default": True},
     },
 )
 
@@ -248,6 +336,134 @@ FEISHU_MODEL_REGISTRY_PUBLISH_CARD_SCHEMA = _schema(
 
 def _client() -> FeishuOpenApiClient:
     return build_feishu_client()
+
+
+def _shorten_model_label(model_id: str, *, max_len: int = 36) -> str:
+    text = str(model_id or "").strip()
+    if len(text) <= max_len:
+        return text
+    if "/" in text:
+        provider, remainder = text.split("/", 1)
+        head = max(8, min(18, max_len // 2))
+        tail = max(6, min(12, max_len - len(provider) - head - 4))
+        return f"{provider}/{remainder[:head]}...{remainder[-tail:]}"
+    head = max(8, min(20, max_len // 2))
+    tail = max(6, min(12, max_len - head - 3))
+    return text[:head] + "..." + text[-tail:]
+
+
+def _chunk_actions(actions: list[dict[str, Any]], *, size: int = 2) -> list[list[dict[str, Any]]]:
+    size = max(1, int(size or 2))
+    return [actions[index:index + size] for index in range(0, len(actions), size)]
+
+
+def _registry_switch_button(*, provider: str, model_id: str) -> dict[str, Any]:
+    return {
+        "tag": "button",
+        "text": {"tag": "plain_text", "content": _shorten_model_label(model_id)},
+        "type": "default",
+        "value": {
+            "hermes_action": "registry_switch_model",
+            "provider": str(provider or "").strip(),
+            "model": str(model_id or "").strip(),
+        },
+    }
+
+
+def _build_registry_entry_line(entry: Dict[str, Any]) -> str:
+    model_id = str(entry.get("model") or "").strip()
+    badges: list[str] = []
+    if entry.get("recent_used"):
+        badges.append("recent")
+    if entry.get("is_free"):
+        badges.append("free")
+    hint = str(entry.get("selection_hint") or "").strip()
+    if hint and hint not in badges:
+        badges.append(hint)
+    status = str(entry.get("status") or "").strip().lower()
+    if status and status not in {"active", "ok"} and status not in badges:
+        badges.append(status)
+    badge_text = f" [{' | '.join(badges)}]" if badges else ""
+    return f"`{model_id}`{badge_text}"
+
+
+def _build_model_registry_switch_card(
+    *,
+    registry_payload: Dict[str, Any],
+    top_n: int,
+    include_unavailable: bool,
+) -> tuple[Dict[str, Any], list[str]]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    recent_entries: list[dict[str, Any]] = []
+    for entry in registry_payload.get("entries") or []:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("hidden"):
+            continue
+        if not include_unavailable and not entry.get("is_available", True):
+            continue
+        provider = str(entry.get("provider") or "unknown").strip().lower() or "unknown"
+        grouped.setdefault(provider, []).append(entry)
+        if entry.get("recent_used"):
+            recent_entries.append(entry)
+
+    elements: list[dict[str, Any]] = [
+        {
+            "tag": "markdown",
+            "content": (
+                f"Registry snapshot: `{len(registry_payload.get('entries') or [])}` models\n"
+                "Tap a model button to send a native Hermes switch command immediately."
+            ),
+        }
+    ]
+
+    if recent_entries:
+        top_recent = recent_entries[: min(top_n, 6)]
+        elements.append(
+            {
+                "tag": "markdown",
+                "content": "**Recent used**\n" + "\n".join(
+                    f"- {str(item.get('provider') or '').strip()}: {_build_registry_entry_line(item)}"
+                    for item in top_recent
+                ),
+            }
+        )
+        recent_actions = [
+            _registry_switch_button(
+                provider=str(item.get("provider") or "").strip(),
+                model_id=str(item.get("model") or "").strip(),
+            )
+            for item in top_recent
+            if str(item.get("provider") or "").strip() and str(item.get("model") or "").strip()
+        ]
+        for chunk in _chunk_actions(recent_actions):
+            elements.append({"tag": "action", "actions": chunk})
+
+    for provider in sorted(grouped.keys()):
+        entries = grouped[provider][:top_n]
+        elements.append(
+            {
+                "tag": "markdown",
+                "content": f"**{provider}**\n" + "\n".join(
+                    f"{index + 1}. {_build_registry_entry_line(item)}"
+                    for index, item in enumerate(entries)
+                ),
+            }
+        )
+        provider_actions = [
+            _registry_switch_button(provider=provider, model_id=str(item.get("model") or "").strip())
+            for item in entries
+            if str(item.get("model") or "").strip()
+        ]
+        for chunk in _chunk_actions(provider_actions):
+            elements.append({"tag": "action", "actions": chunk})
+
+    card = {
+        "config": {"wide_screen_mode": True},
+        "header": {"title": {"tag": "plain_text", "content": "Hermes Model Switcher"}, "template": "blue"},
+        "elements": elements,
+    }
+    return card, sorted(grouped.keys())
 
 
 def feishu_doc_create_tool(args: Dict[str, Any], **_kw: Any) -> str:
@@ -307,20 +523,75 @@ def feishu_doc_append_markdown_tool(args: Dict[str, Any], **_kw: Any) -> str:
         return tool_error("markdown is required")
     try:
         document_id = extract_document_id(args.get("document_id_or_url", ""))
+        blocks = markdown_to_doc_blocks(markdown)
         data = _client().request_json(
             "POST",
             f"/open-apis/docx/v1/documents/{document_id}/blocks/{document_id}/children",
-            json_body={"children": markdown_to_doc_blocks(markdown), "index": -1},
+            json_body={"children": blocks, "index": -1},
         )
         return tool_result(
             success=True,
             document_id=document_id,
-            inserted_blocks=len(markdown_to_doc_blocks(markdown)),
+            inserted_blocks=len(blocks),
             document_revision_id=data.get("document_revision_id"),
+            update_mode="append",
         )
     except Exception as exc:
         logger.warning("feishu_doc_append_markdown failed: %s", exc)
         return tool_error(f"Failed to append markdown to Feishu document: {exc}")
+
+
+def feishu_doc_replace_markdown_tool(args: Dict[str, Any], **_kw: Any) -> str:
+    markdown = str(args.get("markdown", "") or "")
+    try:
+        document_id = extract_document_id(args.get("document_id_or_url", ""))
+        client = _client()
+        root_payload = client.request_json(
+            "GET",
+            f"/open-apis/docx/v1/documents/{document_id}/blocks/{document_id}",
+        )
+        root_block = root_payload.get("block") if isinstance(root_payload.get("block"), dict) else root_payload
+        if not isinstance(root_block, dict):
+            raise RuntimeError("Feishu document root block lookup returned no block payload")
+        existing_children = [
+            str(child_id).strip()
+            for child_id in (root_block.get("children") or [])
+            if str(child_id).strip()
+        ]
+        delete_revision_id = None
+        if existing_children:
+            delete_result = client.request_json(
+                "DELETE",
+                f"/open-apis/docx/v1/documents/{document_id}/blocks/{document_id}/children/batch_delete",
+                json_body={"start_index": 0, "end_index": len(existing_children) - 1},
+            )
+            delete_revision_id = delete_result.get("document_revision_id")
+
+        insert_revision_id = None
+        blocks: list[dict[str, Any]] = []
+        if markdown:
+            blocks = markdown_to_doc_blocks(markdown)
+            insert_result = client.request_json(
+                "POST",
+                f"/open-apis/docx/v1/documents/{document_id}/blocks/{document_id}/children",
+                json_body={"children": blocks, "index": 0},
+            )
+            insert_revision_id = insert_result.get("document_revision_id")
+
+        return tool_result(
+            success=True,
+            document_id=document_id,
+            cleared_blocks=len(existing_children),
+            inserted_blocks=len(blocks),
+            previous_children_count=len(existing_children),
+            cleared_only=not bool(blocks),
+            delete_revision_id=delete_revision_id,
+            document_revision_id=insert_revision_id or delete_revision_id,
+            update_mode="replace",
+        )
+    except Exception as exc:
+        logger.warning("feishu_doc_replace_markdown failed: %s", exc)
+        return tool_error(f"Failed to replace markdown in Feishu document: {exc}")
 
 
 def feishu_lookup_user_tool(args: Dict[str, Any], **_kw: Any) -> str:
@@ -517,25 +788,65 @@ def feishu_bitable_upsert_records_tool(args: Dict[str, Any], **_kw: Any) -> str:
 
 
 def feishu_message_send_tool(args: Dict[str, Any], **_kw: Any) -> str:
-    chat_id = str(args.get("chat_id", "") or "").strip()
+    receive_id = str(args.get("receive_id", "") or args.get("chat_id", "") or "").strip()
+    receive_id_type = str(args.get("receive_id_type", "") or "").strip().lower() or None
     message = str(args.get("message", "") or "")
     msg_type = str(args.get("msg_type", "text") or "text").strip().lower() or "text"
-    if not chat_id:
-        return tool_error("chat_id is required")
-    if not message:
-        return tool_error("message is required")
-    if msg_type not in {"text", "post", "interactive"}:
-        return tool_error("msg_type must be one of text, post, interactive")
+    if not receive_id:
+        return tool_error("receive_id or chat_id is required")
+    if msg_type not in {"text", "post", "interactive", "image", "file", "audio", "media"}:
+        return tool_error("msg_type must be one of text, post, interactive, image, file, audio, media")
     try:
+        resolved_receive_id_type = resolve_message_receive_id_type(receive_id, explicit_type=receive_id_type)
         if msg_type == "text":
+            if not message:
+                return tool_error("message is required for text messages")
             content = json.dumps({"text": message}, ensure_ascii=False)
         elif msg_type == "post":
-            content = build_plain_post_payload(message, title=str(args.get("title", "") or "").strip() or None)
-        else:
+            if not message:
+                return tool_error("message is required for post messages")
+            try:
+                parsed_message = json.loads(message)
+            except Exception:
+                parsed_message = None
+            if isinstance(parsed_message, dict) and parsed_message:
+                content = message
+            else:
+                content = build_plain_post_payload(message, title=str(args.get("title", "") or "").strip() or None)
+        elif msg_type == "interactive":
+            if not message:
+                return tool_error("message is required for interactive messages")
             json.loads(message)
             content = message
-        data = _client().send_message(chat_id=chat_id, msg_type=msg_type, content=content)
-        return tool_result(success=True, chat_id=chat_id, msg_type=msg_type, message_id=data.get("message_id"))
+        elif msg_type == "image":
+            image_key = str(args.get("image_key", "") or args.get("resource_key", "") or "").strip()
+            if not image_key and message:
+                parsed_message = json.loads(message)
+                image_key = str(parsed_message.get("image_key") or "").strip() if isinstance(parsed_message, dict) else ""
+            if not image_key:
+                return tool_error("image_key or resource_key is required for image messages")
+            content = json.dumps({"image_key": image_key}, ensure_ascii=False)
+        else:
+            file_key = str(args.get("file_key", "") or args.get("resource_key", "") or "").strip()
+            if not file_key and message:
+                parsed_message = json.loads(message)
+                file_key = str(parsed_message.get("file_key") or "").strip() if isinstance(parsed_message, dict) else ""
+            if not file_key:
+                return tool_error("file_key or resource_key is required for file/audio/media messages")
+            content = json.dumps({"file_key": file_key}, ensure_ascii=False)
+        data = _client().send_message(
+            receive_id=receive_id,
+            receive_id_type=resolved_receive_id_type,
+            msg_type=msg_type,
+            content=content,
+        )
+        return tool_result(
+            success=True,
+            receive_id=receive_id,
+            receive_id_type=resolved_receive_id_type,
+            msg_type=msg_type,
+            message_id=data.get("message_id"),
+        )
     except Exception as exc:
         logger.warning("feishu_message_send failed: %s", exc)
         return tool_error(f"Failed to send Feishu message: {exc}")
@@ -564,6 +875,16 @@ def feishu_file_upload_tool(args: Dict[str, Any], **_kw: Any) -> str:
         return tool_error(f"Failed to upload Feishu file: {exc}")
 
 
+def feishu_image_upload_tool(args: Dict[str, Any], **_kw: Any) -> str:
+    try:
+        path = coerce_local_file_path(args.get("file_path", ""))
+        data = _client().upload_im_image(file_path=path)
+        return tool_result(success=True, image_key=data.get("image_key"), file_name=path.name)
+    except Exception as exc:
+        logger.warning("feishu_image_upload failed: %s", exc)
+        return tool_error(f"Failed to upload Feishu image: {exc}")
+
+
 def feishu_file_send_tool(args: Dict[str, Any], **_kw: Any) -> str:
     chat_id = str(args.get("chat_id", "") or "").strip()
     if not chat_id:
@@ -582,6 +903,77 @@ def feishu_file_send_tool(args: Dict[str, Any], **_kw: Any) -> str:
     except Exception as exc:
         logger.warning("feishu_file_send failed: %s", exc)
         return tool_error(f"Failed to send Feishu file: {exc}")
+
+
+def feishu_image_send_tool(args: Dict[str, Any], **_kw: Any) -> str:
+    chat_id = str(args.get("chat_id", "") or "").strip()
+    if not chat_id:
+        return tool_error("chat_id is required")
+    try:
+        path = coerce_local_file_path(args.get("file_path", ""))
+        caption = str(args.get("caption", "") or "").strip() or None
+        client = _client()
+        upload = client.upload_im_image(file_path=path)
+        image_key = str(upload.get("image_key") or "").strip()
+        if not image_key:
+            raise RuntimeError("Feishu image upload did not return an image_key")
+        send_result = client.send_uploaded_image_message(chat_id=chat_id, image_key=image_key, caption=caption)
+        return tool_result(success=True, chat_id=chat_id, image_key=image_key, file_name=path.name, message_id=send_result.get("message_id"))
+    except Exception as exc:
+        logger.warning("feishu_image_send failed: %s", exc)
+        return tool_error(f"Failed to send Feishu image: {exc}")
+
+
+def feishu_audio_send_tool(args: Dict[str, Any], **_kw: Any) -> str:
+    chat_id = str(args.get("chat_id", "") or "").strip()
+    if not chat_id:
+        return tool_error("chat_id is required")
+    try:
+        path = coerce_local_file_path(args.get("file_path", ""))
+        file_name = str(args.get("file_name", "") or "").strip() or path.name
+        caption = str(args.get("caption", "") or "").strip() or None
+        client = _client()
+        upload = client.upload_im_file(file_path=path, file_name=file_name)
+        file_key = str(upload.get("file_key") or "").strip()
+        if not file_key:
+            raise RuntimeError("Feishu audio upload did not return a file_key")
+        send_result = client.send_uploaded_file_message(
+            chat_id=chat_id,
+            file_key=file_key,
+            caption=caption,
+            file_name=file_name,
+            outbound_message_type="audio",
+        )
+        return tool_result(success=True, chat_id=chat_id, file_key=file_key, file_name=file_name, message_id=send_result.get("message_id"))
+    except Exception as exc:
+        logger.warning("feishu_audio_send failed: %s", exc)
+        return tool_error(f"Failed to send Feishu audio: {exc}")
+
+
+def feishu_video_send_tool(args: Dict[str, Any], **_kw: Any) -> str:
+    chat_id = str(args.get("chat_id", "") or "").strip()
+    if not chat_id:
+        return tool_error("chat_id is required")
+    try:
+        path = coerce_local_file_path(args.get("file_path", ""))
+        file_name = str(args.get("file_name", "") or "").strip() or path.name
+        caption = str(args.get("caption", "") or "").strip() or None
+        client = _client()
+        upload = client.upload_im_file(file_path=path, file_name=file_name)
+        file_key = str(upload.get("file_key") or "").strip()
+        if not file_key:
+            raise RuntimeError("Feishu video upload did not return a file_key")
+        send_result = client.send_uploaded_file_message(
+            chat_id=chat_id,
+            file_key=file_key,
+            caption=caption,
+            file_name=file_name,
+            outbound_message_type="media",
+        )
+        return tool_result(success=True, chat_id=chat_id, file_key=file_key, file_name=file_name, message_id=send_result.get("message_id"))
+    except Exception as exc:
+        logger.warning("feishu_video_send failed: %s", exc)
+        return tool_error(f"Failed to send Feishu video: {exc}")
 
 
 def feishu_file_download_tool(args: Dict[str, Any], **_kw: Any) -> str:
@@ -642,6 +1034,65 @@ def feishu_model_registry_sync_tool(args: Dict[str, Any], **_kw: Any) -> str:
         return tool_error(f"Failed to sync Feishu model registry: {exc}")
 
 
+def feishu_model_registry_list_tool(args: Dict[str, Any], **_kw: Any) -> str:
+    provider_filter = str(args.get("provider") or "").strip().lower()
+    force_refresh = bool(args.get("force_refresh", False))
+    available_only = bool(args.get("available_only", True))
+    recent_only = bool(args.get("recent_only", False))
+    include_hidden = bool(args.get("include_hidden", False))
+    limit = max(1, min(int(args.get("limit") or 20), 100))
+
+    try:
+        registry_payload = build_model_registry(force_refresh=force_refresh)
+        filtered_entries: list[dict[str, Any]] = []
+        for entry in registry_payload.get("entries") or []:
+            if not isinstance(entry, dict):
+                continue
+            provider = str(entry.get("provider") or "").strip().lower()
+            if provider_filter and provider != provider_filter:
+                continue
+            if not include_hidden and entry.get("hidden"):
+                continue
+            if available_only and not bool(entry.get("is_available", True)):
+                continue
+            if recent_only and not bool(entry.get("recent_used")):
+                continue
+            filtered_entries.append(
+                {
+                    "provider": provider,
+                    "model": str(entry.get("model") or "").strip(),
+                    "display_name": str(entry.get("display_name") or entry.get("model") or "").strip(),
+                    "status": str(entry.get("status") or "").strip(),
+                    "is_available": bool(entry.get("is_available", True)),
+                    "is_free": bool(entry.get("is_free")),
+                    "recent_used": bool(entry.get("recent_used")),
+                    "recent_used_count": int(entry.get("recent_used_count") or 0),
+                    "recent_used_at": entry.get("recent_used_at"),
+                    "selection_hint": str(entry.get("selection_hint") or "").strip(),
+                    "generated_command": str(entry.get("generated_command") or "").strip(),
+                }
+            )
+
+        filtered_entries = filtered_entries[:limit]
+        return tool_result(
+            success=True,
+            provider=provider_filter or None,
+            filters={
+                "available_only": available_only,
+                "recent_only": recent_only,
+                "include_hidden": include_hidden,
+                "limit": limit,
+            },
+            count=len(filtered_entries),
+            generated_at=registry_payload.get("generated_at"),
+            source=registry_payload.get("source"),
+            entries=filtered_entries,
+        )
+    except Exception as exc:
+        logger.warning("feishu_model_registry_list failed: %s", exc)
+        return tool_error(f"Failed to list Feishu model registry entries: {exc}")
+
+
 def feishu_model_registry_prepare_bitable_tool(args: Dict[str, Any], **_kw: Any) -> str:
     try:
         client = _client()
@@ -661,6 +1112,23 @@ def feishu_model_registry_prepare_bitable_tool(args: Dict[str, Any], **_kw: Any)
         return tool_error(f"Failed to prepare Feishu Bitable model registry schema: {exc}")
 
 
+def feishu_model_registry_bootstrap_bitable_tool(args: Dict[str, Any], **_kw: Any) -> str:
+    try:
+        client = _client()
+        result = bootstrap_model_registry_bitable(
+            client,
+            app_name=str(args.get("app_name") or "Hermes Model Registry").strip() or "Hermes Model Registry",
+            table_name=str(args.get("table_name") or "Hermes Model Registry").strip() or "Hermes Model Registry",
+            folder_token=str(args.get("folder_token") or "").strip() or None,
+            time_zone=str(args.get("time_zone") or "").strip() or None,
+            reuse_default_table=bool(args.get("reuse_default_table", True)),
+        )
+        return tool_result(result)
+    except Exception as exc:
+        logger.warning("feishu_model_registry_bootstrap_bitable failed: %s", exc)
+        return tool_error(f"Failed to bootstrap Feishu Bitable model registry app: {exc}")
+
+
 def feishu_model_registry_publish_card_tool(args: Dict[str, Any], **_kw: Any) -> str:
     chat_id = str(args.get("chat_id", "") or "").strip()
     if not chat_id:
@@ -669,37 +1137,19 @@ def feishu_model_registry_publish_card_tool(args: Dict[str, Any], **_kw: Any) ->
     include_unavailable = bool(args.get("include_unavailable", False))
     try:
         registry_payload = build_model_registry(force_refresh=False)
-        grouped: dict[str, list[dict[str, Any]]] = {}
-        for entry in registry_payload.get("entries") or []:
-            if entry.get("hidden"):
-                continue
-            if not include_unavailable and not entry.get("is_available", True):
-                continue
-            grouped.setdefault(str(entry.get("provider") or "unknown"), []).append(entry)
-
-        elements: list[dict[str, Any]] = [
-            {
-                "tag": "markdown",
-                "content": f"Current registry snapshot: `{len(registry_payload.get('entries') or [])}` models\nGenerated at `{registry_payload.get('generated_at')}`",
-            }
-        ]
-        for provider, entries in grouped.items():
-            top_entries = entries[:top_n]
-            lines = []
-            for item in top_entries:
-                free_marker = "free" if item.get("is_free") else "paid"
-                hint = str(item.get("selection_hint") or "").strip()
-                suffix = f" ({hint})" if hint else ""
-                lines.append(f"- `{item.get('model')}` [{free_marker}]{suffix}")
-            elements.append({"tag": "markdown", "content": f"**{provider}**\n" + "\n".join(lines)})
-
-        card = {
-            "config": {"wide_screen_mode": True},
-            "header": {"title": {"tag": "plain_text", "content": "Hermes Model Registry"}, "template": "blue"},
-            "elements": elements,
-        }
+        card, card_providers = _build_model_registry_switch_card(
+            registry_payload=registry_payload,
+            top_n=top_n,
+            include_unavailable=include_unavailable,
+        )
         send_result = _client().send_message(chat_id=chat_id, msg_type="interactive", content=json.dumps(card, ensure_ascii=False))
-        return tool_result(success=True, chat_id=chat_id, message_id=send_result.get("message_id"), card_providers=sorted(grouped.keys()))
+        return tool_result(
+            success=True,
+            chat_id=chat_id,
+            message_id=send_result.get("message_id"),
+            card_providers=card_providers,
+            interaction_mode="registry_switch_model",
+        )
     except Exception as exc:
         logger.warning("feishu_model_registry_publish_card failed: %s", exc)
         return tool_error(f"Failed to publish Feishu model registry card: {exc}")
@@ -708,6 +1158,7 @@ def feishu_model_registry_publish_card_tool(args: Dict[str, Any], **_kw: Any) ->
 registry.register(name="feishu_doc_create", toolset="feishu", schema=FEISHU_DOC_CREATE_SCHEMA, handler=feishu_doc_create_tool, check_fn=make_capability_check("docs"), requires_env=["FEISHU_APP_ID", "FEISHU_APP_SECRET"], emoji="F")
 registry.register(name="feishu_doc_get", toolset="feishu", schema=FEISHU_DOC_GET_SCHEMA, handler=feishu_doc_get_tool, check_fn=make_capability_check("docs"), requires_env=["FEISHU_APP_ID", "FEISHU_APP_SECRET"], emoji="F", max_result_size_chars=20_000)
 registry.register(name="feishu_doc_append_markdown", toolset="feishu", schema=FEISHU_DOC_APPEND_MARKDOWN_SCHEMA, handler=feishu_doc_append_markdown_tool, check_fn=make_capability_check("docs"), requires_env=["FEISHU_APP_ID", "FEISHU_APP_SECRET"], emoji="F")
+registry.register(name="feishu_doc_replace_markdown", toolset="feishu", schema=FEISHU_DOC_REPLACE_MARKDOWN_SCHEMA, handler=feishu_doc_replace_markdown_tool, check_fn=make_capability_check("docs"), requires_env=["FEISHU_APP_ID", "FEISHU_APP_SECRET"], emoji="F")
 registry.register(name="feishu_lookup_user", toolset="feishu", schema=FEISHU_LOOKUP_USER_SCHEMA, handler=feishu_lookup_user_tool, check_fn=make_capability_check("contacts"), requires_env=["FEISHU_APP_ID", "FEISHU_APP_SECRET"], emoji="F")
 registry.register(name="feishu_sheet_create", toolset="feishu", schema=FEISHU_SHEET_CREATE_SCHEMA, handler=feishu_sheet_create_tool, check_fn=make_capability_check("sheets"), requires_env=["FEISHU_APP_ID", "FEISHU_APP_SECRET"], emoji="F")
 registry.register(name="feishu_sheet_read_range", toolset="feishu", schema=FEISHU_SHEET_READ_RANGE_SCHEMA, handler=feishu_sheet_read_range_tool, check_fn=make_capability_check("sheets"), requires_env=["FEISHU_APP_ID", "FEISHU_APP_SECRET"], emoji="F")
@@ -718,8 +1169,14 @@ registry.register(name="feishu_bitable_upsert_records", toolset="feishu", schema
 registry.register(name="feishu_message_send", toolset="feishu", schema=FEISHU_MESSAGE_SEND_SCHEMA, handler=feishu_message_send_tool, check_fn=make_capability_check("messages"), requires_env=["FEISHU_APP_ID", "FEISHU_APP_SECRET"], emoji="F")
 registry.register(name="feishu_chat_lookup", toolset="feishu", schema=FEISHU_CHAT_LOOKUP_SCHEMA, handler=feishu_chat_lookup_tool, check_fn=make_capability_check("messages"), requires_env=["FEISHU_APP_ID", "FEISHU_APP_SECRET"], emoji="F")
 registry.register(name="feishu_file_upload", toolset="feishu", schema=FEISHU_FILE_UPLOAD_SCHEMA, handler=feishu_file_upload_tool, check_fn=make_capability_check("files"), requires_env=["FEISHU_APP_ID", "FEISHU_APP_SECRET"], emoji="F")
+registry.register(name="feishu_image_upload", toolset="feishu", schema=FEISHU_IMAGE_UPLOAD_SCHEMA, handler=feishu_image_upload_tool, check_fn=make_capability_check("files"), requires_env=["FEISHU_APP_ID", "FEISHU_APP_SECRET"], emoji="F")
 registry.register(name="feishu_file_send", toolset="feishu", schema=FEISHU_FILE_SEND_SCHEMA, handler=feishu_file_send_tool, check_fn=make_capability_check("files"), requires_env=["FEISHU_APP_ID", "FEISHU_APP_SECRET"], emoji="F")
+registry.register(name="feishu_image_send", toolset="feishu", schema=FEISHU_IMAGE_SEND_SCHEMA, handler=feishu_image_send_tool, check_fn=make_capability_check("files"), requires_env=["FEISHU_APP_ID", "FEISHU_APP_SECRET"], emoji="F")
+registry.register(name="feishu_audio_send", toolset="feishu", schema=FEISHU_AUDIO_SEND_SCHEMA, handler=feishu_audio_send_tool, check_fn=make_capability_check("files"), requires_env=["FEISHU_APP_ID", "FEISHU_APP_SECRET"], emoji="F")
+registry.register(name="feishu_video_send", toolset="feishu", schema=FEISHU_VIDEO_SEND_SCHEMA, handler=feishu_video_send_tool, check_fn=make_capability_check("files"), requires_env=["FEISHU_APP_ID", "FEISHU_APP_SECRET"], emoji="F")
 registry.register(name="feishu_file_download", toolset="feishu", schema=FEISHU_FILE_DOWNLOAD_SCHEMA, handler=feishu_file_download_tool, check_fn=make_capability_check("files"), requires_env=["FEISHU_APP_ID", "FEISHU_APP_SECRET"], emoji="F")
 registry.register(name="feishu_model_registry_sync", toolset="feishu", schema=FEISHU_MODEL_REGISTRY_SYNC_SCHEMA, handler=feishu_model_registry_sync_tool, check_fn=make_capability_check("model_registry"), requires_env=["FEISHU_APP_ID", "FEISHU_APP_SECRET"], emoji="F")
+registry.register(name="feishu_model_registry_list", toolset="feishu", schema=FEISHU_MODEL_REGISTRY_LIST_SCHEMA, handler=feishu_model_registry_list_tool, check_fn=make_capability_check("model_registry"), requires_env=["FEISHU_APP_ID", "FEISHU_APP_SECRET"], emoji="F")
 registry.register(name="feishu_model_registry_prepare_bitable", toolset="feishu", schema=FEISHU_MODEL_REGISTRY_PREPARE_BITABLE_SCHEMA, handler=feishu_model_registry_prepare_bitable_tool, check_fn=make_capability_check("model_registry"), requires_env=["FEISHU_APP_ID", "FEISHU_APP_SECRET"], emoji="F")
+registry.register(name="feishu_model_registry_bootstrap_bitable", toolset="feishu", schema=FEISHU_MODEL_REGISTRY_BOOTSTRAP_BITABLE_SCHEMA, handler=feishu_model_registry_bootstrap_bitable_tool, check_fn=make_capability_check("model_registry"), requires_env=["FEISHU_APP_ID", "FEISHU_APP_SECRET"], emoji="F")
 registry.register(name="feishu_model_registry_publish_card", toolset="feishu", schema=FEISHU_MODEL_REGISTRY_PUBLISH_CARD_SCHEMA, handler=feishu_model_registry_publish_card_tool, check_fn=make_capability_check("model_registry"), requires_env=["FEISHU_APP_ID", "FEISHU_APP_SECRET"], emoji="F")

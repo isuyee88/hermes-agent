@@ -333,18 +333,18 @@ Management commands:
 
 ## openclaw-honcho checklist
 
-Ordered by impact:
+Status as of 2026-04-12 after source validation:
 
-- [ ] **Async prefetch** — move `session.context()` out of `before_prompt_build` into post-`agent_end` background Promise
-- [ ] **observe_me=True for agent peer** — one-line change in `session.addPeers()`
-- [ ] **Dynamic reasoning level** — add helper; apply in `honcho_recall` and `honcho_analyze`; add `dialecticReasoningLevel` to config
-- [ ] **Per-peer memory modes** — add `userMemoryMode` / `agentMemoryMode` to config; gate Honcho sync and local writes
-- [ ] **seedAiIdentity()** — add helper; use during setup migration for SOUL.md / IDENTITY.md
-- [ ] **Session naming strategies** — add `sessionStrategy`, `sessions` map, `sessionPeerPrefix`
-- [ ] **CLI surface injection** — append command reference to `before_prompt_build` return value
-- [ ] **honcho identity subcommand** — seed from file or `--show` current representation
-- [ ] **AI peer name injection** — if `aiPeer` name configured, prepend to injected system prompt
-- [ ] **honcho mode / sessions / map** — CLI parity with Hermes
+- [x] **Async prefetch** — Hermes pre-warms context/dialectic off the critical path during init
+- [x] **observe_me=True for agent peer** — implemented via per-peer Honcho observation config
+- [x] **Dynamic reasoning level** — `dialecticReasoningLevel` / `dialecticDynamic` shipped in Honcho config
+- [~] **Per-peer memory modes** — shipped as granular `observation` booleans rather than separate `userMemoryMode` / `agentMemoryMode`
+- [x] **seedAiIdentity()** — implemented as `seed_ai_identity()` and wired into setup/migration CLI
+- [x] **Session naming strategies** — `sessionStrategy`, `sessions`, `sessionPeerPrefix` shipped
+- [x] **CLI surface injection** — Honcho system prompt now includes compact management command reference
+- [x] **honcho identity subcommand** — shipped with seed/show flows
+- [~] **AI peer name injection** — `aiPeer` config is resolved and used for identity; prompt prefix wording may still evolve
+- [x] **honcho mode / sessions / map** — CLI parity shipped
 
 Already done in openclaw-honcho (do not re-implement): `lastSavedIndex` dedup, platform metadata stripping, multi-agent parent observer, `peerPerspective` on `context()`, tiered tool surface, workspace `agentPeerMap`, QMD passthrough, self-hosted Honcho.
 

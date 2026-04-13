@@ -163,6 +163,60 @@ async def test_get_chat_provider_records_keeps_nvidia_when_env_key_present(monke
 
 
 @pytest.mark.asyncio
+async def test_get_chat_provider_records_registry_only_skips_live_expanded_lookup(monkeypatch):
+    import hermes_cli.models as cli_models
+
+    runner = _make_runner()
+
+    monkeypatch.setattr(
+        cli_models,
+        "list_available_providers",
+        lambda: [
+            {"id": "openrouter", "label": "OpenRouter", "aliases": [], "authenticated": True},
+            {"id": "nvidia", "label": "NVIDIA", "aliases": [], "authenticated": True},
+        ],
+    )
+    monkeypatch.setattr(
+        runner,
+        "_load_chat_model_registry_index",
+        lambda: {
+            "openrouter": [
+                {"provider": "openrouter", "model": "openai/gpt-4.1-mini", "recent_used": True, "selection_hint": "recommended"},
+                {"provider": "openrouter", "model": "anthropic/claude-opus-4.6", "recent_used": False, "selection_hint": "candidate"},
+            ],
+            "nvidia": [
+                {"provider": "nvidia", "model": "qwen/qwq-32b", "recent_used": True, "selection_hint": "recommended"},
+            ],
+        },
+    )
+    monkeypatch.setattr(
+        GatewayRunner,
+        "_get_chat_curated_model_items",
+        lambda self, provider: [],
+    )
+
+    def _unexpected_live_lookup(self, provider):
+        raise AssertionError(f"live expanded lookup should be skipped for {provider}")
+
+    monkeypatch.setattr(GatewayRunner, "_get_chat_expanded_model_ids", _unexpected_live_lookup)
+
+    records = runner._get_chat_provider_records(
+        session_key="agent:main:feishu:dm:oc_test",
+        current_model="openai/gpt-4.1-mini",
+        current_provider="openrouter",
+        authenticated_only=False,
+        max_models=0,
+        prefer_registry_only=True,
+    )
+
+    openrouter = next(record for record in records if record["slug"] == "openrouter")
+    nvidia = next(record for record in records if record["slug"] == "nvidia")
+    assert openrouter["catalog_mode"] == "registry-only"
+    assert openrouter["models"][:2] == ["openai/gpt-4.1-mini", "anthropic/claude-opus-4.6"]
+    assert nvidia["models"] == ["qwen/qwq-32b"]
+
+
+@pytest.mark.asyncio
 async def test_model_provider_catalog_shows_curated_models(monkeypatch):
     import agent.models_dev as models_dev
     import hermes_cli.models as cli_models
@@ -292,3 +346,116 @@ async def test_feishu_model_picker_open_id_target_updates_real_dm_session(monkey
     assert actual_session_key in runner._session_model_overrides
     assert runner._session_model_overrides[actual_session_key]["model"] == "qwen/qwq-32b"
     assert runner._session_model_overrides[actual_session_key]["provider"] == "nvidia"
+
+
+@pytest.mark.asyncio
+async def test_model_picker_selection_handler_uses_gateway_config_session_flags(monkeypatch):
+    import hermes_cli.model_switch as model_switch
+
+    runner = _make_runner()
+    if hasattr(runner.config, "session"):
+        delattr(runner.config, "session")
+    runner.config.group_sessions_per_user = False
+    runner.config.thread_sessions_per_user = True
+
+    monkeypatch.setattr(
+        model_switch,
+        "switch_model",
+        lambda **_kwargs: SimpleNamespace(
+            success=True,
+            error_message="",
+            new_model="qwen/qwq-32b",
+            target_provider="nvidia",
+            api_key="nvapi-test",
+            base_url="https://integrate.api.nvidia.com/v1",
+            api_mode="chat_completions",
+            provider_label="NVIDIA",
+            model_info=None,
+        ),
+    )
+
+    source = SessionSource(
+        platform=Platform.FEISHU,
+        chat_id="ou_owner",
+        chat_type="dm",
+        user_id="ou_owner",
+        user_name="Alice",
+    )
+    handler = runner._build_model_picker_selection_handler(
+        session_key="agent:main:feishu:dm:ou_owner",
+        source=source,
+        current_model="openrouter/default-model",
+        current_provider="openrouter",
+        current_base_url="https://openrouter.ai/api/v1",
+        current_api_key="",
+    )
+
+    text = await handler("oc_real_chat", "qwen/qwq-32b", "nvidia")
+
+    expected_session_key = build_session_key(
+        SessionSource(
+            platform=Platform.FEISHU,
+            chat_id="oc_real_chat",
+            chat_type="dm",
+            user_id="ou_owner",
+            user_name="Alice",
+        ),
+        group_sessions_per_user=False,
+        thread_sessions_per_user=True,
+    )
+    assert "Model switched to `qwen/qwq-32b`" in text
+    assert expected_session_key in runner._session_model_overrides
+
+
+def test_switch_model_with_runtime_fallback_recovers_known_provider(monkeypatch):
+    import hermes_cli.model_switch as model_switch
+    import hermes_cli.models as model_registry
+    import hermes_cli.runtime_provider as runtime_provider
+
+    runner = _make_runner()
+
+    monkeypatch.setattr(
+        model_switch,
+        "switch_model",
+        lambda **_kwargs: SimpleNamespace(
+            success=False,
+            error_message="Could not resolve credentials for provider 'NVIDIA': Unknown provider 'nvidia'.",
+            new_model="",
+            target_provider="nvidia",
+            api_key="",
+            base_url="",
+            api_mode="",
+            provider_label="NVIDIA",
+            model_info=None,
+        ),
+    )
+    monkeypatch.setattr(
+        runtime_provider,
+        "resolve_runtime_provider",
+        lambda **_kwargs: {
+            "provider": "nvidia",
+            "api_key": "nvapi-test",
+            "base_url": "https://integrate.api.nvidia.com/v1",
+            "api_mode": "chat_completions",
+        },
+    )
+    monkeypatch.setattr(
+        model_registry,
+        "validate_requested_model",
+        lambda *_args, **_kwargs: {"accepted": True},
+    )
+
+    result = runner._switch_model_with_runtime_fallback(
+        raw_input="qwen/qwq-32b",
+        current_provider="openrouter",
+        current_model="openrouter/default-model",
+        current_base_url="https://openrouter.ai/api/v1",
+        current_api_key="",
+        is_global=False,
+        explicit_provider="nvidia",
+    )
+
+    assert result.success is True
+    assert result.target_provider == "nvidia"
+    assert result.new_model == "qwen/qwq-32b"
+    assert result.base_url == "https://integrate.api.nvidia.com/v1"

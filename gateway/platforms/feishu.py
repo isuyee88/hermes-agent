@@ -27,6 +27,7 @@ import logging
 import mimetypes
 import os
 import re
+import tempfile
 import threading
 import time
 import uuid
@@ -116,6 +117,7 @@ _MARKDOWN_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
 _MENTION_RE = re.compile(r"@_user_\d+")
 _MULTISPACE_RE = re.compile(r"[ \t]{2,}")
 _POST_CONTENT_INVALID_RE = re.compile(r"content format of the post type is incorrect", re.IGNORECASE)
+_TEXTUAL_DOCUMENT_EXTENSIONS = {".md", ".txt"}
 
 
 def _is_truthy(value: str | None, *, default: bool = False) -> bool:
@@ -138,6 +140,59 @@ def _trim_log_field(value: Any, *, limit: int = 120) -> str:
 
 def _feishu_send_audit_enabled() -> bool:
     return _is_truthy(os.getenv("HERMES_FEISHU_SEND_AUDIT_LOG"), default=True)
+
+
+def _pdf_hex_text(text: str) -> str:
+    return text.encode("utf-16-be").hex().upper()
+
+
+def _build_simple_pdf_from_text(text: str, *, title: str) -> bytes:
+    normalized_lines = [
+        line.replace("\r", "").expandtabs(4)
+        for line in str(text or "").splitlines()
+    ] or [""]
+    lines = normalized_lines[:60]
+    content_lines = ["BT", "/F1 12 Tf", "14 TL", "50 780 Td"]
+    for index, line in enumerate(lines):
+        if index > 0:
+            content_lines.append("T*")
+        content_lines.append(f"<{_pdf_hex_text(line[:100])}> Tj")
+    content_lines.append("ET")
+    stream_bytes = "\n".join(content_lines).encode("ascii")
+    safe_title = "".join(ch if 32 <= ord(ch) < 127 else "_" for ch in str(title or "document"))[:80] or "document"
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 4 0 R >> >> /Contents 6 0 R >>",
+        (
+            b"<< /Type /Font /Subtype /Type0 /BaseFont /STSong-Light /Encoding /UniGB-UCS2-H "
+            b"/DescendantFonts [5 0 R] >>"
+        ),
+        (
+            b"<< /Type /Font /Subtype /CIDFontType0 /BaseFont /STSong-Light "
+            b"/CIDSystemInfo << /Registry (Adobe) /Ordering (GB1) /Supplement 4 >> /DW 1000 >>"
+        ),
+        f"<< /Length {len(stream_bytes)} >>\nstream\n".encode("ascii") + stream_bytes + b"\nendstream",
+        f"<< /Title ({safe_title}) /Producer (Hermes Feishu Adapter) >>".encode("ascii"),
+    ]
+    header = b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n"
+    body = bytearray()
+    offsets = [0]
+    for index, obj in enumerate(objects, start=1):
+        offsets.append(len(header) + len(body))
+        body.extend(f"{index} 0 obj\n".encode("ascii"))
+        body.extend(obj)
+        body.extend(b"\nendobj\n")
+    startxref = len(header) + len(body)
+    xref = [f"xref\n0 {len(objects) + 1}\n".encode("ascii"), b"0000000000 65535 f \n"]
+    for offset in offsets[1:]:
+        xref.append(f"{offset:010d} 00000 n \n".encode("ascii"))
+    trailer = (
+        f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R /Info 7 0 R >>\nstartxref\n{startxref}\n%%EOF\n".encode(
+            "ascii"
+        )
+    )
+    return header + body + b"".join(xref) + trailer
 
 
 def _feishu_resolve_sender_names_enabled() -> bool:
@@ -207,7 +262,13 @@ _FEISHU_MENU_COMMANDS = {
     "model_status": "/model",
     "provider_status": "/provider",
     "provider_openrouter": "/model --provider openrouter",
+    "provider_openrouter_featured": "/model --provider openrouter",
+    "provider_openrouter_recent": "/model --provider openrouter",
+    "provider_openrouter_performance": "/model --provider openrouter",
     "provider_nvidia": "/model --provider nvidia",
+    "provider_nvidia_featured": "/model --provider nvidia",
+    "provider_nvidia_recent": "/model --provider nvidia",
+    "provider_nvidia_performance": "/model --provider nvidia",
     "route_status": "/provider",
 }
 # ---------------------------------------------------------------------------
@@ -1104,6 +1165,7 @@ class FeishuAdapter(BasePlatformAdapter):
         self._approval_counter = itertools.count(1)
         self._model_picker_state: Dict[str, Dict[str, Any]] = {}
         self._model_picker_counter = itertools.count(1)
+        self._background_tasks: set[asyncio.Task[Any]] = set()
         self._menu_action_handler: Optional[Callable[..., Awaitable[bool] | bool]] = None
         self._load_seen_message_ids()
         self._load_model_picker_state()
@@ -1614,6 +1676,7 @@ class FeishuAdapter(BasePlatformAdapter):
         on_model_selected,
         metadata: Optional[Dict[str, Any]] = None,
         selected_provider: Optional[str] = None,
+        selected_filter: Optional[str] = None,
     ) -> SendResult:
         """Send an interactive Feishu card for provider/model selection."""
         if not self._client:
@@ -1627,12 +1690,14 @@ class FeishuAdapter(BasePlatformAdapter):
                 "current_model": current_model,
                 "current_provider": current_provider,
                 "selected_provider": selected_provider or None,
+                "selected_filter": selected_filter or None,
+                "provider_cards": {},
             }
             if selected_provider:
-                card = self._build_model_picker_model_card(
+                card = self._get_model_picker_provider_cached_card(
                     state=picker_state,
                     provider_slug=selected_provider,
-                    page=0,
+                    selected_filter=selected_filter or "featured",
                 )
             else:
                 card = self._build_model_picker_provider_card(
@@ -1661,6 +1726,7 @@ class FeishuAdapter(BasePlatformAdapter):
                     "current_model": current_model,
                     "current_provider": current_provider,
                     "selected_provider": selected_provider or None,
+                    "selected_filter": selected_filter or None,
                     "model_page": 0,
                     "allowed_user_id": str((metadata or {}).get("user_id") or "").strip(),
                 }
@@ -1678,81 +1744,103 @@ class FeishuAdapter(BasePlatformAdapter):
         current_provider: str,
         picker_id: str,
     ) -> Dict[str, Any]:
-        rows: List[Dict[str, Any]] = []
-        rows.append(
+        rows: List[Dict[str, Any]] = [
             {
                 "tag": "markdown",
                 "content": (
-                    f"Current model: {current_model or 'unknown'}\n"
-                    f"Current provider: {current_provider or 'unknown'}\n"
-                    "Tap a model name below to switch quickly. Use More when you need the longer list."
+                    f"**Current route**\n"
+                    f"Provider: {current_provider or 'unknown'}\n"
+                    f"Model: {current_model or 'unknown'}\n"
+                    "Mode: sticky route\n"
+                    "Data source: local Hermes registry cache\n"
+                    "Prebuilt sections below favor speed over full catalog browsing."
                 ),
             }
+        ]
+
+        recent_entries: List[tuple[Dict[str, Any], str]] = []
+        hot_entries: List[tuple[Dict[str, Any], str]] = []
+        recommended_entries: List[tuple[Dict[str, Any], str]] = []
+        seen_recent: set[tuple[str, str]] = set()
+        seen_hot: set[tuple[str, str]] = set()
+        seen_recommended: set[tuple[str, str]] = set()
+
+        for provider in providers:
+            provider_slug = str(provider.get("slug") or "").strip()
+            for model_id in self._dedupe_preserving_order(
+                list(provider.get("recent_models", []) or []) + list(provider.get("recent_registry_models", []) or [])
+            )[:3]:
+                key = (provider_slug, model_id)
+                if key not in seen_recent:
+                    seen_recent.add(key)
+                    recent_entries.append((provider, model_id))
+            for model_id in self._dedupe_preserving_order(list(provider.get("hot_models", []) or []))[:3]:
+                key = (provider_slug, model_id)
+                if key not in seen_hot:
+                    seen_hot.add(key)
+                    hot_entries.append((provider, model_id))
+            for model_id in self._dedupe_preserving_order(list(provider.get("recommended_models", []) or []))[:2]:
+                key = (provider_slug, model_id)
+                if key not in seen_recommended:
+                    seen_recommended.add(key)
+                    recommended_entries.append((provider, model_id))
+
+        rows.extend(
+            self._build_model_picker_group_section(
+                title="Recent Used",
+                entries=recent_entries[:6],
+                picker_id=picker_id,
+                current_model=current_model,
+            )
         )
+        rows.extend(
+            self._build_model_picker_group_section(
+                title="Hot Models",
+                entries=hot_entries[:6],
+                picker_id=picker_id,
+                current_model=current_model,
+            )
+        )
+        rows.extend(
+            self._build_model_picker_group_section(
+                title="Recommended",
+                entries=recommended_entries[:4],
+                picker_id=picker_id,
+                current_model=current_model,
+            )
+        )
+
+        provider_actions: List[Dict[str, Any]] = []
         for provider in providers:
             provider_slug = str(provider.get("slug") or "").strip()
             provider_name = str(provider.get("name") or provider_slug or "provider").strip()
-            preview_models = self._dedupe_preserving_order(list(provider.get("preview_models", []) or []))[:4]
-            recent_models = self._dedupe_preserving_order(list(provider.get("recent_models", []) or []))[:3]
             total_models = int(provider.get("total_models") or len(provider.get("models", [])) or 0)
+            available_count = len(list(provider.get("available_models", []) or [])) or total_models
             status_bits = ["current" if provider_slug == current_provider else "available"]
             status_bits.append("ready" if provider.get("authenticated") else "not configured")
-            recent_text = ", ".join(recent_models) or "None yet"
             rows.append(
                 {
                     "tag": "markdown",
                     "content": (
-                        f"**{provider_name}** ({provider_slug}) - {', '.join(status_bits)} - {total_models} models\n"
-                        f"Recent: {recent_text}"
+                        f"**{provider_name}** ({provider_slug})\n"
+                        f"Status: {', '.join(status_bits)}\n"
+                        f"Available: {available_count}/{total_models}\n"
+                        f"Source: {provider.get('catalog_mode') or 'registry-only'}"
                     ),
                 }
             )
-            provider_models = list(provider.get("models", []) or [])
-            quick_models = [
-                model_id
-                for model_id in self._dedupe_preserving_order([current_model] + recent_models + preview_models)
-                if model_id in provider_models
-            ][:4]
-            if quick_models:
-                rows.append(
-                    {
-                        "tag": "markdown",
-                        "content": "\n".join(
-                            f"{index + 1}. {model_id}" for index, model_id in enumerate(quick_models)
-                        ),
-                    }
+            provider_actions.append(
+                self._make_model_picker_button(
+                    label=f"{provider_name}精选",
+                    action_name="model_picker_provider",
+                    picker_id=picker_id,
+                    extra={"provider": provider_slug},
+                    btn_type="primary" if provider_slug == current_provider else "default",
                 )
-            quick_actions: List[Dict[str, Any]] = []
-            for model_id in quick_models:
-                try:
-                    model_index = provider_models.index(model_id)
-                except ValueError:
-                    continue
-                quick_actions.append(
-                    self._make_model_picker_button(
-                        label=self._shorten_model_picker_label(model_id),
-                        action_name="model_picker_select",
-                        picker_id=picker_id,
-                        extra={"provider": provider_slug, "index": model_index},
-                        btn_type="primary" if model_id == current_model else "default",
-                    )
-                )
-            for action_chunk in self._chunk_action_buttons(quick_actions, chunk_size=2):
-                rows.append({"tag": "action", "actions": action_chunk})
-            rows.append(
-                {
-                    "tag": "action",
-                    "actions": [
-                        self._make_model_picker_button(
-                            label=f"More {provider_name}",
-                            action_name="model_picker_provider",
-                            picker_id=picker_id,
-                            extra={"provider": provider_slug},
-                            btn_type="default",
-                        )
-                    ],
-                }
             )
+        for action_chunk in self._chunk_action_buttons(provider_actions, chunk_size=2):
+            rows.append({"tag": "action", "actions": action_chunk})
+
         rows.append(
             {
                 "tag": "action",
@@ -1770,7 +1858,213 @@ class FeishuAdapter(BasePlatformAdapter):
         return {
             "config": {"wide_screen_mode": True},
             "header": {
-                "title": {"content": "Model Configuration", "tag": "plain_text"},
+                "title": {"content": "Model Switchboard", "tag": "plain_text"},
+                "template": "blue",
+            },
+            "elements": rows,
+        }
+
+    def _build_model_picker_group_section(
+        self,
+        *,
+        title: str,
+        entries: List[tuple[Dict[str, Any], str]],
+        picker_id: str,
+        current_model: Optional[str] = None,
+        selected_filter: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        if not entries:
+            return []
+        rows: List[Dict[str, Any]] = [
+            {
+                "tag": "markdown",
+                "content": f"**{title}**",
+            }
+        ]
+        actions: List[Dict[str, Any]] = []
+        for provider, model_id in entries:
+            model_index = self._find_model_picker_model_index(provider, model_id)
+            if model_index is None:
+                continue
+            provider_slug = str(provider.get("slug") or "").strip()
+            actions.append(
+                self._make_model_picker_button(
+                    label=self._shorten_model_picker_label(model_id, max_len=44),
+                    action_name="model_picker_select",
+                    picker_id=picker_id,
+                    extra={
+                        "provider": provider_slug,
+                        "index": model_index,
+                        "model": model_id,
+                        "filter": str(selected_filter or "").strip().lower() or "featured",
+                    },
+                    btn_type="danger" if model_id == str(current_model or "").strip() else "default",
+                )
+            )
+        for action_chunk in self._chunk_action_buttons(actions, chunk_size=2):
+            rows.append({"tag": "action", "actions": action_chunk})
+        return rows
+
+    @staticmethod
+    def _find_model_picker_model_index(provider: Dict[str, Any], model_id: str) -> Optional[int]:
+        try:
+            return list(provider.get("models", []) or []).index(model_id)
+        except ValueError:
+            return None
+
+    def _build_model_picker_provider_picks_card(
+        self,
+        *,
+        state: Dict[str, Any],
+        provider_slug: str,
+        selected_filter: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        provider = next(
+            (p for p in state.get("providers", []) if p.get("slug") == provider_slug),
+            None,
+        )
+        if not provider:
+            return self._build_model_picker_status_card(
+                title="Model Picker Expired",
+                body="The selected provider is no longer available. Use /model to reopen the picker.",
+                template="red",
+            )
+
+        models = list(provider.get("models", []) or [])
+        total_models = int(provider.get("total_models") or len(models) or 0)
+        current_model = state.get("current_model")
+        selected_filter = str(selected_filter or state.get("selected_filter") or "featured").strip().lower() or "featured"
+        recent_models = self._dedupe_preserving_order(
+            list(provider.get("recent_models", []) or []) + list(provider.get("recent_registry_models", []) or [])
+        )
+        hot_models = self._dedupe_preserving_order(list(provider.get("hot_models", []) or []))
+        recommended_models = self._dedupe_preserving_order(list(provider.get("recommended_models", []) or []))
+        model_details = dict(provider.get("model_details", {}) or {})
+        section_seen: set[str] = set()
+
+        def _take_unique(candidates: List[str], limit: int) -> List[str]:
+            values: List[str] = []
+            for model_id in candidates:
+                item = str(model_id or "").strip()
+                if not item or item in section_seen or item not in models:
+                    continue
+                section_seen.add(item)
+                values.append(item)
+                if len(values) >= limit:
+                    break
+            return values
+
+        recent_section = _take_unique(recent_models, 4)
+        hot_section = _take_unique(hot_models, 4)
+        recommended_section = _take_unique(recommended_models, 4)
+        top_models = [
+            model_id
+            for model_id in self._dedupe_preserving_order(
+                recent_models
+                + hot_models
+                + recommended_models
+                + list(provider.get("featured_models", []) or [])
+                + models
+            )
+            if model_id in models
+        ]
+        performance_candidates = sorted(
+            [model_id for model_id in models if model_id in model_details or model_id in top_models],
+            key=lambda model_id: (
+                1 if not bool(model_details.get(model_id, {}).get("is_available", True)) else 0,
+                0 if model_id == str(current_model or "").strip() else 1,
+                int(model_details.get(model_id, {}).get("latency_ms") or 10**9),
+                -int(model_details.get(model_id, {}).get("context_window") or 0),
+                int(model_details.get(model_id, {}).get("rank") or 9999),
+                model_id,
+            ),
+        )
+        more_section = _take_unique(top_models, 8)
+
+        featured_section = self._dedupe_preserving_order(
+            recommended_section + hot_section + recent_section + more_section + top_models
+        )[:20]
+        recent_view = self._dedupe_preserving_order(recent_models + recent_section + top_models)[:20]
+        performance_view = self._dedupe_preserving_order(performance_candidates + top_models)[:20]
+
+        if selected_filter == "recent":
+            primary_title = f"Recent ({min(len(recent_view), total_models)}/{total_models})"
+            primary_models = recent_view
+        elif selected_filter == "performance":
+            primary_title = f"Performance ({min(len(performance_view), total_models)}/{total_models})"
+            primary_models = performance_view
+        else:
+            selected_filter = "featured"
+            primary_title = f"Featured ({min(len(featured_section), total_models)}/{total_models})"
+            primary_models = featured_section
+
+        rows: List[Dict[str, Any]] = []
+        rows.append(
+            {
+                "tag": "action",
+                "actions": [
+                    self._make_model_picker_button(
+                        label="精选",
+                        action_name="model_picker_provider",
+                        picker_id=state["picker_id"],
+                        extra={"provider": provider_slug, "filter": "featured"},
+                        btn_type="primary" if selected_filter == "featured" else "default",
+                    ),
+                    self._make_model_picker_button(
+                        label="最近",
+                        action_name="model_picker_provider",
+                        picker_id=state["picker_id"],
+                        extra={"provider": provider_slug, "filter": "recent"},
+                        btn_type="primary" if selected_filter == "recent" else "default",
+                    ),
+                    self._make_model_picker_button(
+                        label="性能",
+                        action_name="model_picker_provider",
+                        picker_id=state["picker_id"],
+                        extra={"provider": provider_slug, "filter": "performance"},
+                        btn_type="primary" if selected_filter == "performance" else "default",
+                    ),
+                ],
+            }
+        )
+        rows.extend(
+            self._build_model_picker_group_section(
+                title=primary_title,
+                entries=[(provider, model_id) for model_id in primary_models],
+                picker_id=state["picker_id"],
+                current_model=current_model,
+            )
+        )
+        rows.append(
+            {
+                "tag": "markdown",
+                "content": "点模型即切换\n后台自动刷新失效模型\n当前会话保持粘性",
+            }
+        )
+        rows.append(
+            {
+                "tag": "action",
+                "actions": [
+                    self._make_model_picker_button(
+                        label="Back",
+                        action_name="model_picker_back",
+                        picker_id=state["picker_id"],
+                        extra={},
+                    ),
+                    self._make_model_picker_button(
+                        label="Cancel",
+                        action_name="model_picker_cancel",
+                        picker_id=state["picker_id"],
+                        extra={},
+                        btn_type="danger",
+                    ),
+                ],
+            }
+        )
+        return {
+            "config": {"wide_screen_mode": True},
+            "header": {
+                "title": {"content": f"{provider.get('name', provider_slug)} Picks", "tag": "plain_text"},
                 "template": "orange",
             },
             "elements": rows,
@@ -1802,13 +2096,44 @@ class FeishuAdapter(BasePlatformAdapter):
         end = min(start + _FEISHU_MODEL_PICKER_PAGE_SIZE, total)
 
         action_rows: List[Dict[str, Any]] = []
+        recent_models = self._dedupe_preserving_order(
+            list(provider.get("recent_models", []) or []) + list(provider.get("recent_registry_models", []) or [])
+        )
+        if recent_models:
+            action_rows.append(
+                {
+                    "tag": "markdown",
+                    "content": "**Recent used on this provider**\n" + "\n".join(
+                        f"- {self._build_model_picker_model_line(provider, model_id, current_model=state.get('current_model'))}"
+                        for model_id in recent_models[:4]
+                    ),
+                }
+            )
+            recent_actions: List[Dict[str, Any]] = []
+            for model_id in recent_models[:4]:
+                try:
+                    model_index = models.index(model_id)
+                except ValueError:
+                    continue
+                recent_actions.append(
+                    self._make_model_picker_button(
+                        label=self._shorten_model_picker_label(model_id, max_len=44),
+                        action_name="model_picker_select",
+                        picker_id=state["picker_id"],
+                        extra={"provider": provider_slug, "index": model_index},
+                        btn_type="primary" if model_id == state.get("current_model") else "default",
+                    )
+                )
+            for action_chunk in self._chunk_action_buttons(recent_actions, chunk_size=2):
+                action_rows.append({"tag": "action", "actions": action_chunk})
+
         visible_models = models[start:end]
         if visible_models:
             action_rows.append(
                 {
                     "tag": "markdown",
                     "content": "\n".join(
-                        f"{offset + 1}. {model_id}"
+                        f"{offset + 1}. {self._build_model_picker_model_line(provider, model_id, current_model=state.get('current_model'))}"
                         for offset, model_id in enumerate(visible_models, start=start)
                     ),
                 }
@@ -1817,7 +2142,7 @@ class FeishuAdapter(BasePlatformAdapter):
         for idx, model_id in enumerate(visible_models, start=start):
             button_row.append(
                 self._make_model_picker_button(
-                    label=self._shorten_model_picker_label(model_id),
+                    label=self._shorten_model_picker_label(model_id, max_len=44),
                     action_name="model_picker_select",
                     picker_id=state["picker_id"],
                     extra={"provider": provider_slug, "index": idx},
@@ -1874,6 +2199,8 @@ class FeishuAdapter(BasePlatformAdapter):
                 "tag": "markdown",
                 "content": (
                     f"Provider: {provider.get('name', provider_slug)} ({provider_slug})\n"
+                    f"Current model: {state.get('current_model') or 'unknown'}\n"
+                    f"Source: {provider.get('catalog_mode') or 'registry-only'}\n"
                     f"Showing {start + 1}-{end} of {total_models} models."
                 ),
             },
@@ -1890,6 +2217,321 @@ class FeishuAdapter(BasePlatformAdapter):
             "elements": action_rows,
         }
 
+    def _build_model_picker_provider_card(
+        self,
+        *,
+        providers: list,
+        current_model: str,
+        current_provider: str,
+        picker_id: str,
+    ) -> Dict[str, Any]:
+        rows: List[Dict[str, Any]] = [
+            {
+                "tag": "markdown",
+                "content": (
+                    f"**Current route**\n"
+                    f"Provider: {current_provider or 'unknown'}\n"
+                    f"Model: {current_model or 'unknown'}\n"
+                    "Mode: sticky route\n"
+                    "Data source: local Hermes registry cache\n"
+                    "Prebuilt sections below favor speed over full catalog browsing."
+                ),
+            }
+        ]
+
+        recent_entries: List[tuple[Dict[str, Any], str]] = []
+        hot_entries: List[tuple[Dict[str, Any], str]] = []
+        recommended_entries: List[tuple[Dict[str, Any], str]] = []
+        seen_recent: set[tuple[str, str]] = set()
+        seen_hot: set[tuple[str, str]] = set()
+        seen_recommended: set[tuple[str, str]] = set()
+
+        for provider in providers:
+            provider_slug = str(provider.get("slug") or "").strip()
+            for model_id in self._dedupe_preserving_order(
+                list(provider.get("recent_models", []) or []) + list(provider.get("recent_registry_models", []) or [])
+            )[:3]:
+                key = (provider_slug, model_id)
+                if key not in seen_recent:
+                    seen_recent.add(key)
+                    recent_entries.append((provider, model_id))
+            for model_id in self._dedupe_preserving_order(list(provider.get("hot_models", []) or []))[:3]:
+                key = (provider_slug, model_id)
+                if key not in seen_hot:
+                    seen_hot.add(key)
+                    hot_entries.append((provider, model_id))
+            for model_id in self._dedupe_preserving_order(list(provider.get("recommended_models", []) or []))[:2]:
+                key = (provider_slug, model_id)
+                if key not in seen_recommended:
+                    seen_recommended.add(key)
+                    recommended_entries.append((provider, model_id))
+
+        rows.extend(
+            self._build_model_picker_group_section(
+                title="Recent Used",
+                entries=recent_entries[:6],
+                picker_id=picker_id,
+                current_model=current_model,
+            )
+        )
+        rows.extend(
+            self._build_model_picker_group_section(
+                title="Hot Models",
+                entries=hot_entries[:6],
+                picker_id=picker_id,
+                current_model=current_model,
+            )
+        )
+        rows.extend(
+            self._build_model_picker_group_section(
+                title="Recommended",
+                entries=recommended_entries[:4],
+                picker_id=picker_id,
+                current_model=current_model,
+            )
+        )
+
+        provider_actions: List[Dict[str, Any]] = []
+        for provider in providers:
+            provider_slug = str(provider.get("slug") or "").strip()
+            provider_name = str(provider.get("name") or provider_slug or "provider").strip()
+            total_models = int(provider.get("total_models") or len(provider.get("models", [])) or 0)
+            available_count = len(list(provider.get("available_models", []) or [])) or total_models
+            status_bits = ["current" if provider_slug == current_provider else "available"]
+            status_bits.append("ready" if provider.get("authenticated") else "not configured")
+            rows.append(
+                {
+                    "tag": "markdown",
+                    "content": (
+                        f"**{provider_name}** ({provider_slug})\n"
+                        f"Status: {', '.join(status_bits)}\n"
+                        f"Available: {available_count}/{total_models}\n"
+                        f"Source: {provider.get('catalog_mode') or 'registry-only'}"
+                    ),
+                }
+            )
+            provider_actions.append(
+                self._make_model_picker_button(
+                    label=f"{provider_name} Picks",
+                    action_name="model_picker_provider",
+                    picker_id=picker_id,
+                    extra={"provider": provider_slug},
+                    btn_type="primary" if provider_slug == current_provider else "default",
+                )
+            )
+        for action_chunk in self._chunk_action_buttons(provider_actions, chunk_size=2):
+            rows.append({"tag": "action", "actions": action_chunk})
+
+        rows.append(
+            {
+                "tag": "action",
+                "actions": [
+                    self._make_model_picker_button(
+                        label="Cancel",
+                        action_name="model_picker_cancel",
+                        picker_id=picker_id,
+                        extra={},
+                        btn_type="danger",
+                    )
+                ],
+            }
+        )
+        return {
+            "config": {"wide_screen_mode": True},
+            "header": {
+                "title": {"content": "Model Switchboard", "tag": "plain_text"},
+                "template": "blue",
+            },
+            "elements": rows,
+        }
+
+    def _build_model_picker_model_card(
+        self,
+        *,
+        state: Dict[str, Any],
+        provider_slug: str,
+        page: int,
+    ) -> Dict[str, Any]:
+        # Compatibility wrapper for stale cards that still point at the old paginated
+        # action path. The active UX now uses prebuilt provider pick cards only.
+        state["selected_provider"] = provider_slug
+        state["model_page"] = max(0, int(page or 0))
+        return self._get_model_picker_provider_cached_card(
+            state=state,
+            provider_slug=provider_slug,
+            selected_filter=str(state.get("selected_filter") or "featured"),
+        )
+
+    def _get_model_picker_provider_cached_card(
+        self,
+        *,
+        state: Dict[str, Any],
+        provider_slug: str,
+        selected_filter: str,
+    ) -> Dict[str, Any]:
+        provider_cards = state.setdefault("provider_cards", {})
+        provider_cache = provider_cards.setdefault(provider_slug, {})
+        filter_key = str(selected_filter or "featured").strip().lower() or "featured"
+        card = provider_cache.get(filter_key)
+        if card:
+            return card
+        card = self._build_model_picker_provider_picks_card(
+            state=state,
+            provider_slug=provider_slug,
+            selected_filter=filter_key,
+        )
+        provider_cache[filter_key] = card
+        return card
+
+    def _build_model_picker_provider_picks_card(
+        self,
+        *,
+        state: Dict[str, Any],
+        provider_slug: str,
+        selected_filter: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        provider = next(
+            (p for p in state.get("providers", []) if p.get("slug") == provider_slug),
+            None,
+        )
+        if not provider:
+            return self._build_model_picker_status_card(
+                title="Model Picker Expired",
+                body="The selected provider is no longer available. Use /model to reopen the picker.",
+                template="red",
+            )
+
+        models = list(provider.get("models", []) or [])
+        total_models = int(provider.get("total_models") or len(models) or 0)
+        current_model = state.get("current_model")
+        selected_filter = str(selected_filter or state.get("selected_filter") or "featured").strip().lower() or "featured"
+        recent_models = self._dedupe_preserving_order(
+            list(provider.get("recent_models", []) or []) + list(provider.get("recent_registry_models", []) or [])
+        )
+        hot_models = self._dedupe_preserving_order(list(provider.get("hot_models", []) or []))
+        recommended_models = self._dedupe_preserving_order(list(provider.get("recommended_models", []) or []))
+        model_details = dict(provider.get("model_details", {}) or {})
+        section_seen: set[str] = set()
+
+        def _take_unique(candidates: List[str], limit: int) -> List[str]:
+            values: List[str] = []
+            for model_id in candidates:
+                item = str(model_id or "").strip()
+                if not item or item in section_seen or item not in models:
+                    continue
+                section_seen.add(item)
+                values.append(item)
+                if len(values) >= limit:
+                    break
+            return values
+
+        recent_section = _take_unique(recent_models, 4)
+        hot_section = _take_unique(hot_models, 4)
+        recommended_section = _take_unique(recommended_models, 4)
+        top_models = [
+            model_id
+            for model_id in self._dedupe_preserving_order(
+                recent_models
+                + hot_models
+                + recommended_models
+                + list(provider.get("featured_models", []) or [])
+                + models
+            )
+            if model_id in models
+        ]
+        performance_candidates = sorted(
+            [model_id for model_id in models if model_id in model_details or model_id in top_models],
+            key=lambda model_id: (
+                1 if not bool(model_details.get(model_id, {}).get("is_available", True)) else 0,
+                0 if model_id == str(current_model or "").strip() else 1,
+                int(model_details.get(model_id, {}).get("latency_ms") or 10**9),
+                -int(model_details.get(model_id, {}).get("context_window") or 0),
+                int(model_details.get(model_id, {}).get("rank") or 9999),
+                model_id,
+            ),
+        )
+        more_section = _take_unique(top_models, 8)
+
+        featured_section = self._dedupe_preserving_order(
+            recommended_section + hot_section + recent_section + more_section + top_models
+        )[:20]
+        recent_view = self._dedupe_preserving_order(recent_models + recent_section + top_models)[:20]
+        performance_view = self._dedupe_preserving_order(performance_candidates + top_models)[:20]
+
+        if selected_filter == "recent":
+            primary_title = f"Recent ({min(len(recent_view), total_models)}/{total_models})"
+            primary_models = recent_view
+        elif selected_filter == "performance":
+            primary_title = f"Performance ({min(len(performance_view), total_models)}/{total_models})"
+            primary_models = performance_view
+        else:
+            selected_filter = "featured"
+            primary_title = f"Featured ({min(len(featured_section), total_models)}/{total_models})"
+            primary_models = featured_section
+
+        rows: List[Dict[str, Any]] = []
+        rows.extend(
+            self._build_model_picker_group_section(
+                title=primary_title,
+                entries=[(provider, model_id) for model_id in primary_models],
+                picker_id=state["picker_id"],
+                current_model=current_model,
+                selected_filter=selected_filter,
+            )
+        )
+        rows.append(
+            {
+                "tag": "markdown",
+                "content": "点击模型立即切换\n后台刷新失效模型\n会话继续保持粘性",
+            }
+        )
+
+        filter_labels = {
+            "featured": "切到精选",
+            "recent": "切到最近",
+            "performance": "切到性能",
+        }
+        sibling_actions = [
+            self._make_model_picker_button(
+                label=filter_labels[filter_name],
+                action_name="model_picker_provider",
+                picker_id=state["picker_id"],
+                extra={"provider": provider_slug, "filter": filter_name},
+            )
+            for filter_name in ("featured", "recent", "performance")
+            if filter_name != selected_filter
+        ]
+        if sibling_actions:
+            rows.append({"tag": "action", "actions": sibling_actions[:2]})
+        rows.append(
+            {
+                "tag": "action",
+                "actions": [
+                    self._make_model_picker_button(
+                        label="Back",
+                        action_name="model_picker_back",
+                        picker_id=state["picker_id"],
+                        extra={},
+                    ),
+                    self._make_model_picker_button(
+                        label="Close",
+                        action_name="model_picker_cancel",
+                        picker_id=state["picker_id"],
+                        extra={},
+                        btn_type="danger",
+                    ),
+                ],
+            }
+        )
+        return {
+            "config": {"wide_screen_mode": True},
+            "header": {
+                "title": {"content": f"{provider.get('name', provider_slug)} {selected_filter.title()}", "tag": "plain_text"},
+                "template": "orange",
+            },
+            "elements": rows,
+        }
+
     @staticmethod
     def _build_model_picker_status_card(*, title: str, body: str, template: str = "green") -> Dict[str, Any]:
         return {
@@ -1902,16 +2544,49 @@ class FeishuAdapter(BasePlatformAdapter):
         }
 
     @staticmethod
-    def _shorten_model_picker_label(model_id: str) -> str:
+    def _shorten_model_picker_label(model_id: str, max_len: int = 32) -> str:
         text = str(model_id or "").strip()
-        if len(text) <= 32:
+        if max_len <= 12:
+            max_len = 12
+        if len(text) <= max_len:
             return text
         if "/" in text:
             provider, remainder = text.split("/", 1)
-            if len(remainder) <= 24:
+            if len(remainder) <= max_len - len(provider) - 1:
                 return text
-            return f"{provider}/{remainder[:14]}...{remainder[-8:]}"
-        return text[:18] + "..." + text[-8:]
+            head = max(8, min(18, max_len // 2))
+            tail = max(6, min(12, max_len - head - len(provider) - 4))
+            return f"{provider}/{remainder[:head]}...{remainder[-tail:]}"
+        head = max(8, min(20, max_len // 2))
+        tail = max(6, min(12, max_len - head - 3))
+        return text[:head] + "..." + text[-tail:]
+
+    def _build_model_picker_model_line(
+        self,
+        provider: Dict[str, Any],
+        model_id: str,
+        *,
+        current_model: Optional[str] = None,
+    ) -> str:
+        details = dict((provider or {}).get("model_details", {}).get(model_id) or {})
+        badges: List[str] = []
+        if model_id == str(current_model or "").strip():
+            badges.append("current")
+        provider_recent = set(provider.get("recent_models", []) or []) | set(provider.get("recent_registry_models", []) or [])
+        if model_id in provider_recent:
+            badges.append("recent")
+        elif bool(details.get("recent_used")):
+            badges.append("recent")
+        selection_hint = str(details.get("selection_hint") or "").strip()
+        if selection_hint and selection_hint not in badges:
+            badges.append(selection_hint)
+        if bool(details.get("is_free")):
+            badges.append("free")
+        status = str(details.get("status") or "").strip().lower()
+        if status and status not in {"active", "ok"} and status not in badges:
+            badges.append(status)
+        badge_text = f" [{' | '.join(badges)}]" if badges else ""
+        return f"{model_id}{badge_text}"
 
     @staticmethod
     def _dedupe_preserving_order(values: List[str]) -> List[str]:
@@ -1957,12 +2632,96 @@ class FeishuAdapter(BasePlatformAdapter):
         request = self._build_update_message_request(message_id=message_id, request_body=body)
         await asyncio.to_thread(self._client.im.v1.message.update, request)
 
+    @staticmethod
+    def _build_delete_message_request(message_id: str) -> Any:
+        delete_request_cls = globals().get("DeleteMessageRequest")
+        if delete_request_cls is None:
+            try:
+                from lark_oapi.api.im.v1 import DeleteMessageRequest as delete_request_cls  # type: ignore
+            except Exception:
+                delete_request_cls = None
+        if delete_request_cls is not None:
+            return delete_request_cls.builder().message_id(message_id).build()
+        return SimpleNamespace(message_id=message_id)
+
+    async def _delete_message(self, message_id: str) -> bool:
+        if not self._client or not message_id:
+            return False
+        try:
+            request = self._build_delete_message_request(message_id)
+            response = await asyncio.to_thread(self._client.im.v1.message.delete, request)
+            if hasattr(response, "success"):
+                return bool(response.success())
+            return bool(getattr(response, "code", 0) in (0, None, ""))
+        except Exception as exc:
+            logger.warning("[Feishu] Failed to delete message %s: %s", message_id, exc)
+            return False
+
+    async def _replace_model_picker_card(
+        self,
+        *,
+        chat_id: str,
+        message_id: str,
+        card: Dict[str, Any],
+        state: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        update_error: Exception | None = None
+        if message_id:
+            try:
+                await self._update_interactive_card(message_id, card)
+                return
+            except Exception as exc:
+                update_error = exc
+                logger.warning(
+                    "[Feishu] Model picker card update failed, sending replacement card chat=%s message_id=%s error=%s",
+                    _mask_chat_id(chat_id),
+                    _trim_log_field(message_id, limit=64),
+                    exc,
+                )
+
+        if not self._client:
+            if update_error:
+                raise update_error
+            raise RuntimeError("Feishu client is not connected")
+
+        payload = json.dumps(card, ensure_ascii=False)
+        response = await self._feishu_send_with_retry(
+            chat_id=chat_id,
+            msg_type="interactive",
+            payload=payload,
+            reply_to=None,
+            metadata={"model_picker_replacement": True},
+        )
+        result = self._finalize_send_result(response, "send replacement model picker failed")
+        if not result.success:
+            raise RuntimeError(result.error or "send replacement model picker failed")
+        if state is not None and result.message_id:
+            state["message_id"] = result.message_id
+            self._persist_model_picker_state()
+
     async def _handle_model_picker_action(self, action_value: Dict[str, Any], chat_id: str, open_id: str) -> bool:
         picker_id = str(action_value.get("picker_id") or "").strip()
         if not picker_id:
             return False
         state = self._get_model_picker_state_entry(picker_id)
+        action_name = str(action_value.get("hermes_action") or "").strip()
+        fallback_provider_slug = str(action_value.get("provider") or "").strip()
+        fallback_model_id = str(action_value.get("model") or "").strip()
         if not state:
+            if action_name == "model_picker_select" and fallback_provider_slug and fallback_model_id:
+                logger.info(
+                    "[Feishu] Model picker %s missing state; dispatching stateless selection model=%s provider=%s",
+                    picker_id,
+                    fallback_model_id,
+                    fallback_provider_slug,
+                )
+                await self._dispatch_model_picker_selection(
+                    chat_id=chat_id,
+                    open_id=open_id,
+                    model_id=fallback_model_id,
+                    provider_slug=fallback_provider_slug,
+                )
+                return True
             logger.debug("[Feishu] Model picker %s already expired", picker_id)
             return True
 
@@ -1971,16 +2730,22 @@ class FeishuAdapter(BasePlatformAdapter):
             logger.info("[Feishu] Ignoring model picker action from non-owner user=%s picker=%s", open_id, picker_id)
             return True
 
-        action_name = str(action_value.get("hermes_action") or "").strip()
         message_id = str(state.get("message_id") or "").strip()
         if action_name == "model_picker_provider":
             provider_slug = str(action_value.get("provider") or "").strip()
             state["selected_provider"] = provider_slug
+            state["selected_filter"] = str(action_value.get("filter") or state.get("selected_filter") or "featured").strip()
             state["model_page"] = 0
             self._persist_model_picker_state()
-            await self._update_interactive_card(
-                message_id,
-                self._build_model_picker_model_card(state=state, provider_slug=provider_slug, page=0),
+            await self._replace_model_picker_card(
+                chat_id=chat_id,
+                message_id=message_id,
+                card=self._get_model_picker_provider_cached_card(
+                    state=state,
+                    provider_slug=provider_slug,
+                    selected_filter=str(state.get("selected_filter") or "featured"),
+                ),
+                state=state,
             )
             return True
 
@@ -1991,37 +2756,50 @@ class FeishuAdapter(BasePlatformAdapter):
             except (TypeError, ValueError):
                 page = 0
             state["selected_provider"] = provider_slug
+            state["selected_filter"] = str(action_value.get("filter") or state.get("selected_filter") or "featured").strip()
             state["model_page"] = page
             self._persist_model_picker_state()
-            await self._update_interactive_card(
-                message_id,
-                self._build_model_picker_model_card(state=state, provider_slug=provider_slug, page=page),
+            await self._replace_model_picker_card(
+                chat_id=chat_id,
+                message_id=message_id,
+                card=self._get_model_picker_provider_cached_card(
+                    state=state,
+                    provider_slug=provider_slug,
+                    selected_filter=str(state.get("selected_filter") or "featured"),
+                ),
+                state=state,
             )
             return True
 
         if action_name == "model_picker_back":
-            await self._update_interactive_card(
-                message_id,
-                self._build_model_picker_provider_card(
+            await self._replace_model_picker_card(
+                chat_id=chat_id,
+                message_id=message_id,
+                card=self._build_model_picker_provider_card(
                     providers=state.get("providers", []),
                     current_model=str(state.get("current_model") or ""),
                     current_provider=str(state.get("current_provider") or ""),
                     picker_id=picker_id,
                 ),
+                state=state,
             )
             return True
 
         if action_name == "model_picker_cancel":
+            deleted = await self._delete_message(message_id)
+            if not deleted:
+                await self._replace_model_picker_card(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    card=self._build_model_picker_status_card(
+                        title="Model Picker Closed",
+                        body="Use `/model` or the Feishu menu to open the picker again.",
+                        template="red",
+                    ),
+                    state=state,
+                )
             self._model_picker_state.pop(picker_id, None)
             self._persist_model_picker_state()
-            await self._update_interactive_card(
-                message_id,
-                self._build_model_picker_status_card(
-                    title="Model Picker Closed",
-                    body="Use `/model` or the Feishu menu to open the picker again.",
-                    template="red",
-                ),
-            )
             return True
 
         if action_name == "model_picker_select":
@@ -2031,13 +2809,25 @@ class FeishuAdapter(BasePlatformAdapter):
                 None,
             )
             if not provider:
-                await self._update_interactive_card(
-                    message_id,
-                    self._build_model_picker_status_card(
+                if fallback_provider_slug and fallback_model_id:
+                    await self._dispatch_model_picker_selection(
+                        chat_id=chat_id,
+                        open_id=open_id,
+                        model_id=fallback_model_id,
+                        provider_slug=fallback_provider_slug,
+                    )
+                    self._model_picker_state.pop(picker_id, None)
+                    self._persist_model_picker_state()
+                    return True
+                await self._replace_model_picker_card(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    card=self._build_model_picker_status_card(
                         title="Provider Missing",
                         body="That provider is no longer available. Reopen the picker and try again.",
                         template="red",
                     ),
+                    state=state,
                 )
                 self._model_picker_state.pop(picker_id, None)
                 return True
@@ -2047,17 +2837,22 @@ class FeishuAdapter(BasePlatformAdapter):
             except (TypeError, ValueError):
                 index = -1
             if index < 0 or index >= len(models):
-                await self._update_interactive_card(
-                    message_id,
-                    self._build_model_picker_status_card(
-                        title="Model Missing",
-                        body="That model is no longer available. Reopen the picker and try again.",
-                        template="red",
-                    ),
-                )
-                self._model_picker_state.pop(picker_id, None)
-                return True
-            model_id = str(models[index] or "").strip()
+                model_id = fallback_model_id
+                if not model_id or model_id not in models:
+                    await self._replace_model_picker_card(
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        card=self._build_model_picker_status_card(
+                            title="Model Missing",
+                            body="That model is no longer available. Reopen the picker and try again.",
+                            template="red",
+                        ),
+                        state=state,
+                    )
+                    self._model_picker_state.pop(picker_id, None)
+                    return True
+            else:
+                model_id = str(models[index] or "").strip()
             callback = state.get("on_model_selected")
             if callable(callback):
                 try:
@@ -2067,22 +2862,26 @@ class FeishuAdapter(BasePlatformAdapter):
                     confirmation = f"Error: {exc}"
                 if isinstance(confirmation, str):
                     template = "green" if not confirmation.lower().startswith("error:") else "red"
-                    await self._update_interactive_card(
-                        message_id,
-                        self._build_model_picker_status_card(
+                    await self._replace_model_picker_card(
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        card=self._build_model_picker_status_card(
                             title="Model Updated" if template == "green" else "Model Switch Failed",
                             body=confirmation,
                             template=template,
                         ),
+                        state=state,
                     )
             else:
-                await self._update_interactive_card(
-                    message_id,
-                    self._build_model_picker_status_card(
+                await self._replace_model_picker_card(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    card=self._build_model_picker_status_card(
                         title="Applying Model Switch",
                         body=f"Switching to `{model_id}` via `{provider_slug}`...",
                         template="orange",
                     ),
+                    state=state,
                 )
                 await self._dispatch_model_picker_selection(
                     chat_id=chat_id,
@@ -2692,6 +3491,23 @@ class FeishuAdapter(BasePlatformAdapter):
             if str(hermes_action).startswith("model_picker_"):
                 handled = await self._handle_model_picker_action(action_value, chat_id, open_id)
                 if handled:
+                    return
+            if str(hermes_action) == "registry_switch_model":
+                provider_slug = str(action_value.get("provider") or "").strip()
+                model_id = str(action_value.get("model") or "").strip()
+                if provider_slug and model_id:
+                    logger.info(
+                        "[Feishu] Routing registry switch action model=%s provider=%s chat=%s",
+                        model_id,
+                        provider_slug,
+                        chat_id,
+                    )
+                    await self._dispatch_model_picker_selection(
+                        chat_id=chat_id,
+                        open_id=open_id,
+                        model_id=model_id,
+                        provider_slug=provider_slug,
+                    )
                     return
 
             approval_id = action_value.get("approval_id")
@@ -4182,7 +4998,22 @@ class FeishuAdapter(BasePlatformAdapter):
         if not os.path.exists(file_path):
             return SendResult(success=False, error=f"File not found: {file_path}")
 
+        effective_file_path = file_path
+        cleanup_paths: list[str] = []
         display_name = file_name or os.path.basename(file_path)
+        if Path(display_name).suffix.lower() in _TEXTUAL_DOCUMENT_EXTENSIONS:
+            try:
+                text_content = Path(file_path).read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                text_content = Path(file_path).read_text(encoding="utf-8", errors="replace")
+            generated_name = f"{Path(display_name).stem or 'document'}.pdf"
+            generated_pdf = _build_simple_pdf_from_text(text_content, title=generated_name)
+            with tempfile.NamedTemporaryFile("wb", suffix=".pdf", delete=False) as tmp:
+                tmp.write(generated_pdf)
+                effective_file_path = tmp.name
+            cleanup_paths.append(effective_file_path)
+            display_name = generated_name
+
         upload_file_type, resolved_message_type = self._resolve_outbound_file_routing(
             file_path=display_name,
             requested_message_type=outbound_message_type,
@@ -4199,7 +5030,7 @@ class FeishuAdapter(BasePlatformAdapter):
                     bool(caption),
                     bool(reply_to),
                 )
-            with open(file_path, "rb") as file_obj:
+            with open(effective_file_path, "rb") as file_obj:
                 body = self._build_file_upload_body(
                     file_type=upload_file_type,
                     file_name=display_name,
@@ -4222,28 +5053,31 @@ class FeishuAdapter(BasePlatformAdapter):
                     _trim_log_field(file_key, limit=64),
                 )
 
-            if caption:
-                media_tag = {
-                    "tag": "media",
-                    "file_key": file_key,
-                    "file_name": display_name,
-                }
-                message_response = await self._feishu_send_with_retry(
+            message_response = await self._feishu_send_with_retry(
+                chat_id=chat_id,
+                msg_type=resolved_message_type,
+                payload=json.dumps({"file_key": file_key}, ensure_ascii=False),
+                reply_to=reply_to,
+                metadata=metadata,
+            )
+            caption_response = None
+            if caption and self._response_succeeded(message_response):
+                caption_response = await self._feishu_send_with_retry(
                     chat_id=chat_id,
-                    msg_type="post",
-                    payload=self._build_media_post_payload(caption=caption, media_tag=media_tag),
-                    reply_to=reply_to,
-                    metadata=metadata,
-                )
-            else:
-                message_response = await self._feishu_send_with_retry(
-                    chat_id=chat_id,
-                    msg_type=resolved_message_type,
-                    payload=json.dumps({"file_key": file_key}, ensure_ascii=False),
-                    reply_to=reply_to,
+                    msg_type="text",
+                    payload=json.dumps({"text": caption}, ensure_ascii=False),
+                    reply_to=None,
                     metadata=metadata,
                 )
             result = self._finalize_send_result(message_response, "file send failed")
+            if result.success and caption and caption_response is not None and not self._response_succeeded(caption_response):
+                logger.warning(
+                    "[Feishu] Attachment caption follow-up failed chat=%s path=%s code=%s msg=%s",
+                    _mask_chat_id(chat_id),
+                    display_name,
+                    getattr(caption_response, "code", None),
+                    getattr(caption_response, "msg", ""),
+                )
             if audit_enabled:
                 logger.warning(
                     "[Feishu] file send final chat=%s path=%s success=%s message_id=%s error=%s",
@@ -4257,6 +5091,12 @@ class FeishuAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.error("[Feishu] Failed to send file %s: %s", file_path, exc, exc_info=True)
             return SendResult(success=False, error=str(exc))
+        finally:
+            for cleanup_path in cleanup_paths:
+                try:
+                    os.unlink(cleanup_path)
+                except OSError:
+                    pass
 
     async def _send_raw_message(
         self,

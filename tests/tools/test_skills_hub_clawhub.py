@@ -1,9 +1,17 @@
 #!/usr/bin/env python3
 
+import os
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
-from tools.skills_hub import ClawHubSource, SkillMeta
+from tools.skills_hub import (
+    ClawHubSource,
+    SkillMeta,
+    build_clawhub_migration_queue,
+    load_marketplace_migration_queue,
+    save_clawhub_migration_queue,
+)
 
 
 class _MockResponse:
@@ -108,6 +116,211 @@ class TestClawHubSource(unittest.TestCase):
         self.assertEqual(results[0].identifier, "self-improving-agent")
         self.assertEqual(results[0].name, "self-improving-agent")
         self.assertIn("continuous improvement", results[0].description)
+
+    def test_top_by_category_groups_and_ranks_by_popularity(self):
+        catalog = [
+            SkillMeta(
+                name="Feishu Sync Pro",
+                description="Feishu bi-directional sync",
+                source="clawhub",
+                identifier="feishu-sync-pro",
+                trust_level="community",
+                tags=["communication", "productivity"],
+                extra={"installs": 2200, "downloads": 1500},
+            ),
+            SkillMeta(
+                name="Feishu Inbox",
+                description="Feishu inbox actions",
+                source="clawhub",
+                identifier="feishu-inbox",
+                trust_level="community",
+                tags=["communication"],
+                extra={"installs": 3100, "downloads": 500},
+            ),
+            SkillMeta(
+                name="Code Review Bot",
+                description="PR review workflows",
+                source="clawhub",
+                identifier="code-review-bot",
+                trust_level="community",
+                tags=["coding", "productivity"],
+                extra={"installs": 1900, "downloads": 1200},
+            ),
+        ]
+
+        grouped = self.src.top_by_category(limit_per_category=2, catalog=catalog)
+
+        self.assertEqual([item.identifier for item in grouped["communication"]], [
+            "feishu-inbox",
+            "feishu-sync-pro",
+        ])
+        self.assertEqual([item.identifier for item in grouped["productivity"]], [
+            "feishu-sync-pro",
+            "code-review-bot",
+        ])
+        self.assertEqual([item.identifier for item in grouped["coding"]], [
+            "code-review-bot",
+        ])
+
+    def test_meta_from_item_preserves_popularity_metrics(self):
+        meta = self.src._meta_from_item(
+            {
+                "slug": "feishu-sync-pro",
+                "displayName": "Feishu Sync Pro",
+                "summary": "Feishu bi-directional sync",
+                "tags": ["communication"],
+                "installs": 2200,
+                "downloads": 1500,
+                "weeklyInstalls": 180,
+                "category": "communication",
+            }
+        )
+
+        self.assertIsNotNone(meta)
+        assert meta is not None
+        self.assertEqual(meta.extra["installs"], 2200)
+        self.assertEqual(meta.extra["downloads"], 1500)
+        self.assertEqual(meta.extra["weeklyInstalls"], 180)
+        self.assertEqual(meta.extra["category"], "communication")
+
+    def test_build_clawhub_migration_queue_marks_covered_items_done(self):
+        catalog = [
+            SkillMeta(
+                name="Feishu Inbox",
+                description="Feishu inbox actions",
+                source="clawhub",
+                identifier="feishu-inbox",
+                trust_level="community",
+                tags=["communication"],
+                extra={"installs": 3100, "downloads": 500},
+            )
+        ]
+        local_catalog = [
+            SkillMeta(
+                name="Feishu Inbox",
+                description="Inbox actions for Feishu chats",
+                source="builtin",
+                identifier="skills/productivity/feishu-inbox",
+                trust_level="builtin",
+                path="productivity/feishu-inbox",
+                tags=["feishu", "communication"],
+                extra={"category": "communication"},
+            )
+        ]
+
+        queue = build_clawhub_migration_queue(
+            limit_per_category=10,
+            catalog=catalog,
+            local_catalog=local_catalog,
+        )
+
+        self.assertEqual(queue["summary"]["covered_items"], 1)
+        item = queue["categories"]["communication"][0]
+        self.assertEqual(item["coverage_status"], "covered")
+        self.assertEqual(item["task_status"], "done")
+        self.assertEqual(item["local_matches"][0]["name"], "Feishu Inbox")
+
+    def test_build_clawhub_migration_queue_preserves_gap_status_and_notes(self):
+        catalog = [
+            SkillMeta(
+                name="Code Review Bot",
+                description="PR review workflows",
+                source="clawhub",
+                identifier="code-review-bot",
+                trust_level="community",
+                tags=["coding", "productivity"],
+                extra={"installs": 1900, "downloads": 1200},
+            )
+        ]
+        existing_queue = {
+            "items": [
+                {
+                    "category": "coding",
+                    "identifier": "code-review-bot",
+                    "task_status": "blocked",
+                    "notes": "Waiting for human review of migration scope.",
+                }
+            ]
+        }
+
+        queue = build_clawhub_migration_queue(
+            limit_per_category=10,
+            catalog=catalog,
+            local_catalog=[],
+            existing_queue=existing_queue,
+        )
+
+        item = queue["categories"]["coding"][0]
+        self.assertEqual(item["coverage_status"], "gap")
+        self.assertEqual(item["task_status"], "blocked")
+        self.assertEqual(item["notes"], "Waiting for human review of migration scope.")
+
+    def test_save_clawhub_migration_queue_persists_and_reuses_state(self):
+        catalog = [
+            SkillMeta(
+                name="Code Review Bot",
+                description="PR review workflows",
+                source="clawhub",
+                identifier="code-review-bot",
+                trust_level="community",
+                tags=["coding", "productivity"],
+                extra={"installs": 1900, "downloads": 1200},
+            )
+        ]
+
+        temp_root = Path(os.getcwd()) / ".tmp-pytest" / "skills-hub-queue-state"
+        temp_root.mkdir(parents=True, exist_ok=True)
+        queue_path = temp_root / f"clawhub-migration-queue-{os.getpid()}.json"
+        temp_queue_path = queue_path.with_suffix(f"{queue_path.suffix}.tmp")
+        for path in (queue_path, temp_queue_path):
+            try:
+                if path.exists():
+                    path.unlink()
+            except OSError:
+                pass
+
+        first = save_clawhub_migration_queue(
+            queue_path,
+            limit_per_category=10,
+            catalog=catalog,
+            local_catalog=[],
+            existing_queue={
+                "items": [
+                    {
+                        "category": "coding",
+                        "identifier": "code-review-bot",
+                        "task_status": "in_progress",
+                        "notes": "Migration scaffolding started.",
+                    }
+                ]
+            },
+        )
+        self.assertTrue(queue_path.exists())
+        self.assertEqual(first["categories"]["coding"][0]["task_status"], "in_progress")
+
+        loaded = load_marketplace_migration_queue(queue_path)
+        self.assertEqual(loaded["categories"]["coding"][0]["notes"], "Migration scaffolding started.")
+
+        second = save_clawhub_migration_queue(
+            queue_path,
+            limit_per_category=10,
+            catalog=catalog,
+            local_catalog=[],
+        )
+        self.assertEqual(second["categories"]["coding"][0]["task_status"], "in_progress")
+        self.assertEqual(second["categories"]["coding"][0]["notes"], "Migration scaffolding started.")
+
+    def test_write_index_cache_skips_unwritable_cache_dir(self):
+        import tools.skills_hub as hub_mod
+        original_mkdir = type(hub_mod.INDEX_CACHE_DIR).mkdir
+
+        def _guarded_mkdir(path_self, *args, **kwargs):
+            if path_self == hub_mod.INDEX_CACHE_DIR:
+                raise PermissionError("denied")
+            return original_mkdir(path_self, *args, **kwargs)
+
+        with patch.object(type(hub_mod.INDEX_CACHE_DIR), "mkdir", _guarded_mkdir):
+            hub_mod._write_index_cache("test_key", {"data": "test"})
 
     @patch("tools.skills_hub.httpx.get")
     def test_search_repairs_poisoned_cache_with_exact_slug_lookup(self, mock_get):

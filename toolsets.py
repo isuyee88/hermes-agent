@@ -59,7 +59,7 @@ _HERMES_CORE_TOOLS = [
     # Cross-platform messaging (gated on gateway running via check_fn)
     "send_message",
     # Feishu/Lark collaboration APIs (gated on FEISHU_APP_ID / FEISHU_APP_SECRET)
-    "feishu_doc_create", "feishu_doc_get", "feishu_doc_append_markdown",
+    "feishu_doc_create", "feishu_doc_get", "feishu_doc_append_markdown", "feishu_doc_replace_markdown",
     "feishu_lookup_user", "feishu_sheet_create", "feishu_sheet_read_range",
     "feishu_sheet_write_range", "feishu_bitable_get_schema",
     "feishu_bitable_list_records", "feishu_bitable_upsert_records",
@@ -143,7 +143,7 @@ TOOLSETS = {
     "feishu": {
         "description": "Feishu/Lark collaboration tools for docs, sheets, bitable, messaging, files, and model registry operations",
         "tools": [
-            "feishu_doc_create", "feishu_doc_get", "feishu_doc_append_markdown",
+            "feishu_doc_create", "feishu_doc_get", "feishu_doc_append_markdown", "feishu_doc_replace_markdown",
             "feishu_lookup_user", "feishu_sheet_create", "feishu_sheet_read_range",
             "feishu_sheet_write_range", "feishu_bitable_get_schema",
             "feishu_bitable_list_records", "feishu_bitable_upsert_records",

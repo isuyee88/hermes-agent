@@ -499,8 +499,6 @@ def _resolve_platform_toolset_controls(
         enabled -= disabled
 
     return sorted(enabled), sorted(disabled)
-
-
 def _resolve_hermes_bin() -> Optional[list[str]]:
     """Resolve the Hermes update command as argv parts.
 
@@ -640,6 +638,7 @@ class GatewayRunner:
 
         # Track background tasks to prevent garbage collection mid-execution
         self._background_tasks: set = set()
+        self._feishu_registry_refresh_tasks: dict[str, asyncio.Task] = {}
 
 
 
@@ -928,6 +927,25 @@ class GatewayRunner:
                 break
         return merged[:limit]
 
+    @staticmethod
+    def _infer_provider_from_base_url(base_url: str | None) -> str:
+        normalized = str(base_url or "").strip().lower().rstrip("/")
+        if not normalized:
+            return ""
+        if "openrouter.ai" in normalized:
+            return "openrouter"
+        if "integrate.api.nvidia.com" in normalized or "api.nvcf.nvidia.com" in normalized:
+            return "nvidia"
+        return ""
+
+    @classmethod
+    def _normalize_route_provider(cls, provider: str | None, base_url: str | None) -> str:
+        normalized = str(provider or "").strip().lower()
+        inferred = cls._infer_provider_from_base_url(base_url)
+        if inferred and normalized in {"", "custom", "local", "unknown"}:
+            return inferred
+        return normalized or inferred
+
     def _build_recent_route_entries(
         self,
         session_key: str,
@@ -955,6 +973,40 @@ class GatewayRunner:
             seed = self._merge_recent_route_entries(seed, provider, model, limit=limit)
         return seed[:limit]
 
+    def _load_chat_model_registry_index(self) -> dict[str, list[dict[str, Any]]]:
+        try:
+            from tools.feishu_api import load_feishu_model_registry
+
+            payload = load_feishu_model_registry(force_refresh=False)
+        except Exception:
+            return {}
+
+        entries = payload.get("entries") if isinstance(payload, dict) else None
+        if not isinstance(entries, list):
+            return {}
+
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for item in entries:
+            if not isinstance(item, dict):
+                continue
+            provider = str(item.get("provider") or "").strip().lower()
+            model_id = str(item.get("model") or "").strip()
+            if not provider or not model_id:
+                continue
+            grouped.setdefault(provider, []).append(item)
+
+        for provider_entries in grouped.values():
+            provider_entries.sort(
+                key=lambda entry: (
+                    bool(entry.get("hidden")),
+                    0 if entry.get("recent_used") else 1,
+                    0 if str(entry.get("selection_hint") or "") == "recommended" else 1,
+                    int(entry.get("rank") or 9999),
+                    str(entry.get("model") or ""),
+                )
+            )
+        return grouped
+
     def _build_route_debug_payload(
         self,
         *,
@@ -966,15 +1018,16 @@ class GatewayRunner:
         last_failure_reason: str | None = None,
         extra: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        normalized_provider = self._normalize_route_provider(provider, base_url)
         payload = {
             "last_route_selection": str(selection_reason or "fresh_select").strip() or "fresh_select",
-            "provider": str(provider or "").strip().lower(),
+            "provider": normalized_provider,
             "model": str(model or "").strip(),
             "base_url": str(base_url or "").strip(),
             "updated_at": int(time.time()),
             "recent_routes": self._build_recent_route_entries(
                 session_key,
-                provider=provider,
+                provider=normalized_provider,
                 model=model,
             ),
         }
@@ -1023,14 +1076,20 @@ class GatewayRunner:
         lease_active = False
 
         active_model = str(current_model or "").strip()
-        active_provider = str(current_provider or "openrouter").strip().lower() or "openrouter"
+        active_provider = (
+            self._normalize_route_provider(current_provider, current_base_url)
+            or "openrouter"
+        )
         active_base_url = str(current_base_url or "").strip()
         active_api_key = str(current_api_key or "").strip()
 
         if override:
             active_model = str(override.get("model") or active_model).strip()
-            active_provider = str(override.get("provider") or active_provider).strip().lower() or active_provider
             active_base_url = str(override.get("base_url") or active_base_url).strip()
+            active_provider = (
+                self._normalize_route_provider(override.get("provider") or active_provider, active_base_url)
+                or active_provider
+            )
             active_api_key = str(override.get("api_key") or active_api_key).strip()
             selection_reason = "explicit_override"
         else:
@@ -1039,8 +1098,11 @@ class GatewayRunner:
                 lease_active = expires_at > int(time.time())
                 if lease_active:
                     active_model = str(route_lease.get("model") or active_model).strip()
-                    active_provider = str(route_lease.get("provider") or active_provider).strip().lower() or active_provider
                     active_base_url = str(route_lease.get("base_url") or active_base_url).strip()
+                    active_provider = (
+                        self._normalize_route_provider(route_lease.get("provider") or active_provider, active_base_url)
+                        or active_provider
+                    )
             selection_reason = (
                 (route_debug or {}).get("last_route_selection")
                 or (route_lease or {}).get("selection_reason")
@@ -1067,6 +1129,7 @@ class GatewayRunner:
         current_provider: str,
         authenticated_only: bool = False,
         max_models: int = 8,
+        prefer_registry_only: bool = False,
     ) -> list[dict[str, Any]]:
         from hermes_cli.models import list_available_providers
         from hermes_cli.providers import get_label
@@ -1083,6 +1146,7 @@ class GatewayRunner:
             provider=current_provider,
             model=current_model,
         )
+        registry_index = self._load_chat_model_registry_index()
         for slug in _CHAT_VISIBLE_PROVIDER_ORDER:
             auth_info = auth_lookup.get(slug, {})
             authenticated = bool(auth_info.get("authenticated"))
@@ -1094,18 +1158,80 @@ class GatewayRunner:
                 authenticated = True
             if authenticated_only and not authenticated:
                 continue
+            registry_entries = list(registry_index.get(slug) or [])
             curated_items = self._get_chat_curated_model_items(slug)
             curated_models = [model_id for model_id, _note in curated_items]
-            expanded_models = self._get_chat_expanded_model_ids(slug)
-            all_models = expanded_models or curated_models
-            models = all_models if max_models <= 0 else all_models[:max_models]
+            expanded_models = [] if prefer_registry_only else self._get_chat_expanded_model_ids(slug)
             recent_models = [
                 item["model"]
                 for item in recent_routes
                 if str(item.get("provider") or "").strip().lower() == slug
             ]
-            preview_models = self._dedupe_strings(recent_models + curated_models + all_models)[:4]
+            registry_models = [
+                str(item.get("model") or "").strip()
+                for item in registry_entries
+                if str(item.get("model") or "").strip()
+                and not bool(item.get("hidden"))
+            ]
+            all_models = self._dedupe_strings(
+                (
+                    [current_model] if slug == current_provider and current_model else []
+                )
+                + recent_models
+                + registry_models
+                + ([] if prefer_registry_only else expanded_models)
+                + curated_models
+            )
+            models = all_models if max_models <= 0 else all_models[:max_models]
+            recent_registry_models = [
+                str(item.get("model") or "").strip()
+                for item in registry_entries
+                if bool(item.get("recent_used")) and str(item.get("model") or "").strip()
+            ]
+            featured_models = self._dedupe_strings(recent_models + recent_registry_models + curated_models + all_models)[:6]
+            preview_models = featured_models[:4]
             total_models = len(all_models)
+            model_details = {
+                str(item.get("model") or "").strip(): {
+                    "display_name": str(item.get("display_name") or item.get("model") or "").strip(),
+                    "is_free": bool(item.get("is_free")),
+                    "is_available": bool(item.get("is_available", True)),
+                    "selection_hint": str(item.get("selection_hint") or "").strip(),
+                    "status": str(item.get("status") or "").strip(),
+                    "recent_used": bool(item.get("recent_used")),
+                    "recent_used_count": int(item.get("recent_used_count") or 0),
+                    "recent_used_at": int(item.get("recent_used_at") or 0) or None,
+                    "context_window": item.get("context_window"),
+                    "latency_ms": item.get("latency_ms"),
+                }
+                for item in registry_entries
+                if str(item.get("model") or "").strip()
+            }
+            recommended_models = [
+                str(item.get("model") or "").strip()
+                for item in registry_entries
+                if str(item.get("selection_hint") or "").strip().lower() == "recommended"
+                and str(item.get("model") or "").strip()
+                and not bool(item.get("hidden"))
+            ]
+            hot_candidates = sorted(
+                (
+                    item
+                    for item in registry_entries
+                    if str(item.get("model") or "").strip() and not bool(item.get("hidden"))
+                ),
+                key=lambda item: (
+                    -(int(item.get("recent_used_count") or 0)),
+                    0 if str(item.get("selection_hint") or "").strip().lower() == "recommended" else 1,
+                    int(item.get("rank") or 9999),
+                    str(item.get("model") or ""),
+                ),
+            )
+            hot_models = [
+                str(item.get("model") or "").strip()
+                for item in hot_candidates
+                if str(item.get("model") or "").strip()
+            ]
             records.append(
                 {
                     "slug": slug,
@@ -1115,9 +1241,20 @@ class GatewayRunner:
                     "authenticated": authenticated,
                     "models": models,
                     "preview_models": preview_models,
+                    "featured_models": featured_models,
                     "recent_models": recent_models[:3],
+                    "recent_registry_models": recent_registry_models[:4],
+                    "recommended_models": self._dedupe_strings(recommended_models)[:4],
+                    "hot_models": self._dedupe_strings(hot_models)[:6],
                     "total_models": total_models,
+                    "available_models": [
+                        model_id
+                        for model_id in all_models
+                        if bool(model_details.get(model_id, {}).get("is_available", True))
+                    ],
+                    "model_details": model_details,
                     "source": "chat-curated",
+                    "catalog_mode": "registry-only" if prefer_registry_only else "live-expanded",
                 }
             )
 
@@ -1242,6 +1379,97 @@ class GatewayRunner:
             metadata["receive_id_type"] = "open_id"
         return metadata or None
 
+    def _switch_model_with_runtime_fallback(
+        self,
+        *,
+        raw_input: str,
+        current_provider: str,
+        current_model: str,
+        current_base_url: str,
+        current_api_key: str,
+        is_global: bool,
+        explicit_provider: str,
+    ):
+        from hermes_cli.model_switch import ModelSwitchResult, switch_model as _switch_model
+
+        result = _switch_model(
+            raw_input=raw_input,
+            current_provider=current_provider,
+            current_model=current_model,
+            current_base_url=current_base_url,
+            current_api_key=current_api_key,
+            is_global=is_global,
+            explicit_provider=explicit_provider,
+        )
+        if result.success:
+            return result
+
+        normalized_error = str(result.error_message or "").strip().lower()
+        requested_provider = str(explicit_provider or "").strip().lower()
+        if not requested_provider or not raw_input.strip():
+            return result
+        if not any(
+            marker in normalized_error
+            for marker in (
+                "unknown provider",
+                "could not resolve credentials",
+                "invalid_provider",
+            )
+        ):
+            return result
+
+        try:
+            from hermes_cli.model_normalize import normalize_model_for_provider
+            from hermes_cli.models import validate_requested_model
+            from hermes_cli.providers import determine_api_mode, get_label
+            from hermes_cli.runtime_provider import resolve_runtime_provider
+
+            runtime = resolve_runtime_provider(requested=requested_provider)
+            provider_name = str(runtime.get("provider") or requested_provider).strip().lower() or requested_provider
+            api_key = str(runtime.get("api_key") or "").strip()
+            base_url = str(runtime.get("base_url") or "").strip()
+            api_mode = str(runtime.get("api_mode") or "").strip() or determine_api_mode(provider_name, base_url)
+            if not api_key or not base_url:
+                return result
+
+            normalized_model = normalize_model_for_provider(raw_input, provider_name)
+            try:
+                validation = validate_requested_model(
+                    normalized_model,
+                    provider_name,
+                    api_key=api_key,
+                    base_url=base_url,
+                )
+            except Exception:
+                validation = {"accepted": True}
+            if not validation.get("accepted", True):
+                return result
+
+            logger.info(
+                "Recovered model switch via runtime fallback provider=%s model=%s",
+                provider_name,
+                normalized_model,
+            )
+            return ModelSwitchResult(
+                success=True,
+                new_model=normalized_model,
+                target_provider=provider_name,
+                provider_changed=provider_name != current_provider,
+                api_key=api_key,
+                base_url=base_url,
+                api_mode=api_mode,
+                provider_label=get_label(provider_name),
+                is_global=is_global,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Model switch runtime fallback failed provider=%s model=%s: %s",
+                requested_provider,
+                raw_input,
+                exc,
+            )
+            return result
+
     def _build_model_picker_selection_handler(
         self,
         *,
@@ -1252,8 +1480,6 @@ class GatewayRunner:
         current_base_url: str,
         current_api_key: str,
     ):
-        from hermes_cli.model_switch import switch_model as _switch_model
-
         async def _on_model_selected(_chat_id: str, model_id: str, provider_slug: str) -> str:
             target_session_keys = {session_key}
             if (
@@ -1277,12 +1503,12 @@ class GatewayRunner:
                 target_session_keys.add(
                     build_session_key(
                         target_source,
-                        group_sessions_per_user=self.config.session.group_sessions_per_user,
-                        thread_sessions_per_user=self.config.session.thread_sessions_per_user,
+                        group_sessions_per_user=self.config.group_sessions_per_user,
+                        thread_sessions_per_user=self.config.thread_sessions_per_user,
                     )
                 )
 
-            result = _switch_model(
+            result = self._switch_model_with_runtime_fallback(
                 raw_input=model_id,
                 current_provider=current_provider,
                 current_model=current_model,
@@ -1292,6 +1518,10 @@ class GatewayRunner:
                 explicit_provider=provider_slug,
             )
             if not result.success:
+                self._schedule_model_registry_refresh(
+                    reason=f"picker_switch_failed:{provider_slug}:{model_id}",
+                    source=source,
+                )
                 return f"Error: {result.error_message}"
 
             _cache_lock = getattr(self, "_agent_cache_lock", None)
@@ -1375,6 +1605,164 @@ class GatewayRunner:
 
         return _on_model_selected
 
+    def _schedule_background_task(self, task: asyncio.Task) -> None:
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+    def _schedule_model_registry_refresh(
+        self,
+        *,
+        reason: str,
+        source: SessionSource | None = None,
+        adapter: Any | None = None,
+        picker_message_id: str | None = None,
+        picker_id: str | None = None,
+        selected_provider: str | None = None,
+        selected_filter: str | None = None,
+        session_key: str | None = None,
+        current_model: str | None = None,
+        current_provider: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        task_key = picker_id or picker_message_id or "global"
+        existing = self._feishu_registry_refresh_tasks.get(task_key)
+        if existing and not existing.done():
+            return
+        task = asyncio.create_task(
+            self._refresh_model_registry_and_update_feishu_picker(
+                reason=reason,
+                source=source,
+                adapter=adapter,
+                picker_message_id=picker_message_id,
+                picker_id=picker_id,
+                selected_provider=selected_provider,
+                selected_filter=selected_filter,
+                session_key=session_key,
+                current_model=current_model,
+                current_provider=current_provider,
+                metadata=metadata,
+            )
+        )
+        self._feishu_registry_refresh_tasks[task_key] = task
+        task.add_done_callback(lambda _task, key=task_key: self._feishu_registry_refresh_tasks.pop(key, None))
+        self._schedule_background_task(task)
+
+    async def _refresh_model_registry_and_update_feishu_picker(
+        self,
+        *,
+        reason: str,
+        source: SessionSource | None,
+        adapter: Any | None,
+        picker_message_id: str | None,
+        picker_id: str | None,
+        selected_provider: str | None,
+        selected_filter: str | None,
+        session_key: str | None,
+        current_model: str | None,
+        current_provider: str | None,
+        metadata: dict[str, Any] | None,
+    ) -> None:
+        try:
+            from tools.model_registry_refresh import trigger_model_registry_refresh
+
+            refresh_result = await asyncio.to_thread(
+                trigger_model_registry_refresh,
+                reason=reason,
+                force_refresh=True,
+                mirror_to_bitable=None,
+                min_interval_seconds=30,
+            )
+            logger.info("Model registry refresh completed reason=%s status=%s", reason, refresh_result.get("status"))
+        except Exception as exc:
+            logger.warning("Model registry refresh task failed reason=%s error=%s", reason, exc, exc_info=True)
+            return
+
+        if not adapter or not picker_message_id:
+            return
+
+        picker_state = None
+        state_map = getattr(adapter, "_model_picker_state", None)
+        if isinstance(state_map, dict):
+            if picker_id:
+                picker_state = state_map.get(picker_id)
+            if picker_state is None:
+                picker_state = next(
+                    (
+                        item
+                        for item in state_map.values()
+                        if str(item.get("message_id") or "").strip() == str(picker_message_id or "").strip()
+                    ),
+                    None,
+                )
+        if not isinstance(picker_state, dict):
+            return
+
+        effective_session_key = session_key or str(picker_state.get("session_key") or "").strip()
+        if not effective_session_key:
+            return
+
+        if source is not None:
+            runtime_current_model, runtime_current_provider, runtime_base_url, runtime_api_key, _ = self._load_model_runtime_config()
+            route_state = self._get_active_route_state(
+                effective_session_key,
+                current_model=runtime_current_model,
+                current_provider=runtime_current_provider,
+                current_base_url=runtime_base_url,
+                current_api_key=runtime_api_key,
+            )
+            effective_current_model = str(route_state.get("current_model") or current_model or "")
+            effective_current_provider = str(route_state.get("current_provider") or current_provider or "")
+        else:
+            effective_current_model = str(current_model or picker_state.get("current_model") or "")
+            effective_current_provider = str(current_provider or picker_state.get("current_provider") or "")
+
+        providers = self._get_chat_provider_records(
+            session_key=effective_session_key,
+            current_model=effective_current_model,
+            current_provider=effective_current_provider,
+            authenticated_only=False,
+            max_models=0,
+            prefer_registry_only=True,
+        )
+        if not providers:
+            return
+
+        picker_state["providers"] = list(providers)
+        picker_state["current_model"] = effective_current_model
+        picker_state["current_provider"] = effective_current_provider
+        picker_state["provider_cards"] = {}
+        if selected_provider:
+            picker_state["selected_provider"] = selected_provider
+        if selected_filter:
+            picker_state["selected_filter"] = selected_filter
+
+        provider_slugs = {str(item.get("slug") or "").strip() for item in providers}
+        active_provider = str(picker_state.get("selected_provider") or "").strip()
+        if active_provider and active_provider not in provider_slugs:
+            picker_state["selected_provider"] = effective_current_provider if effective_current_provider in provider_slugs else ""
+
+        replacement_card = (
+            adapter._get_model_picker_provider_cached_card(
+                state=picker_state,
+                provider_slug=str(picker_state.get("selected_provider") or "").strip(),
+                selected_filter=str(picker_state.get("selected_filter") or "featured"),
+            )
+            if str(picker_state.get("selected_provider") or "").strip()
+            else adapter._build_model_picker_provider_card(
+                providers=providers,
+                current_model=effective_current_model,
+                current_provider=effective_current_provider,
+                picker_id=str(picker_state.get("picker_id") or ""),
+            )
+        )
+
+        await adapter._replace_model_picker_card(
+            chat_id=str(picker_state.get("chat_id") or ""),
+            message_id=str(picker_state.get("message_id") or ""),
+            card=replacement_card,
+            state=picker_state,
+        )
+
     async def _handle_feishu_menu_action(
         self,
         *,
@@ -1389,7 +1777,13 @@ class GatewayRunner:
             "model_status",
             "provider_status",
             "provider_openrouter",
+            "provider_openrouter_featured",
+            "provider_openrouter_recent",
+            "provider_openrouter_performance",
             "provider_nvidia",
+            "provider_nvidia_featured",
+            "provider_nvidia_recent",
+            "provider_nvidia_performance",
             "route_status",
         }:
             return False
@@ -1417,10 +1811,17 @@ class GatewayRunner:
             )
             return bool(result.success)
 
-        selected_provider = {
-            "provider_openrouter": "openrouter",
-            "provider_nvidia": "nvidia",
-        }.get(event_key)
+        provider_filter_map = {
+            "provider_openrouter": ("openrouter", "featured"),
+            "provider_openrouter_featured": ("openrouter", "featured"),
+            "provider_openrouter_recent": ("openrouter", "recent"),
+            "provider_openrouter_performance": ("openrouter", "performance"),
+            "provider_nvidia": ("nvidia", "featured"),
+            "provider_nvidia_featured": ("nvidia", "featured"),
+            "provider_nvidia_recent": ("nvidia", "recent"),
+            "provider_nvidia_performance": ("nvidia", "performance"),
+        }
+        selected_provider, selected_filter = provider_filter_map.get(event_key, (None, None))
 
         providers = self._get_chat_provider_records(
             session_key=session_key,
@@ -1428,6 +1829,7 @@ class GatewayRunner:
             current_provider=current_provider,
             authenticated_only=False,
             max_models=0,
+            prefer_registry_only=True,
         )
         if not providers:
             result = await adapter.send(
@@ -1454,7 +1856,30 @@ class GatewayRunner:
             on_model_selected=on_model_selected,
             metadata=metadata,
             selected_provider=selected_provider,
+            selected_filter=selected_filter,
         )
+        if result.success:
+            picker_state = next(
+                (
+                    item
+                    for item in getattr(adapter, "_model_picker_state", {}).values()
+                    if str(item.get("message_id") or "").strip() == str(result.message_id or "").strip()
+                ),
+                None,
+            )
+            self._schedule_model_registry_refresh(
+                reason=f"feishu_menu:{event_key}",
+                source=source,
+                adapter=adapter,
+                picker_message_id=result.message_id,
+                picker_id=str((picker_state or {}).get("picker_id") or "").strip() or None,
+                selected_provider=selected_provider,
+                selected_filter=selected_filter,
+                session_key=session_key,
+                current_model=current_model,
+                current_provider=current_provider,
+                metadata=metadata,
+            )
         return bool(result.success)
 
     def _build_session_route_lease(
@@ -1469,7 +1894,8 @@ class GatewayRunner:
         now = int(time.time())
         selected_ts = int(selected_at or now)
         success_ts = int(last_success_at or selected_ts)
-        provider_name = str(route.get("provider") or "").strip().lower()
+        base_url = str(route.get("base_url") or "").strip()
+        provider_name = self._normalize_route_provider(route.get("provider"), base_url)
         if provider_name == "openrouter":
             api_key_source = "OPENROUTER_API_KEY"
         elif provider_name == "nvidia":
@@ -1483,7 +1909,7 @@ class GatewayRunner:
         return {
             "provider": provider_name,
             "model": str(route.get("model") or "").strip(),
-            "base_url": str(route.get("base_url") or "").strip(),
+            "base_url": base_url,
             "api_mode": str(route.get("api_mode") or "").strip(),
             "api_key_source": api_key_source,
             "selected_at": selected_ts,
@@ -1539,20 +1965,47 @@ class GatewayRunner:
     ) -> dict[str, Any] | None:
         if not isinstance(lease, dict):
             return None
-        provider_name = str(lease.get("provider") or "").strip().lower()
-        model_name = str(lease.get("model") or "").strip()
         base_url = str(lease.get("base_url") or "").strip()
+        provider_name = self._normalize_route_provider(lease.get("provider"), base_url)
+        model_name = str(lease.get("model") or "").strip()
         if not provider_name or not model_name:
             return None
+        resolved_runtime: dict[str, Any] = {}
+        try:
+            from hermes_cli.runtime_provider import resolve_runtime_provider
+
+            resolved_runtime = resolve_runtime_provider(
+                requested=provider_name,
+                explicit_base_url=base_url or None,
+            ) or {}
+        except Exception:
+            resolved_runtime = {}
+
         runtime = {
-            "api_key": runtime_kwargs.get("api_key"),
-            "base_url": base_url or runtime_kwargs.get("base_url"),
-            "provider": provider_name or runtime_kwargs.get("provider"),
-            "api_mode": str(lease.get("api_mode") or runtime_kwargs.get("api_mode") or "").strip() or runtime_kwargs.get("api_mode"),
-            "command": runtime_kwargs.get("command"),
-            "args": list(runtime_kwargs.get("args") or []),
-            "credential_pool": runtime_kwargs.get("credential_pool"),
+            "api_key": str(resolved_runtime.get("api_key") or "").strip(),
+            "base_url": base_url or resolved_runtime.get("base_url") or runtime_kwargs.get("base_url"),
+            "provider": str(resolved_runtime.get("provider") or provider_name or runtime_kwargs.get("provider") or "").strip().lower(),
+            "api_mode": (
+                str(
+                    lease.get("api_mode")
+                    or resolved_runtime.get("api_mode")
+                    or runtime_kwargs.get("api_mode")
+                    or ""
+                ).strip()
+                or runtime_kwargs.get("api_mode")
+            ),
+            "command": resolved_runtime.get("command") or runtime_kwargs.get("command"),
+            "args": list(resolved_runtime.get("args") or runtime_kwargs.get("args") or []),
+            "credential_pool": resolved_runtime.get("credential_pool") or runtime_kwargs.get("credential_pool"),
         }
+        if not runtime["api_key"]:
+            api_key_source = str(lease.get("api_key_source") or "").strip().upper()
+            if provider_name == "openrouter" or api_key_source == "OPENROUTER_API_KEY":
+                runtime["api_key"] = str(os.getenv("OPENROUTER_API_KEY") or "").strip()
+            elif provider_name == "nvidia" or api_key_source in {"NVIDIA_API_KEY", "NGC_API_KEY"}:
+                runtime["api_key"] = str(os.getenv("NVIDIA_API_KEY") or os.getenv("NGC_API_KEY") or "").strip()
+            elif str(runtime_kwargs.get("provider") or "").strip().lower() == provider_name:
+                runtime["api_key"] = str(runtime_kwargs.get("api_key") or "").strip()
         if not runtime.get("api_key") or not runtime.get("base_url"):
             return None
         return {
@@ -1604,25 +2057,49 @@ class GatewayRunner:
 
         if override:
             route_selection = "explicit_override"
+            override_base_url = str(override.get("base_url") or runtime_input.get("base_url") or "").strip()
+            override_provider = (
+                self._normalize_route_provider(override.get("provider"), override_base_url)
+                or str(runtime_input.get("provider") or "").strip().lower()
+            )
+            hydrated_override = self._hydrate_turn_route_from_lease(
+                {
+                    "provider": override_provider or override.get("provider"),
+                    "model": override.get("model") or model,
+                    "base_url": override_base_url,
+                    "api_mode": override.get("api_mode") or runtime_input.get("api_mode"),
+                    "api_key_source": override.get("api_key_source") or override_provider,
+                },
+                runtime_input,
+            )
+            override_runtime = (hydrated_override or {}).get("runtime") or {}
             route = {
                 "model": override.get("model") or model,
                 "runtime": {
-                    "api_key": override.get("api_key") or runtime_kwargs.get("api_key"),
-                    "base_url": override.get("base_url") or runtime_input.get("base_url"),
-                    "provider": override.get("provider") or runtime_input.get("provider"),
-                    "api_mode": override.get("api_mode") or runtime_input.get("api_mode"),
-                    "command": runtime_input.get("command"),
-                    "args": list(runtime_input.get("args") or []),
-                    "credential_pool": runtime_input.get("credential_pool"),
+                    "api_key": (
+                        override_runtime.get("api_key")
+                        or (
+                            override.get("api_key")
+                            if override_provider in {"", "custom", "local", "unknown"}
+                            else ""
+                        )
+                        or runtime_kwargs.get("api_key")
+                    ),
+                    "base_url": override_runtime.get("base_url") or override_base_url,
+                    "provider": override_runtime.get("provider") or override_provider or runtime_input.get("provider"),
+                    "api_mode": override_runtime.get("api_mode") or override.get("api_mode") or runtime_input.get("api_mode"),
+                    "command": override_runtime.get("command") or runtime_input.get("command"),
+                    "args": list(override_runtime.get("args") or runtime_input.get("args") or []),
+                    "credential_pool": override_runtime.get("credential_pool") or runtime_input.get("credential_pool"),
                 },
                 "label": "session_override",
                 "signature": (
                     override.get("model") or model,
-                    override.get("provider") or runtime_input.get("provider"),
-                    override.get("base_url") or runtime_input.get("base_url"),
-                    override.get("api_mode") or runtime_input.get("api_mode"),
-                    runtime_input.get("command"),
-                    tuple(runtime_input.get("args") or ()),
+                    override_runtime.get("provider") or override_provider or runtime_input.get("provider"),
+                    override_runtime.get("base_url") or override_base_url,
+                    override_runtime.get("api_mode") or override.get("api_mode") or runtime_input.get("api_mode"),
+                    override_runtime.get("command") or runtime_input.get("command"),
+                    tuple(override_runtime.get("args") or runtime_input.get("args") or ()),
                 ),
                 "route_selection": route_selection,
                 "route_lease": route_lease,
@@ -4673,6 +5150,7 @@ class GatewayRunner:
                         current_provider=current_provider,
                         authenticated_only=True,
                         max_models=0,
+                        prefer_registry_only=(source.platform == Platform.FEISHU),
                     )
                 except Exception:
                     providers = []
@@ -4714,11 +5192,11 @@ class GatewayRunner:
                             target_session_keys.add(
                                 build_session_key(
                                     target_source,
-                                    group_sessions_per_user=_self.config.session.group_sessions_per_user,
-                                    thread_sessions_per_user=_self.config.session.thread_sessions_per_user,
+                                    group_sessions_per_user=_self.config.group_sessions_per_user,
+                                    thread_sessions_per_user=_self.config.thread_sessions_per_user,
                                 )
                             )
-                        result = _switch_model(
+                        result = _self._switch_model_with_runtime_fallback(
                             raw_input=model_id,
                             current_provider=_cur_provider,
                             current_model=_cur_model,
@@ -4891,7 +5369,7 @@ class GatewayRunner:
             )
 
         # Perform the switch
-        result = _switch_model(
+        result = self._switch_model_with_runtime_fallback(
             raw_input=model_input,
             current_provider=current_provider,
             current_model=current_model,
@@ -5757,8 +6235,6 @@ class GatewayRunner:
         self, prompt: str, source: "SessionSource", task_id: str
     ) -> None:
         """Execute a background agent task and deliver the result to the chat."""
-        from run_agent import AIAgent
-
         adapter = self.adapters.get(source.platform)
         if not adapter:
             logger.warning("No adapter for platform %s in background task %s", source.platform, task_id)
@@ -5780,6 +6256,7 @@ class GatewayRunner:
             model = _resolve_gateway_model(user_config)
             platform_key = _platform_config_key(source.platform)
             enabled_toolsets, disabled_toolsets = _resolve_platform_toolset_controls(platform_key, user_config)
+            from run_agent import AIAgent
 
             pr = self._provider_routing
             max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
@@ -7540,12 +8017,12 @@ class GatewayRunner:
         This is run in a thread pool to not block the event loop.
         Supports interruption via new messages.
         """
-        from run_agent import AIAgent
         import queue
         
         user_config = _load_gateway_config()
         platform_key = _platform_config_key(source.platform)
         enabled_toolsets, disabled_toolsets = _resolve_platform_toolset_controls(platform_key, user_config)
+        from run_agent import AIAgent
 
         # Apply tool preview length config (0 = no limit)
         try:

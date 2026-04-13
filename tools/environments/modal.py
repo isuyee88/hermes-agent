@@ -96,6 +96,10 @@ def _resolve_modal_image(image_spec: Any) -> Any:
         setup_commands.insert(0,
             "RUN apt-get update -qq && apt-get install -y -qq python3 python3-venv > /dev/null 2>&1 || true"
         )
+        setup_commands.insert(
+            1,
+            "RUN apt-get update -qq && apt-get install -y -qq libsecret-1-0 > /dev/null 2>&1 || true",
+        )
 
     return _modal.Image.from_registry(
         image_spec,

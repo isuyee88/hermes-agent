@@ -359,6 +359,15 @@ class HonchoMemoryProvider(MemoryProvider):
             return ""
         return "\n\n".join(parts)
 
+    def _management_commands_block(self) -> str:
+        """Return a compact Honcho command reference for prompt injection."""
+        session_key = self._session_key or "pending"
+        mode = self._recall_mode or "hybrid"
+        return (
+            "Management commands:\n"
+            f"honcho status | mode | sessions | map | identity  Session: {session_key}. Mode: {mode}."
+        )
+
     def system_prompt_block(self) -> str:
         """Return system prompt text, adapted by recall_mode.
 
@@ -374,7 +383,8 @@ class HonchoMemoryProvider(MemoryProvider):
                 return (
                     "# Honcho Memory\n"
                     "Active (tools-only mode). Use honcho_profile, honcho_search, "
-                    "honcho_context, and honcho_conclude tools to access user memory."
+                    "honcho_context, and honcho_conclude tools to access user memory.\n"
+                    f"{self._management_commands_block()}"
                 )
             return ""
 
@@ -416,6 +426,7 @@ class HonchoMemoryProvider(MemoryProvider):
                 "honcho_search for raw excerpts, honcho_context for synthesized answers, "
                 "honcho_conclude to save facts about the user."
             )
+        header = f"{header}\n{self._management_commands_block()}"
 
         if first_turn_block:
             return f"{header}\n\n{first_turn_block}"

@@ -1319,6 +1319,49 @@ class AIAgent:
             # Iterative summary from previous session must not bleed into new one (#2635)
             self.context_compressor._previous_summary = None
     
+    def _model_registry_identity(self, response_model: str | None = None) -> tuple[str, str]:
+        provider = str(getattr(self, "provider", "") or "").strip().lower()
+        model = str(response_model or getattr(self, "model", "") or "").strip()
+        return provider, model
+
+    def _note_model_registry_failure(
+        self,
+        *,
+        error_text: str,
+        failure_reason: str,
+        error_code: str | int | None = None,
+        response_model: str | None = None,
+        mirror_to_bitable: bool | None = True,
+    ) -> None:
+        provider, model = self._model_registry_identity(response_model=response_model)
+        if not provider or not model:
+            return
+        try:
+            from tools.model_registry_refresh import note_model_registry_failure
+
+            note_model_registry_failure(
+                provider=provider,
+                model=model,
+                error_text=error_text,
+                failure_reason=failure_reason,
+                error_code=error_code,
+                min_interval_seconds=30,
+                mirror_to_bitable=mirror_to_bitable,
+            )
+        except Exception as exc:
+            logger.debug("Failed to note model registry failure for %s/%s: %s", provider, model, exc)
+
+    def _note_model_registry_success(self, *, response_model: str | None = None) -> None:
+        provider, model = self._model_registry_identity(response_model=response_model)
+        if not provider or not model:
+            return
+        try:
+            from tools.model_registry_refresh import note_model_registry_success
+
+            note_model_registry_success(provider=provider, model=model)
+        except Exception as exc:
+            logger.debug("Failed to note model registry success for %s/%s: %s", provider, model, exc)
+
     def switch_model(self, new_model, new_provider, api_key='', base_url='', api_mode=''):
         """Switch the model/provider in-place for a live agent.
 
@@ -4816,6 +4859,12 @@ class AIAgent:
                                 )
 
                         if _is_timeout or _is_conn_err or _is_sse_conn_err:
+                            self._note_model_registry_failure(
+                                error_text=str(e),
+                                failure_reason="transient_network",
+                                error_code=type(e).__name__,
+                                mirror_to_bitable=True,
+                            )
                             # Transient network / timeout error. Retry the
                             # streaming request with a fresh connection first.
                             if _stream_attempt < _max_stream_retries:
@@ -5111,6 +5160,17 @@ class AIAgent:
                 f"🔄 Primary model failed — switching to fallback: "
                 f"{fb_model} via {fb_provider}"
             )
+            try:
+                from tools.model_registry_refresh import schedule_model_registry_refresh
+
+                schedule_model_registry_refresh(
+                    reason=f"fallback_activated:{old_model}->{fb_model}:{fb_provider}",
+                    force_refresh=True,
+                    mirror_to_bitable=True,
+                    min_interval_seconds=30,
+                )
+            except Exception:
+                pass
             logging.info(
                 "Fallback activated: %s → %s (%s)",
                 old_model, fb_model, fb_provider,
@@ -8570,6 +8630,31 @@ class AIAgent:
                     ) and not is_context_length_error
 
                     if is_client_error:
+                        self._note_model_registry_failure(
+                            error_text=str(api_error),
+                            failure_reason=str(getattr(classified, "reason", "") or "client_error"),
+                            error_code=status_code,
+                            mirror_to_bitable=True,
+                        )
+                        try:
+                            from tools.model_registry_refresh import (
+                                schedule_model_registry_refresh,
+                                should_trigger_model_registry_refresh,
+                            )
+
+                            if should_trigger_model_registry_refresh(
+                                status_code=status_code,
+                                error_text=str(api_error),
+                                failure_reason=str(getattr(classified, "reason", "") or ""),
+                            ):
+                                schedule_model_registry_refresh(
+                                    reason=f"agent_client_error:{_provider}:{_model}:http_{status_code}",
+                                    force_refresh=True,
+                                    mirror_to_bitable=True,
+                                    min_interval_seconds=30,
+                                )
+                        except Exception:
+                            pass
                         # Try fallback before aborting — a different provider
                         # may not have the same issue (rate limit, auth, etc.)
                         self._emit_status(f"⚠️ Non-retryable error (HTTP {status_code}) — trying fallback...")
@@ -8680,6 +8765,12 @@ class AIAgent:
                             "%sAPI call failed after %s retries. %s | provider=%s model=%s msgs=%s tokens=~%s",
                             self.log_prefix, max_retries, _final_summary,
                             _provider, _model, len(api_messages), f"{approx_tokens:,}",
+                        )
+                        self._note_model_registry_failure(
+                            error_text=_final_summary,
+                            failure_reason="transient_network" if _is_stream_drop else str(getattr(classified, "reason", "") or "retry_exhausted"),
+                            error_code=getattr(api_error, "status_code", None) or type(api_error).__name__,
+                            mirror_to_bitable=True,
                         )
                         self._dump_api_request_debug(
                             api_kwargs, reason="max_retries_exhausted", error=api_error,
@@ -9498,6 +9589,9 @@ class AIAgent:
         # Plugins can use this to persist conversation data (e.g. sync
         # to an external memory system).
         if final_response and not interrupted:
+            self._note_model_registry_success(
+                response_model=str((self._last_provider_usage_metadata or {}).get("response_model") or "").strip() or None
+            )
             try:
                 from hermes_cli.plugins import invoke_hook as _invoke_hook
                 _invoke_hook(

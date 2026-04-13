@@ -70,6 +70,7 @@ Thread safety:
 """
 
 import asyncio
+from contextlib import contextmanager
 import inspect
 import json
 import logging
@@ -82,6 +83,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+_MCP_DISCOVERY_LOCAL = threading.local()
 
 # ---------------------------------------------------------------------------
 # Graceful import -- MCP SDK is an optional dependency
@@ -325,6 +327,32 @@ def _format_connect_error(exc: BaseException) -> str:
         if item not in deduped:
             deduped.append(item)
     return _sanitize_error("; ".join(deduped[:3]))
+
+
+def _mcp_discovery_suppressed() -> bool:
+    """Return True when the current thread has temporarily disabled discovery."""
+    depth = int(getattr(_MCP_DISCOVERY_LOCAL, "suppress_depth", 0) or 0)
+    if depth > 0:
+        return True
+    raw = str(os.getenv("HERMES_SKIP_MCP_DISCOVERY", "") or "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+@contextmanager
+def suppress_mcp_discovery(reason: str | None = None):
+    """Temporarily disable automatic MCP discovery on the current thread."""
+    previous_depth = int(getattr(_MCP_DISCOVERY_LOCAL, "suppress_depth", 0) or 0)
+    _MCP_DISCOVERY_LOCAL.suppress_depth = previous_depth + 1
+    try:
+        if previous_depth == 0:
+            logger.debug("Suppressing MCP discovery%s", f" ({reason})" if reason else "")
+        yield
+    finally:
+        if previous_depth <= 0:
+            if hasattr(_MCP_DISCOVERY_LOCAL, "suppress_depth"):
+                delattr(_MCP_DISCOVERY_LOCAL, "suppress_depth")
+        else:
+            _MCP_DISCOVERY_LOCAL.suppress_depth = previous_depth
 
 
 # ---------------------------------------------------------------------------
@@ -1166,6 +1194,11 @@ def _interpolate_env_vars(value):
     return value
 
 
+def _normalize_mcp_server_aliases(servers: Dict[str, dict]) -> Dict[str, dict]:
+    """Normalize legacy MCP server aliases to their canonical names."""
+    return dict(servers)
+
+
 def _load_mcp_config() -> Dict[str, dict]:
     """Read ``mcp_servers`` from the Hermes config file.
 
@@ -1189,7 +1222,8 @@ def _load_mcp_config() -> Dict[str, dict]:
             load_hermes_dotenv()
         except Exception:
             pass
-        return {name: _interpolate_env_vars(cfg) for name, cfg in servers.items()}
+        interpolated = {name: _interpolate_env_vars(cfg) for name, cfg in servers.items()}
+        return _normalize_mcp_server_aliases(interpolated)
     except Exception as exc:
         logger.debug("Failed to load MCP config: %s", exc)
         return {}
@@ -1961,6 +1995,10 @@ def discover_mcp_tools() -> List[str]:
     """
     if not _MCP_AVAILABLE:
         logger.debug("MCP SDK not available -- skipping MCP tool discovery")
+        return []
+
+    if _mcp_discovery_suppressed():
+        logger.debug("MCP discovery suppressed for current thread")
         return []
 
     servers = _load_mcp_config()

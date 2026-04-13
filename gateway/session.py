@@ -337,7 +337,35 @@ def build_session_context_prompt(
     # Note about explicit targeting
     lines.append("")
     lines.append("*For explicit targeting, use `\"platform:chat_id\"` format if the user provides a specific chat ID.*")
-    
+
+    if context.source.platform == Platform.FEISHU:
+        bitable_app_token = str(os.getenv("FEISHU_BITABLE_APP_TOKEN") or "").strip()
+        bitable_wiki_token = str(os.getenv("FEISHU_BITABLE_WIKI_TOKEN") or "").strip()
+        bitable_table_id = str(os.getenv("FEISHU_BITABLE_TABLE_ID") or "").strip()
+        if bitable_table_id and (bitable_app_token or bitable_wiki_token):
+            lines.append("")
+            lines.append("**Feishu workbench defaults:**")
+            lines.append(
+                "Use the configured default Bitable target for registry/workbench reads when the user means the default table."
+            )
+            lines.append(
+                "Do not ask the user for a table link, app_token, or table_id again unless they want a different table."
+            )
+            lines.append(
+                "Do not claim a user access token is required when the configured target below is enough for the requested action."
+            )
+            lines.append(
+                "For default Hermes model catalog questions, prefer the native Hermes model registry tools first instead of querying the mirrored Bitable table."
+            )
+            if bitable_app_token:
+                lines.append(f"- Default Bitable app_token: `{bitable_app_token}`")
+            if bitable_wiki_token:
+                lines.append(f"- Default Bitable wiki_token: `{bitable_wiki_token}`")
+            lines.append(f"- Default Bitable table_id: `{bitable_table_id}`")
+            lines.append(
+                "- Only reveal these identifiers explicitly if the user asks for them or if a tool call truly needs them."
+            )
+
     return "\n".join(lines)
 
 

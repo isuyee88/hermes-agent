@@ -191,6 +191,14 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         api_key_env_vars=("MINIMAX_CN_API_KEY",),
         base_url_env_var="MINIMAX_CN_BASE_URL",
     ),
+    "nvidia": ProviderConfig(
+        id="nvidia",
+        name="NVIDIA",
+        auth_type="api_key",
+        inference_base_url="https://integrate.api.nvidia.com/v1",
+        api_key_env_vars=("NVIDIA_API_KEY", "NGC_API_KEY"),
+        base_url_env_var="NVIDIA_BASE_URL",
+    ),
     "deepseek": ProviderConfig(
         id="deepseek",
         name="DeepSeek",
@@ -828,6 +836,7 @@ def resolve_provider(
         "aigateway": "ai-gateway", "vercel": "ai-gateway", "vercel-ai-gateway": "ai-gateway",
         "opencode": "opencode-zen", "zen": "opencode-zen",
         "qwen-portal": "qwen-oauth", "qwen-cli": "qwen-oauth", "qwen-oauth": "qwen-oauth",
+        "ngc": "nvidia", "nvidia-ai": "nvidia", "nvidia-nim": "nvidia",
         "hf": "huggingface", "hugging-face": "huggingface", "huggingface-hub": "huggingface",
         "go": "opencode-go", "opencode-go-sub": "opencode-go",
         "kilo": "kilocode", "kilo-code": "kilocode", "kilo-gateway": "kilocode",

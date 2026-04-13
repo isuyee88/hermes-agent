@@ -39,6 +39,7 @@ class TestProviderRegistry:
         ("copilot-acp", "GitHub Copilot ACP", "external_process"),
         ("copilot", "GitHub Copilot", "api_key"),
         ("huggingface", "Hugging Face", "api_key"),
+        ("nvidia", "NVIDIA", "api_key"),
         ("zai", "Z.AI / GLM", "api_key"),
         ("kimi-coding", "Kimi / Moonshot", "api_key"),
         ("minimax", "MiniMax", "api_key"),
@@ -93,9 +94,15 @@ class TestProviderRegistry:
         assert pconfig.api_key_env_vars == ("HF_TOKEN",)
         assert pconfig.base_url_env_var == "HF_BASE_URL"
 
+    def test_nvidia_env_vars(self):
+        pconfig = PROVIDER_REGISTRY["nvidia"]
+        assert pconfig.api_key_env_vars == ("NVIDIA_API_KEY", "NGC_API_KEY")
+        assert pconfig.base_url_env_var == "NVIDIA_BASE_URL"
+
     def test_base_urls(self):
         assert PROVIDER_REGISTRY["copilot"].inference_base_url == "https://api.githubcopilot.com"
         assert PROVIDER_REGISTRY["copilot-acp"].inference_base_url == "acp://copilot"
+        assert PROVIDER_REGISTRY["nvidia"].inference_base_url == "https://integrate.api.nvidia.com/v1"
         assert PROVIDER_REGISTRY["zai"].inference_base_url == "https://api.z.ai/api/paas/v4"
         assert PROVIDER_REGISTRY["kimi-coding"].inference_base_url == "https://api.moonshot.ai/v1"
         assert PROVIDER_REGISTRY["minimax"].inference_base_url == "https://api.minimax.io/anthropic"
@@ -119,6 +126,7 @@ class TestProviderRegistry:
 PROVIDER_ENV_VARS = (
     "OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "ANTHROPIC_TOKEN",
     "CLAUDE_CODE_OAUTH_TOKEN",
+    "NVIDIA_API_KEY", "NGC_API_KEY", "NVIDIA_BASE_URL",
     "GLM_API_KEY", "ZAI_API_KEY", "Z_AI_API_KEY",
     "KIMI_API_KEY", "KIMI_BASE_URL", "MINIMAX_API_KEY", "MINIMAX_CN_API_KEY",
     "AI_GATEWAY_API_KEY", "AI_GATEWAY_BASE_URL",
@@ -209,6 +217,12 @@ class TestResolveProvider:
     def test_explicit_huggingface(self):
         assert resolve_provider("huggingface") == "huggingface"
 
+    def test_explicit_nvidia(self):
+        assert resolve_provider("nvidia") == "nvidia"
+
+    def test_alias_ngc(self):
+        assert resolve_provider("ngc") == "nvidia"
+
     def test_alias_hf(self):
         assert resolve_provider("hf") == "huggingface"
 
@@ -257,6 +271,14 @@ class TestResolveProvider:
     def test_auto_detects_hf_token(self, monkeypatch):
         monkeypatch.setenv("HF_TOKEN", "hf_test_token")
         assert resolve_provider("auto") == "huggingface"
+
+    def test_auto_detects_nvidia_key(self, monkeypatch):
+        monkeypatch.setenv("NVIDIA_API_KEY", "nvapi-test")
+        assert resolve_provider("auto") == "nvidia"
+
+    def test_auto_detects_ngc_key(self, monkeypatch):
+        monkeypatch.setenv("NGC_API_KEY", "ngc-test")
+        assert resolve_provider("auto") == "nvidia"
 
     def test_openrouter_takes_priority_over_glm(self, monkeypatch):
         """OpenRouter API key should win over GLM in auto-detection."""
@@ -632,9 +654,10 @@ class TestHasAnyProviderConfigured:
         hermes_home.mkdir()
         monkeypatch.setattr(config_module, "get_env_path", lambda: hermes_home / ".env")
         monkeypatch.setattr(config_module, "get_hermes_home", lambda: hermes_home)
-        # Clear all provider env vars so earlier checks don't short-circuit
-        for var in ("OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY",
-                     "ANTHROPIC_TOKEN", "OPENAI_BASE_URL"):
+        # Clear all provider env vars so earlier checks don't short-circuit.
+        # Use the registry-backed list so new providers don't silently change
+        # the meaning of these "fresh install" tests.
+        for var in PROVIDER_ENV_VARS:
             monkeypatch.delenv(var, raising=False)
         # Simulate valid Claude Code credentials
         monkeypatch.setattr(
@@ -644,6 +667,10 @@ class TestHasAnyProviderConfigured:
         monkeypatch.setattr(
             "agent.anthropic_adapter.is_claude_code_token_valid",
             lambda creds: True,
+        )
+        monkeypatch.setattr(
+            "hermes_cli.auth.get_auth_status",
+            lambda provider_id=None: {"logged_in": False},
         )
         from hermes_cli.main import _has_any_provider_configured
         assert _has_any_provider_configured() is False
@@ -662,8 +689,7 @@ class TestHasAnyProviderConfigured:
         monkeypatch.setattr(config_module, "get_hermes_home", lambda: hermes_home)
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
         # Clear all provider env vars
-        for var in ("OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY",
-                     "ANTHROPIC_TOKEN", "OPENAI_BASE_URL"):
+        for var in PROVIDER_ENV_VARS:
             monkeypatch.delenv(var, raising=False)
         from hermes_cli.main import _has_any_provider_configured
         assert _has_any_provider_configured() is True
@@ -681,8 +707,7 @@ class TestHasAnyProviderConfigured:
         monkeypatch.setattr(config_module, "get_env_path", lambda: hermes_home / ".env")
         monkeypatch.setattr(config_module, "get_hermes_home", lambda: hermes_home)
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
-        for var in ("OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY",
-                     "ANTHROPIC_TOKEN", "OPENAI_BASE_URL"):
+        for var in PROVIDER_ENV_VARS:
             monkeypatch.delenv(var, raising=False)
         from hermes_cli.main import _has_any_provider_configured
         assert _has_any_provider_configured() is True
@@ -700,8 +725,7 @@ class TestHasAnyProviderConfigured:
         monkeypatch.setattr(config_module, "get_env_path", lambda: hermes_home / ".env")
         monkeypatch.setattr(config_module, "get_hermes_home", lambda: hermes_home)
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
-        for var in ("OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY",
-                     "ANTHROPIC_TOKEN", "OPENAI_BASE_URL"):
+        for var in PROVIDER_ENV_VARS:
             monkeypatch.delenv(var, raising=False)
         from hermes_cli.main import _has_any_provider_configured
         assert _has_any_provider_configured() is True
@@ -719,9 +743,12 @@ class TestHasAnyProviderConfigured:
         monkeypatch.setattr(config_module, "get_env_path", lambda: hermes_home / ".env")
         monkeypatch.setattr(config_module, "get_hermes_home", lambda: hermes_home)
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
-        for var in ("OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY",
-                     "ANTHROPIC_TOKEN", "OPENAI_BASE_URL"):
+        for var in PROVIDER_ENV_VARS:
             monkeypatch.delenv(var, raising=False)
+        monkeypatch.setattr(
+            "hermes_cli.auth.get_auth_status",
+            lambda provider_id=None: {"logged_in": False},
+        )
         from hermes_cli.main import _has_any_provider_configured
         assert _has_any_provider_configured() is False
 
@@ -738,8 +765,7 @@ class TestHasAnyProviderConfigured:
         monkeypatch.setattr(config_module, "get_hermes_home", lambda: hermes_home)
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
         # Clear all provider env vars
-        for var in ("OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY",
-                     "ANTHROPIC_TOKEN", "OPENAI_BASE_URL"):
+        for var in PROVIDER_ENV_VARS:
             monkeypatch.delenv(var, raising=False)
         # Simulate valid Claude Code credentials
         monkeypatch.setattr(

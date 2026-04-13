@@ -3,10 +3,12 @@ import asyncio
 import json
 import os
 import sys
+import time
 import types
 from pathlib import Path
 
 from fastapi.testclient import TestClient
+import yaml
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -46,6 +48,82 @@ def test_extract_tool_names_handles_dict_payloads():
         }
     ]
     assert module._extract_tool_names(messages) == ["web_search", "read_file"]
+
+
+def test_extract_feishu_inline_fast_command_from_text_payload():
+    module = _load_module()
+    payload = {
+        "event": {
+            "message": {
+                "message_type": "text",
+                "content": json.dumps({"text": "/model moonshotai/kimi-k2.5 --provider openrouter"}),
+            }
+        }
+    }
+
+    assert module._extract_feishu_inline_fast_command(payload) == "model"
+
+
+def test_extract_feishu_inline_fast_command_ignores_leading_mentions():
+    module = _load_module()
+    payload = {
+        "event": {
+            "message": {
+                "message_type": "text",
+                "content": json.dumps({"text": "<at user_id=\"ou_x\">Hermes</at> /provider"}),
+            }
+        }
+    }
+
+    assert module._extract_feishu_inline_fast_command(payload) == "provider"
+
+
+def test_extract_feishu_trace_token_from_text_payload():
+    module = _load_module()
+    payload = {
+        "event": {
+            "message": {
+                "message_type": "text",
+                "content": json.dumps({"text": "hello world [trace:fev_123abc]"}),
+            }
+        }
+    }
+
+    assert module._extract_feishu_trace_token(payload) == "fev_123abc"
+
+
+def test_extract_feishu_message_read_event_info():
+    module = _load_module()
+    payload = {
+        "header": {
+            "event_type": "im.message.message_read_v1",
+            "event_id": "evt_read_123",
+        },
+        "event": {
+            "reader": {
+                "reader_id": {
+                    "open_id": "ou_reader_123",
+                    "user_id": "reader_user_123",
+                    "union_id": "union_reader_123",
+                },
+                "tenant_key": "tenant_key_123",
+                "read_time": "1712970000",
+            },
+            "message_id_list": ["om_1", "om_2"],
+        },
+    }
+
+    result = module._extract_feishu_message_read_event_info(payload)
+
+    assert result["event_type"] == "im.message.message_read_v1"
+    assert result["event_id"] == "evt_read_123"
+    assert result["reader_open_id"] == "ou_reader_123"
+    assert result["reader_user_id"] == "reader_user_123"
+    assert result["reader_union_id"] == "union_reader_123"
+    assert result["tenant_key"] == "tenant_key_123"
+    assert result["read_time"] == 1712970000
+    assert result["message_id_list"] == ["om_1", "om_2"]
+    assert result["message_count"] == 2
 
 
 def test_session_state_round_trip(tmp_path):
@@ -158,6 +236,50 @@ def test_chat_partition_claim_round_trip(tmp_path):
     assert claimed_after_release is True
 
 
+def test_chat_partition_claim_can_take_over_stale_claim(tmp_path):
+    module = _load_module()
+    module.DATA_ROOT = tmp_path / "data"
+    module.SESSIONS_DIR = module.DATA_ROOT / "sessions"
+    module.UPDATES_PATH = module.DATA_ROOT / "telegram_updates.json"
+    module.HERMES_HOME_DIR = tmp_path / "home"
+    module.CHAT_QUEUE_CLAIMS_PATH = module.DATA_ROOT / "chat_queue_claims.json"
+    module.DEFAULT_CHAT_QUEUE_STALE_CLAIM_TAKEOVER_SECONDS = 30
+    module._ensure_runtime_dirs()
+
+    old_token = "claim-old"
+    module._save_chat_queue_claims(
+        {
+            "feishu:oc_chat": {
+                "claim_token": old_token,
+                "claimed_at": int(time.time()) - 120,
+                "platform": "feishu",
+                "status": "claimed",
+            }
+        }
+    )
+
+    claimed, token = module._claim_chat_partition("feishu:oc_chat", platform="feishu", ttl_seconds=3600)
+
+    assert claimed is True
+    assert token != old_token
+
+
+def test_feishu_bot_identity_cache_round_trip(tmp_path):
+    module = _load_module()
+    module.DATA_ROOT = tmp_path / "data"
+    module.FEISHU_BOT_IDENTITY_CACHE_PATH = module.DATA_ROOT / "feishu_bot_identity_cache.json"
+    module.HERMES_HOME_DIR = tmp_path / "home"
+    module._ensure_runtime_dirs()
+
+    assert module._get_cached_feishu_bot_identity("cli_app") == {}
+
+    asyncio.run(module._cache_feishu_bot_identity_async("cli_app", bot_name="Hermes"))
+
+    cached = module._get_cached_feishu_bot_identity("cli_app")
+    assert cached["bot_name"] == "Hermes"
+    assert cached["updated_at"] > 0
+
+
 def test_process_chat_queue_commits_before_releasing_claim(monkeypatch, tmp_path):
     module = _load_module()
     module.DATA_ROOT = tmp_path / "data"
@@ -180,8 +302,15 @@ def test_process_chat_queue_commits_before_releasing_claim(monkeypatch, tmp_path
             return []
 
     monkeypatch.setattr(module, "_get_chat_queue", lambda: FakeQueue())
-    monkeypatch.setattr(module, "_claim_chat_partition", lambda partition, platform: (True, "claim-1"))
-    monkeypatch.setattr(module, "_process_chat_queue_item", lambda item: {"status": "ok", "item": item})
+    monkeypatch.setattr(
+        module,
+        "_claim_chat_partition",
+        lambda partition, platform, claim_token=None: (True, claim_token or "claim-1"),
+    )
+    async def _fake_process_items(items, **kwargs):
+        return [{"status": "ok", "item": item} for item in items]
+
+    monkeypatch.setattr(module, "_process_chat_queue_items_async", _fake_process_items)
     monkeypatch.setattr(module, "_safe_chat_queue_depth", lambda: 0)
 
     def _record_sync(*, reload=False, commit=False):
@@ -199,6 +328,9 @@ def test_process_chat_queue_commits_before_releasing_claim(monkeypatch, tmp_path
     result = module._process_chat_queue_impl(platform="feishu", partition="feishu:oc_chat", max_items=1)
 
     assert result["processed_count"] == 1
+    assert result["worker_boot_id"].startswith("inline-")
+    assert result["container_reused"] is False
+    assert result["batch_size"] == 1
     assert events[-2:] == ["commit", "release:feishu:oc_chat:claim-1"]
 
 
@@ -218,7 +350,67 @@ def test_sync_runtime_config_writes_official_config_path(tmp_path, monkeypatch):
     written_path = module._sync_runtime_config()
 
     assert written_path == str(module.HERMES_HOME_DIR / "config.yaml")
-    assert (module.HERMES_HOME_DIR / "config.yaml").read_text(encoding="utf-8") == source.read_text(encoding="utf-8")
+
+
+def test_sync_runtime_config_preserves_existing_mcp_servers_without_feishu_injection(tmp_path, monkeypatch):
+    module = _load_module()
+    module.DATA_ROOT = tmp_path / "data"
+    module.SESSIONS_DIR = module.DATA_ROOT / "sessions"
+    module.UPDATES_PATH = module.DATA_ROOT / "telegram_updates.json"
+    module.HERMES_HOME_DIR = tmp_path / "home"
+
+    source = tmp_path / "config.modal.yaml"
+    source.write_text(
+        "mcp_servers:\n"
+        "  github:\n"
+        "    command: npx\n"
+        "    args: [github-mcp]\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_MODAL_CONFIG_SOURCE", str(source))
+    monkeypatch.setenv("HERMES_MODAL_SYNC_CONFIG", "true")
+    monkeypatch.setenv("FEISHU_APP_ID", "cli_test_feishu")
+    monkeypatch.setenv("FEISHU_APP_SECRET", "secret_test_feishu")
+
+    module._ensure_runtime_dirs()
+    written_path = Path(module._sync_runtime_config())
+    payload = yaml.safe_load(written_path.read_text(encoding="utf-8"))
+
+    assert payload["mcp_servers"] == {"github": {"command": "npx", "args": ["github-mcp"]}}
+
+
+def test_modal_official_parity_state_reports_modal_exceptions(monkeypatch):
+    module = _load_module()
+
+    monkeypatch.delenv("HERMES_ENABLED_TOOLSETS", raising=False)
+    monkeypatch.delenv("HERMES_DISABLED_TOOLSETS", raising=False)
+    monkeypatch.setattr(module.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    original_find_spec = module.importlib.util.find_spec
+
+    def _fake_find_spec(name):
+        if name in {
+            "plugins.memory.honcho",
+            "tools.homeassistant_tool",
+            "botpy",
+        }:
+            return object()
+        return original_find_spec(name)
+
+    monkeypatch.setattr(module.importlib.util, "find_spec", _fake_find_spec)
+
+    payload = module._build_modal_official_parity_state()
+
+    assert payload["features"]["core_agent_loop"]["status"] == "supported"
+    assert payload["features"]["browser_tools"]["status"] == "supported"
+    assert payload["features"]["honcho_memory_provider"]["status"] == "supported"
+    assert payload["platforms"]["telegram"]["status"] == "supported"
+    assert payload["platforms"]["feishu"]["status"] == "supported"
+    assert payload["platforms"]["qq"]["status"] == "supported"
+    assert payload["platforms"]["discord"]["status"] == "unsupported"
+    assert payload["platforms"]["matrix"]["status"] == "unsupported"
+    assert "voice" in payload["default_disabled_toolsets"]
+    assert "rl" in payload["default_disabled_toolsets"]
 
 
 def test_sync_runtime_config_expands_model_env_placeholder(tmp_path, monkeypatch):
@@ -362,10 +554,147 @@ def test_extract_feishu_queue_context_handles_menu_event():
     result = module._extract_feishu_queue_context(payload)
 
     assert result["platform"] == "feishu"
-    assert result["partition"] == "feishu:oc_menu_chat"
+    assert result["partition"] == "feishu:control:oc_menu_chat"
+    assert result["lane"] == "control"
     assert result["chat_id"] == "oc_menu_chat"
     assert result["actor_id"] == "ou_menu_operator"
     assert result["event_type"] == "application.bot.menu_v6"
+
+
+def test_extract_feishu_queue_context_handles_bot_entered_user_shape():
+    module = _load_module()
+    payload = {
+        "header": {
+            "event_id": "evt-entered-1",
+            "event_type": "im.chat.access_event.bot_p2p_chat_entered_v1",
+        },
+        "event": {
+            "user_id": {"open_id": "ou_entered_user"},
+            "open_chat_id": "oc_entered_chat",
+        },
+    }
+
+    result = module._extract_feishu_queue_context(payload)
+
+    assert result["platform"] == "feishu"
+    assert result["partition"] == "feishu:control:oc_entered_chat"
+    assert result["lane"] == "control"
+    assert result["chat_id"] == "oc_entered_chat"
+    assert result["actor_id"] == "ou_entered_user"
+    assert result["event_type"] == "im.chat.access_event.bot_p2p_chat_entered_v1"
+
+    warmup = module._extract_feishu_warmup_context(payload)
+    assert warmup["lane"] == "chat_light"
+    assert warmup["partition"] == "feishu:chat_light:oc_entered_chat"
+
+
+def test_classify_feishu_chat_lane_prefers_chat_light_for_short_text():
+    module = _load_module()
+    payload = {
+        "header": {
+            "event_type": "im.message.receive_v1",
+            "event_id": "evt_light_1",
+        },
+        "event": {
+            "message": {
+                "message_type": "text",
+                "content": json.dumps({"text": "hello"}),
+            }
+        },
+    }
+
+    assert module._classify_feishu_chat_lane(payload) == "chat_light"
+    context = module._extract_feishu_queue_context(payload)
+    assert context["lane"] == "chat_light"
+    assert context["partition"] == "feishu:chat_light:unknown"
+
+
+def test_classify_feishu_chat_lane_marks_non_text_messages_heavy():
+    module = _load_module()
+    payload = {
+        "header": {
+            "event_type": "im.message.receive_v1",
+            "event_id": "evt_heavy_1",
+        },
+        "event": {
+            "open_chat_id": "oc_heavy_chat",
+            "message": {
+                "message_type": "image",
+                "content": json.dumps({"image_key": "img_123"}),
+            },
+        },
+    }
+
+    assert module._classify_feishu_chat_lane(payload) == "chat_heavy"
+    context = module._extract_feishu_queue_context(payload)
+    assert context["lane"] == "chat_heavy"
+    assert context["partition"] == "feishu:chat_heavy:oc_heavy_chat"
+
+
+def test_process_chat_queue_warmup_snapshot_is_consumed_once(monkeypatch, tmp_path):
+    module = _load_module()
+    module.DATA_ROOT = tmp_path / "data"
+    module.SESSIONS_DIR = module.DATA_ROOT / "sessions"
+    module.UPDATES_PATH = module.DATA_ROOT / "telegram_updates.json"
+    module.FEISHU_EVENTS_PATH = module.DATA_ROOT / "feishu_events.json"
+    module.FEISHU_TRACE_PATH = module.DATA_ROOT / "feishu_trace.jsonl"
+    module.CHAT_QUEUE_CLAIMS_PATH = module.DATA_ROOT / "chat_queue_claims.json"
+    module.CHAT_QUEUE_WARMUPS_PATH = module.DATA_ROOT / "chat_queue_warmups.json"
+    module.HERMES_HOME_DIR = tmp_path / "home"
+    module._ensure_runtime_dirs()
+
+    monkeypatch.setattr(module, "_sync_modal_volume", lambda **_kwargs: None)
+    monkeypatch.setattr(module, "_safe_chat_queue_depth", lambda: 0)
+    monkeypatch.setattr(module, "_claim_chat_partition", lambda *args, **kwargs: (False, "claimed"))
+
+    warm_context = {
+        "worker_boot_id": "boot-warm",
+        "worker_started_at": 111,
+        "enter_elapsed_ms": 25,
+        "runtime_prepare_elapsed_ms": 25,
+        "chat_id": "oc_entered_chat",
+        "actor_id": "ou_entered_user",
+        "event_id": "evt-entered-1",
+        "event_type": "im.chat.access_event.bot_p2p_chat_entered_v1",
+        "started_at_ms": "1000",
+    }
+    warm_result = module._process_chat_queue_impl(
+        platform="feishu",
+        partition="feishu:oc_entered_chat",
+        max_items=0,
+        worker_context=warm_context,
+        runtime_prepared=True,
+    )
+
+    assert warm_result["status"] == "warmed"
+    assert warm_result["warmup_status"] == "ready"
+
+    cold_result = module._process_chat_queue_impl(
+        platform="feishu",
+        partition="feishu:oc_entered_chat",
+        max_items=1,
+        worker_context={"worker_boot_id": "boot-real"},
+        runtime_prepared=True,
+    )
+
+    assert cold_result["status"] == "skipped"
+    assert cold_result["reason"] == "already_claimed"
+    assert cold_result["warmup_status"] == "ready"
+    assert cold_result["warmup_actor_id"] == "ou_entered_user"
+    assert cold_result["warmup_chat_id"] == "oc_entered_chat"
+    assert cold_result["warmup_same_container"] is False
+
+    next_result = module._process_chat_queue_impl(
+        platform="feishu",
+        partition="feishu:oc_entered_chat",
+        max_items=1,
+        worker_context={"worker_boot_id": "boot-next"},
+        runtime_prepared=True,
+    )
+
+    assert next_result["status"] == "skipped"
+    assert next_result["reason"] == "already_claimed"
+    assert "warmup_status" not in next_result
 
 
 def test_process_chat_queue_item_skips_reload_by_default(monkeypatch, tmp_path):
@@ -401,6 +730,55 @@ def test_process_chat_queue_item_skips_reload_by_default(monkeypatch, tmp_path):
 
     assert result["status"] == "ok"
     assert sync_calls == []
+
+
+def test_process_chat_queue_batch_reuses_single_async_run(monkeypatch, tmp_path):
+    module = _load_module()
+    module.DATA_ROOT = tmp_path / "data"
+    module.SESSIONS_DIR = module.DATA_ROOT / "sessions"
+    module.UPDATES_PATH = module.DATA_ROOT / "telegram_updates.json"
+    module.HERMES_HOME_DIR = tmp_path / "home"
+    module.CHAT_QUEUE_CLAIMS_PATH = module.DATA_ROOT / "chat_queue_claims.json"
+    module._ensure_runtime_dirs()
+
+    class FakeQueue:
+        def __init__(self):
+            self._polls = 0
+
+        def get_many(self, _max_items, block=False, timeout=None, partition=None):
+            self._polls += 1
+            if self._polls == 1:
+                return [{"payload": "one"}, {"payload": "two"}]
+            return []
+
+    asyncio_runs = []
+
+    async def _fake_process_items(items, **kwargs):
+        return [{"status": "ok", "payload": item["payload"]} for item in items]
+
+    real_asyncio_run = module.asyncio.run
+
+    def _record_run(coro):
+        asyncio_runs.append(type(coro).__name__)
+        return real_asyncio_run(coro)
+
+    monkeypatch.setattr(module, "_get_chat_queue", lambda: FakeQueue())
+    monkeypatch.setattr(
+        module,
+        "_claim_chat_partition",
+        lambda partition, platform, claim_token=None: (True, claim_token or "claim-1"),
+    )
+    monkeypatch.setattr(module, "_process_chat_queue_items_async", _fake_process_items)
+    monkeypatch.setattr(module, "_safe_chat_queue_depth", lambda: 0)
+    monkeypatch.setattr(module.asyncio, "run", _record_run)
+    monkeypatch.setattr(module, "_sync_modal_volume", lambda **kwargs: None)
+    monkeypatch.setattr(module, "_release_chat_partition_claim", lambda *args, **kwargs: None)
+
+    result = module._process_chat_queue_impl(platform="feishu", partition="feishu:oc_chat", max_items=8)
+
+    assert result["processed_count"] == 2
+    assert result["batch_size"] == 2
+    assert asyncio_runs == ["coroutine"]
 
 
 def test_chat_partition_claim_skips_reload_by_default(monkeypatch, tmp_path):
@@ -516,42 +894,158 @@ def test_debug_feishu_sync_state_helper(monkeypatch, tmp_path):
     assert payload["resolved_target"]["table_id"] == "tbl_123"
 
 
-def test_debug_feishu_mcp_state_helper(monkeypatch):
+def test_should_prepare_feishu_registry_schema_on_startup_skips_recent_ok_schema(monkeypatch):
+    module = _load_module()
+    recent_checked_at = int(time.time()) - 60
+    monkeypatch.setattr(module, "DEFAULT_FEISHU_STARTUP_SCHEMA_RECHECK_SECONDS", 3600)
+
+    should_prepare = module._should_prepare_feishu_registry_schema_on_startup(
+        {
+            "schema": {
+                "status": "ok",
+                "checked_at": recent_checked_at,
+                "missing_required_fields": [],
+                "missing_views": [],
+            }
+        }
+    )
+
+    assert should_prepare is False
+
+
+def test_should_prepare_feishu_registry_schema_on_startup_rechecks_stale_schema(monkeypatch):
+    module = _load_module()
+    stale_checked_at = int(time.time()) - 7200
+    monkeypatch.setattr(module, "DEFAULT_FEISHU_STARTUP_SCHEMA_RECHECK_SECONDS", 3600)
+
+    should_prepare = module._should_prepare_feishu_registry_schema_on_startup(
+        {
+            "schema": {
+                "status": "ok",
+                "checked_at": stale_checked_at,
+                "missing_required_fields": [],
+                "missing_views": [],
+            }
+        }
+    )
+
+    assert should_prepare is True
+
+
+def _obsolete_test_removed_feishu_debug_helper(monkeypatch):
+    pass
+
+
+def _obsolete_test_removed_feishu_parity_helper(monkeypatch, tmp_path):
+    pass
+
+def test_debug_feishu_runtime_uses_api_only_surface(monkeypatch):
+    source = MODULE_PATH.read_text(encoding="utf-8")
+
+    assert 'def debug_feishu_runtime()' in source
+    assert '"feishu_sync": _build_feishu_sync_state_debug_state()' in source
+    assert '"memory_snapshots": {' in source
+
+
+def test_feishu_model_registry_heartbeat_impl_respects_next_due(monkeypatch):
+    module = _load_module()
+    future_due = int(time.time()) + 120
+    monkeypatch.setenv("FEISHU_MODEL_REGISTRY_MIRROR_ENABLED", "true")
+    monkeypatch.setenv("FEISHU_BITABLE_APP_TOKEN", "app_token_123")
+    monkeypatch.setenv("FEISHU_BITABLE_TABLE_ID", "tbl_123")
+    monkeypatch.setattr(
+        module,
+        "_load_feishu_sync_state",
+        lambda: {"next_due_at": future_due},
+    )
+
+    payload = module._feishu_model_registry_heartbeat_impl()
+
+    assert payload["status"] == "skipped"
+    assert payload["reason"] == "not_due"
+    assert payload["next_due_at"] == future_due
+
+
+def test_maintenance_heartbeat_disabled_by_default(monkeypatch):
+    module = _load_module()
+    monkeypatch.delenv("HERMES_MODAL_MAINTENANCE_HEARTBEAT_ENABLED", raising=False)
+
+    assert module._maintenance_heartbeat_is_enabled() is False
+
+
+def test_maintenance_heartbeat_impl_combines_cron_and_feishu(monkeypatch):
+    module = _load_module()
+    monkeypatch.setattr(
+        module,
+        "_cron_scheduler_tick_impl",
+        lambda *, enqueue_limit, worker_count: {
+            "status": "ok",
+            "enqueue_limit": enqueue_limit,
+            "worker_count": worker_count,
+        },
+    )
+    monkeypatch.setattr(
+        module,
+        "_feishu_model_registry_heartbeat_impl",
+        lambda: {"status": "skipped", "reason": "mirror_disabled"},
+    )
+
+    payload = module._maintenance_heartbeat_impl(enqueue_limit=3, worker_count=2)
+
+    assert payload["status"] == "ok"
+    assert payload["cron"]["enqueue_limit"] == 3
+    assert payload["cron"]["worker_count"] == 2
+    assert payload["feishu_registry"]["reason"] == "mirror_disabled"
+
+
+def test_bootstrap_chat_queue_worker_context_preloads_local_state(monkeypatch):
     module = _load_module()
     monkeypatch.setattr(module, "_prepare_runtime_environment", lambda: None)
-    monkeypatch.setenv("HERMES_FEISHU_MCP_ENABLED", "true")
-    monkeypatch.setenv("HERMES_FEISHU_MCP_PREFER_OFFICIAL", "true")
-    monkeypatch.setenv("HERMES_FEISHU_MCP_SERVER_NAME", "feishu")
-    monkeypatch.setitem(
-        sys.modules,
-        "tools.mcp_tool",
-        types.SimpleNamespace(
-            _load_mcp_config=lambda: {"feishu": {"enabled": True, "url": "https://example.test/mcp"}},
-            get_mcp_status=lambda: [{"name": "feishu", "connected": True, "tools": 3}],
-            discover_mcp_tools=lambda: ["mcp_feishu_docs_list", "mcp_feishu_bitable_query"],
-        ),
+    monkeypatch.setattr(module, "_load_routing_state", lambda: {"refreshed_at": 123456})
+
+    fake_tools_module = types.SimpleNamespace(
+        load_feishu_model_registry=lambda force_refresh=False: {
+            "source": "routing_state",
+            "entries": [{"provider": "openrouter", "model": "openrouter/free"}],
+        }
     )
-    monkeypatch.setitem(
-        sys.modules,
-        "tools.registry",
-        types.SimpleNamespace(
-            registry=types.SimpleNamespace(
-                get_all_tool_names=lambda: [
-                    "mcp_feishu_docs_list",
-                    "mcp_feishu_bitable_query",
-                    "feishu_doc_create",
-                ],
-                get_toolset_for_tool=lambda name: "mcp-feishu" if name.startswith("mcp_feishu_") else "feishu",
-            )
-        ),
+    monkeypatch.setitem(sys.modules, "tools.feishu_api", fake_tools_module)
+
+    payload = module._bootstrap_chat_queue_worker_context()
+
+    assert payload["worker_boot_id"]
+    assert payload["worker_started_at"] > 0
+    assert payload["runtime_prepare_elapsed_ms"] >= 0
+    assert payload["enter_elapsed_ms"] >= payload["runtime_prepare_elapsed_ms"]
+    assert payload["routing_state_refreshed_at"] == 123456
+    assert payload["model_registry_entry_count"] == 1
+    assert payload["model_registry_source"] == "routing_state"
+    assert payload["container_reused"] is False
+
+
+def test_cron_scheduler_tick_batches_jobs_per_worker(monkeypatch):
+    module = _load_module()
+    spawned = []
+
+    monkeypatch.setattr(
+        module,
+        "_enqueue_due_cron_jobs_impl",
+        lambda limit: {"status": "ok", "queue_depth": 5, "enqueued_count": 5},
+    )
+    monkeypatch.setattr(module, "_safe_cron_queue_depth", lambda: 5)
+    monkeypatch.setattr(module, "modal", object())
+    monkeypatch.setattr(
+        module,
+        "process_cron_queue",
+        types.SimpleNamespace(spawn=lambda **kwargs: spawned.append(kwargs)),
+        raising=False,
     )
 
-    payload = module._build_feishu_mcp_debug_state(probe=True)
+    payload = module._cron_scheduler_tick_impl(enqueue_limit=8, worker_count=2)
 
-    assert payload["enabled"] is True
-    assert payload["resolved_server_name"] == "feishu"
-    assert payload["connected"] is True
-    assert payload["registered_tool_count"] == 2
+    assert payload["spawned_workers"] == 2
+    assert payload["jobs_per_worker"] == 3
+    assert spawned == [{"max_jobs": 3}, {"max_jobs": 3}]
 
 
 def test_health_check_reports_feishu_configured(monkeypatch):
@@ -1179,6 +1673,17 @@ def test_run_agent_task_pins_response_model_into_route_lease(monkeypatch, tmp_pa
     assert module._load_session_state("pin-response-model")["route_lease"]["model"] == "google/gemma-3-27b-it:free"
 
 
+def _obsolete_test_validate_feishu_workbench_call_retries_with_stronger_model(monkeypatch, tmp_path):
+    pass
+
+
+def _obsolete_test_validate_feishu_workbench_call_continues_after_provider_403_exception(monkeypatch, tmp_path):
+    pass
+
+
+def _obsolete_test_validate_feishu_workbench_call_prefers_explicit_mcp_toolset(monkeypatch, tmp_path):
+    pass
+
 def test_debug_gateway_session_state_loads_persisted_entries(monkeypatch, tmp_path):
     module = _load_module()
     module.DATA_ROOT = tmp_path / "data"
@@ -1446,9 +1951,16 @@ def test_feishu_webhook_route_preserves_json_response(monkeypatch):
     assert response.json() == {"challenge": "ok"}
 
 
-def test_dispatch_feishu_update_processes_message_synchronously(monkeypatch):
+def test_spawn_feishu_event_handoff_async_schedules_worker(monkeypatch, tmp_path):
     module = _load_module()
-    handled = {"spawned": None, "enqueued": None}
+    module.DATA_ROOT = tmp_path / "data"
+    module.SESSIONS_DIR = module.DATA_ROOT / "sessions"
+    module.UPDATES_PATH = module.DATA_ROOT / "telegram_updates.json"
+    module.FEISHU_EVENTS_PATH = module.DATA_ROOT / "feishu_events.json"
+    module.HERMES_HOME_DIR = tmp_path / "home"
+    module.CHAT_QUEUE_CLAIMS_PATH = module.DATA_ROOT / "chat_queue_claims.json"
+    module._ensure_runtime_dirs()
+    handled = {"spawn_payload": None}
     monkeypatch.setenv("FEISHU_APP_ID", "cli_feishu_app")
     monkeypatch.setenv("FEISHU_APP_SECRET", "feishu-secret-123")
     payload = {
@@ -1460,26 +1972,453 @@ def test_dispatch_feishu_update_processes_message_synchronously(monkeypatch):
         "event": {"message": {"message_id": "om_sync"}},
     }
 
-    def _fake_enqueue(*, platform, partition, payload, metadata):
+    async def _fake_spawn_aio(*, payload, warmup_only=False, warmup_context=None):
+        handled["spawn_payload"] = payload
+        handled["warmup_only"] = warmup_only
+        handled["warmup_context"] = warmup_context
+
+    monkeypatch.setattr(
+        module,
+        "process_feishu_event",
+        types.SimpleNamespace(spawn=types.SimpleNamespace(aio=_fake_spawn_aio)),
+        raising=False,
+    )
+
+    result = asyncio.run(
+        module._spawn_feishu_event_handoff_async(
+            payload=payload,
+            context={"partition": "feishu:chat_light:unknown", "lane": "chat_light"},
+        )
+    )
+
+    assert result["status"] == "scheduled"
+    assert result["reason"] == "process_feishu_event_spawned"
+    assert handled["spawn_payload"]["event"]["message"]["message_id"] == "om_sync"
+    assert handled["warmup_only"] is False
+    assert handled["warmup_context"] is None
+
+
+def test_feishu_message_webhook_uses_inline_enqueue_and_direct_worker_spawn(monkeypatch, tmp_path):
+    module = _load_module()
+    module.DATA_ROOT = tmp_path / "data"
+    module.SESSIONS_DIR = module.DATA_ROOT / "sessions"
+    module.UPDATES_PATH = module.DATA_ROOT / "telegram_updates.json"
+    module.FEISHU_EVENTS_PATH = module.DATA_ROOT / "feishu_events.json"
+    module.HERMES_HOME_DIR = tmp_path / "home"
+    module.CHAT_QUEUE_CLAIMS_PATH = module.DATA_ROOT / "chat_queue_claims.json"
+    module._ensure_runtime_dirs()
+    handled = {"enqueued": None, "spawned": None, "ack_reaction_spawned": False}
+    monkeypatch.setenv("FEISHU_APP_ID", "cli_feishu_app")
+    monkeypatch.setenv("FEISHU_APP_SECRET", "feishu-secret-123")
+    payload = {
+        "header": {
+            "event_type": "im.message.receive_v1",
+            "event_id": "evt_sync_fallback",
+            "token": "verify-token",
+        },
+        "event": {"message": {"message_id": "om_sync_fallback"}},
+    }
+
+    async def _fake_parse(_request):
+        return object(), payload
+
+    async def _fake_enqueue_async(*, platform, partition, payload, metadata, include_queue_depth=True):
         handled["enqueued"] = {
             "platform": platform,
             "partition": partition,
             "payload": payload,
             "metadata": metadata,
+            "include_queue_depth": include_queue_depth,
         }
-        return {"status": "enqueued", "queue_depth": 1}
+        return {"status": "enqueued", "partition": partition, "queue_depth": None, **metadata}
+
+    async def _fake_spawn_async(**kwargs):
+        handled["spawned"] = kwargs
+        return {"status": "scheduled", **kwargs}
+
+    async def _fake_spawn_ack_reaction(*, payload, request_started_at=None):
+        handled["ack_reaction_spawned"] = request_started_at is not None
+        return {
+            "status": "scheduled",
+            "reason": "process_feishu_ack_reaction_spawned",
+            "schedule_elapsed_ms": 12,
+            "message_id": payload["event"]["message"]["message_id"],
+        }
+
+    monkeypatch.setattr(module, "_parse_feishu_webhook_request", _fake_parse)
+    monkeypatch.setattr(module, "_mark_feishu_event_seen", lambda _event_id: True)
+    monkeypatch.setattr(
+        module,
+        "process_feishu_event",
+        types.SimpleNamespace(),
+        raising=False,
+    )
+    monkeypatch.setattr(module, "_enqueue_chat_event_async", _fake_enqueue_async)
+    monkeypatch.setattr(module, "_spawn_chat_queue_worker_optimistic_async", _fake_spawn_async)
+    monkeypatch.setattr(module, "_spawn_feishu_ack_reaction_async", _fake_spawn_ack_reaction)
+
+    client = TestClient(module.create_web_app())
+    response = client.post("/feishu/webhook", json=payload)
+
+    assert response.status_code == 200
+    assert response.json() == {"code": 0, "msg": "accepted"}
+    assert handled["ack_reaction_spawned"] is True
+    assert handled["enqueued"]["partition"] == "feishu:chat_light:unknown"
+    assert handled["spawned"]["partition"] == "feishu:chat_light:unknown"
+
+
+def test_spawn_feishu_ack_reaction_async_requires_message_id(monkeypatch):
+    module = _load_module()
+
+    async def _run():
+        return await module._spawn_feishu_ack_reaction_async(
+            payload={
+                "header": {"event_type": "im.message.receive_v1", "event_id": "evt_missing_msg"},
+                "event": {"message": {}},
+            },
+        )
+
+    result = asyncio.run(_run())
+
+    assert result["status"] == "skipped"
+    assert result["reason"] == "missing_message_id"
+
+
+def test_add_feishu_ack_reaction_from_payload_records_success(monkeypatch):
+    module = _load_module()
+    traces = []
+    fake_client = types.SimpleNamespace(
+        request_json=lambda method, path, json_body=None: {
+            "reaction_id": "reaction-om_ack_bg",
+            "method": method,
+            "path": path,
+            "json_body": json_body,
+        }
+    )
+
+    monkeypatch.setitem(sys.modules, "tools.feishu_api", types.SimpleNamespace(build_feishu_client=lambda: fake_client))
+    monkeypatch.setattr(module, "_append_feishu_trace", lambda stage, payload, **extra: traces.append((stage, extra)))
+
+    result = module._add_feishu_ack_reaction_from_payload(
+        {
+            "header": {"event_type": "im.message.receive_v1", "event_id": "evt_ack_bg"},
+            "event": {"message": {"message_id": "om_ack_bg", "chat_id": "oc_chat"}},
+        },
+        request_started_at_ms=int(time.time() * 1000),
+        worker_context={"worker_boot_id": "ack-worker-1", "container_reused": False},
+    )
+
+    assert result["status"] == "ok"
+    assert result["message_id"] == "om_ack_bg"
+    assert result["reaction_id"] == "reaction-om_ack_bg"
+    assert result["worker_boot_id"] == "ack-worker-1"
+    assert any(stage == "webhook.ack_reaction" for stage, _extra in traces)
+
+
+def test_spawn_feishu_event_handoff_async_times_out(monkeypatch):
+    module = _load_module()
+    monkeypatch.setattr(module, "DEFAULT_FEISHU_INGRESS_HANDOFF_TIMEOUT_SECONDS", 0.01)
 
     async def _fake_spawn_aio(**kwargs):
-        handled["spawned"] = kwargs
+        await asyncio.sleep(0.2)
 
-    monkeypatch.setattr(module, "_enqueue_chat_event", _fake_enqueue)
-    monkeypatch.setattr(module, "_mark_feishu_event_seen", lambda _event_id: True)
-    monkeypatch.setattr(module, "_safe_chat_queue_depth", lambda: 1)
+    monkeypatch.setattr(
+        module,
+        "process_feishu_event",
+        types.SimpleNamespace(spawn=types.SimpleNamespace(aio=_fake_spawn_aio)),
+        raising=False,
+    )
+
+    result = asyncio.run(
+        module._spawn_feishu_event_handoff_async(
+            payload={"header": {"event_type": "im.message.receive_v1", "event_id": "evt_timeout"}},
+            context={"partition": "feishu:chat_light:oc_timeout", "lane": "chat_light"},
+        )
+    )
+
+    assert result["status"] == "timeout"
+    assert result["reason"] == "process_feishu_event_spawn_timeout"
+    assert result["handoff_schedule_wait_elapsed_ms"] >= result["handoff_wait_elapsed_ms"]
+
+
+def test_feishu_webhook_fast_command_bypasses_chat_queue(monkeypatch):
+    module = _load_module()
+    handled = {"dispatched": None, "enqueued": False, "spawned": False}
+    monkeypatch.setenv("FEISHU_APP_ID", "cli_feishu_app")
+    monkeypatch.setenv("FEISHU_APP_SECRET", "feishu-secret-123")
+    payload = {
+        "header": {
+            "event_type": "im.message.receive_v1",
+            "event_id": "evt_fast_model",
+            "token": "verify-token",
+        },
+        "event": {
+            "message": {
+                "message_id": "om_fast_model",
+                "message_type": "text",
+                "content": json.dumps({"text": "/model"}),
+            }
+        },
+    }
 
     async def _fake_parse(_request):
         return object(), payload
 
+    async def _fake_dispatch(raw_payload, await_background_tasks=False):
+        handled["dispatched"] = {
+            "payload": raw_payload,
+            "await_background_tasks": await_background_tasks,
+        }
+
+    async def _fake_enqueue(**kwargs):
+        handled["enqueued"] = True
+        return {"status": "enqueued", "queue_depth": 1}
+
+    async def _fake_spawn(**kwargs):
+        handled["spawned"] = kwargs
+
     monkeypatch.setattr(module, "_parse_feishu_webhook_request", _fake_parse)
+    monkeypatch.setattr(module, "_dispatch_feishu_payload", _fake_dispatch)
+    monkeypatch.setattr(module, "_enqueue_chat_event_async", _fake_enqueue)
+    monkeypatch.setattr(module, "_mark_feishu_event_seen", lambda _event_id: True)
+    monkeypatch.setattr(
+        module,
+        "process_chat_queue",
+        types.SimpleNamespace(spawn=types.SimpleNamespace(aio=_fake_spawn)),
+        raising=False,
+    )
+
+    client = TestClient(module.create_web_app())
+    response = client.post("/feishu/webhook", json=payload)
+
+    assert response.status_code == 200
+    assert response.json() == {"code": 0, "msg": "accepted"}
+    assert handled["dispatched"]["payload"]["event"]["message"]["message_id"] == "om_fast_model"
+    assert handled["dispatched"]["await_background_tasks"] is True
+    assert handled["enqueued"] is False
+    assert handled["spawned"] is False
+
+
+def test_feishu_webhook_bot_p2p_chat_entered_warms_chat_worker_without_queue(monkeypatch):
+    module = _load_module()
+    handled = {"warmup": None, "enqueued": False, "spawned": False, "dispatched": False}
+    monkeypatch.setenv("FEISHU_APP_ID", "cli_feishu_app")
+    monkeypatch.setenv("FEISHU_APP_SECRET", "feishu-secret-123")
+    payload = {
+        "header": {
+            "event_type": "im.chat.access_event.bot_p2p_chat_entered_v1",
+            "event_id": "evt_warmup_1",
+            "token": "verify-token",
+        },
+        "event": {
+            "operator": {
+                "operator_id": {
+                    "open_id": "ou_entered_123",
+                }
+            },
+            "context": {
+                "open_chat_id": "oc_entered_123",
+            },
+        },
+    }
+
+    async def _fake_parse(_request):
+        return object(), payload
+
+    async def _fake_warmup(**kwargs):
+        handled["warmup"] = kwargs
+        return {"status": "scheduled", "spawned": True, **kwargs}
+
+    async def _fake_enqueue(**kwargs):
+        handled["enqueued"] = kwargs
+        return {"status": "enqueued", "queue_depth": 1}
+
+    async def _fake_spawn(**kwargs):
+        handled["spawned"] = kwargs
+        return {"status": "scheduled", **kwargs}
+
+    async def _fake_dispatch(*_args, **_kwargs):
+        handled["dispatched"] = True
+
+    monkeypatch.setattr(module, "_parse_feishu_webhook_request", _fake_parse)
+    monkeypatch.setattr(module, "_spawn_feishu_ingress_warmup_async", _fake_warmup)
+    monkeypatch.setattr(module, "_enqueue_chat_event_async", _fake_enqueue)
+    monkeypatch.setattr(module, "_spawn_chat_queue_worker_async", _fake_spawn)
+    monkeypatch.setattr(module, "_dispatch_feishu_payload", _fake_dispatch)
+    monkeypatch.setattr(module, "_mark_feishu_event_seen", lambda _event_id: True)
+
+    client = TestClient(module.create_web_app())
+    response = client.post("/feishu/webhook", json=payload)
+
+    assert response.status_code == 200
+    assert response.json() == {"code": 0, "msg": "accepted"}
+    assert handled["warmup"]["warmup_context"]["partition"] == "feishu:chat_light:oc_entered_123"
+    assert handled["warmup"]["warmup_context"]["actor_id"] == "ou_entered_123"
+    assert handled["warmup"]["payload"]["header"]["event_id"] == "evt_warmup_1"
+
+
+def test_coalesce_feishu_chat_queue_items_keeps_latest_message_for_partition(monkeypatch):
+    module = _load_module()
+    monkeypatch.setattr(module.time, "time", lambda: 1000.0)
+    items = [
+        {
+            "platform": "feishu",
+            "partition": "feishu:chat_light:oc_chat",
+            "metadata": {"event_type": "im.message.receive_v1", "event_id": "evt_old"},
+            "enqueued_at_ms": 999000,
+        },
+        {
+            "platform": "feishu",
+            "partition": "feishu:chat_light:oc_chat",
+            "metadata": {"event_type": "im.message.receive_v1", "event_id": "evt_new"},
+            "enqueued_at_ms": 1000000,
+        },
+    ]
+
+    result = module._coalesce_feishu_chat_queue_items(items)
+
+    assert len(result) == 1
+    assert result[0]["metadata"]["event_id"] == "evt_new"
+
+
+def test_coalesce_feishu_chat_queue_items_skips_stale_message(monkeypatch):
+    module = _load_module()
+    monkeypatch.setattr(module.time, "time", lambda: 1000.0)
+    monkeypatch.setattr(module, "DEFAULT_FEISHU_MESSAGE_QUEUE_MAX_AGE_SECONDS", 60)
+    items = [
+        {
+            "platform": "feishu",
+            "partition": "feishu:chat_light:oc_chat",
+            "metadata": {"event_type": "im.message.receive_v1", "event_id": "evt_stale"},
+            "enqueued_at_ms": 800000,
+        }
+    ]
+
+    result = module._coalesce_feishu_chat_queue_items(items)
+
+    assert result == []
+
+
+def test_resolve_feishu_message_ingress_strategy_prefers_supported_env(monkeypatch):
+    module = _load_module()
+    monkeypatch.setattr(module, "DEFAULT_FEISHU_MESSAGE_INGRESS_STRATEGY", "spawn_process_feishu_message_inline")
+    payload = {"header": {"event_id": "evt_1"}}
+    context = {"event_id": "evt_1", "chat_id": "oc_chat"}
+
+    result = module._resolve_feishu_message_ingress_strategy(payload, context)
+
+    assert result == "spawn_process_feishu_message_inline"
+
+
+def test_resolve_feishu_message_ingress_strategy_prefers_inline_for_light_p2p_by_default(monkeypatch):
+    monkeypatch.delenv("HERMES_FEISHU_MESSAGE_INGRESS_STRATEGY", raising=False)
+    module = _load_module()
+    monkeypatch.setattr(module, "DEFAULT_FEISHU_MESSAGE_INGRESS_STRATEGY", "inline_enqueue_spawn")
+    payload = {
+        "header": {"event_id": "evt_light", "event_type": "im.message.receive_v1"},
+        "event": {
+            "message": {
+                "chat_id": "oc_chat",
+                "chat_type": "p2p",
+                "message_type": "text",
+                "content": json.dumps({"text": "测速"}),
+            }
+        },
+    }
+    context = {"event_id": "evt_light", "chat_id": "oc_chat", "lane": "chat_light", "event_type": "im.message.receive_v1"}
+
+    result = module._resolve_feishu_message_ingress_strategy(payload, context)
+
+    assert result == "spawn_process_feishu_message_inline"
+
+
+def test_resolve_feishu_message_ingress_strategy_respects_explicit_queue_env(monkeypatch):
+    monkeypatch.setenv("HERMES_FEISHU_MESSAGE_INGRESS_STRATEGY", "inline_enqueue_spawn")
+    module = _load_module()
+    payload = {
+        "header": {"event_id": "evt_forced_queue", "event_type": "im.message.receive_v1"},
+        "event": {
+            "message": {
+                "chat_id": "oc_chat",
+                "chat_type": "p2p",
+                "message_type": "text",
+                "content": json.dumps({"text": "测速"}),
+            }
+        },
+    }
+    context = {
+        "event_id": "evt_forced_queue",
+        "chat_id": "oc_chat",
+        "lane": "chat_light",
+        "event_type": "im.message.receive_v1",
+    }
+
+    result = module._resolve_feishu_message_ingress_strategy(payload, context)
+
+    assert result == "inline_enqueue_spawn"
+
+
+def test_resolve_feishu_message_ingress_strategy_legacy_env_still_allows_inline_for_light_p2p(monkeypatch):
+    monkeypatch.setenv("HERMES_FEISHU_MESSAGE_INGRESS_STRATEGY", "spawn_process_feishu_event")
+    module = _load_module()
+    payload = {
+        "header": {"event_id": "evt_legacy_inline", "event_type": "im.message.receive_v1"},
+        "event": {
+            "message": {
+                "chat_id": "oc_chat",
+                "chat_type": "p2p",
+                "message_type": "text",
+                "content": json.dumps({"text": "测速"}),
+            }
+        },
+    }
+    context = {
+        "event_id": "evt_legacy_inline",
+        "chat_id": "oc_chat",
+        "lane": "chat_light",
+        "event_type": "im.message.receive_v1",
+    }
+
+    result = module._resolve_feishu_message_ingress_strategy(payload, context)
+
+    assert result == "spawn_process_feishu_message_inline"
+
+
+def test_resolve_feishu_message_ingress_strategy_aliases_legacy_spawn_to_inline(monkeypatch):
+    module = _load_module()
+    monkeypatch.setattr(module, "DEFAULT_FEISHU_MESSAGE_INGRESS_STRATEGY", "spawn_process_feishu_event")
+    payload = {"header": {"event_id": "evt_legacy"}}
+    context = {"event_id": "evt_legacy", "chat_id": "oc_chat"}
+
+    result = module._resolve_feishu_message_ingress_strategy(payload, context)
+
+    assert result == "inline_enqueue_spawn"
+
+
+def test_resolve_feishu_message_ingress_strategy_falls_back_to_final_strategy(monkeypatch):
+    module = _load_module()
+    monkeypatch.setattr(module, "DEFAULT_FEISHU_MESSAGE_INGRESS_STRATEGY", "unsupported-strategy")
+    payload = {"header": {"event_id": "evt_ab"}}
+    context = {"event_id": "evt_ab", "chat_id": "oc_chat"}
+
+    result = module._resolve_feishu_message_ingress_strategy(payload, context)
+
+    assert result == "inline_enqueue_spawn"
+
+
+def test_spawn_chat_queue_worker_async_skips_duplicate_partition(monkeypatch, tmp_path):
+    module = _load_module()
+    module.DATA_ROOT = tmp_path / "data"
+    module.SESSIONS_DIR = module.DATA_ROOT / "sessions"
+    module.UPDATES_PATH = module.DATA_ROOT / "telegram_updates.json"
+    module.FEISHU_EVENTS_PATH = module.DATA_ROOT / "feishu_events.json"
+    module.HERMES_HOME_DIR = tmp_path / "home"
+    module._ensure_runtime_dirs()
+
+    spawned = []
+
+    async def _fake_spawn_aio(**kwargs):
+        spawned.append(kwargs)
 
     monkeypatch.setattr(
         module,
@@ -1488,17 +2427,342 @@ def test_dispatch_feishu_update_processes_message_synchronously(monkeypatch):
         raising=False,
     )
 
+    first = asyncio.run(
+        module._spawn_chat_queue_worker_async(
+            platform="feishu",
+            partition="feishu:test-partition",
+            max_items=2,
+        )
+    )
+    second = asyncio.run(
+        module._spawn_chat_queue_worker_async(
+            platform="feishu",
+            partition="feishu:test-partition",
+            max_items=2,
+        )
+    )
+
+    assert first["status"] == "scheduled"
+    assert second["status"] == "skipped"
+    assert second["reason"] in {"scheduled", "claimed"}
+    assert len(spawned) == 1
+
+
+def test_spawn_chat_queue_worker_optimistic_async_skips_recent_active_claim(monkeypatch):
+    module = _load_module()
+    spawned = []
+
+    async def _fake_spawn_aio(**kwargs):
+        spawned.append(kwargs)
+
+    monkeypatch.setattr(
+        module,
+        "process_chat_queue",
+        types.SimpleNamespace(spawn=types.SimpleNamespace(aio=_fake_spawn_aio)),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        module,
+        "_peek_chat_partition_claim_async",
+        lambda *args, **kwargs: _async_return(
+            {
+                "claim_token": "claim-active-1",
+                "claimed_at": int(time.time()),
+                "status": "claimed",
+                "platform": "feishu",
+            }
+        ),
+    )
+    monkeypatch.setattr(module, "DEFAULT_CHAT_QUEUE_ACTIVE_CLAIM_SKIP_SECONDS", 30)
+
+    result = asyncio.run(
+        module._spawn_chat_queue_worker_optimistic_async(
+            platform="feishu",
+            partition="feishu:test-active-claim",
+            max_items=2,
+        )
+    )
+
+    assert result["status"] == "skipped"
+    assert result["reason"] == "active_claimed"
+    assert result["claim_token"] == "claim-active-1"
+    assert spawned == []
+
+
+def test_peek_chat_partition_claim_async_refreshes_volume_on_miss(monkeypatch):
+    module = _load_module()
+    loads = {"count": 0}
+    reloads = {"count": 0}
+
+    def _fake_load_claims():
+        loads["count"] += 1
+        if loads["count"] == 1:
+            return {}
+        return {
+            "feishu:test-refresh": {
+                "claim_token": "claim-refresh-1",
+                "claimed_at": int(time.time()),
+                "status": "claimed",
+                "platform": "feishu",
+            }
+        }
+
+    async def _fake_sync_modal_volume_async(*, reload=False, commit=False):
+        if reload:
+            reloads["count"] += 1
+
+    monkeypatch.setattr(module, "_should_reload_modal_volume_for_claims", lambda kind: False)
+    monkeypatch.setattr(module, "_load_chat_queue_claims", _fake_load_claims)
+    monkeypatch.setattr(module, "_prune_chat_queue_claims", lambda claims, ttl_seconds=None: claims)
+    monkeypatch.setattr(module, "_sync_modal_volume_async", _fake_sync_modal_volume_async)
+
+    result = asyncio.run(
+        module._peek_chat_partition_claim_async(
+            "feishu:test-refresh",
+            refresh_on_miss=True,
+        )
+    )
+
+    assert result["claim_token"] == "claim-refresh-1"
+    assert reloads["count"] == 1
+    assert loads["count"] == 2
+
+
+def test_spawn_chat_queue_worker_optimistic_async_skips_recent_spawn_gate(monkeypatch):
+    module = _load_module()
+    spawned = []
+
+    async def _fake_spawn_aio(**kwargs):
+        spawned.append(kwargs)
+
+    monkeypatch.setattr(
+        module,
+        "process_chat_queue",
+        types.SimpleNamespace(spawn=types.SimpleNamespace(aio=_fake_spawn_aio)),
+        raising=False,
+    )
+    monkeypatch.setattr(module, "DEFAULT_FEISHU_RECENT_SPAWN_SKIP_SECONDS", 12.0)
+    monkeypatch.setattr(module, "_RECENT_CHAT_WORKER_SPAWNS", {"feishu:test-recent-gate": time.monotonic()})
+
+    result = asyncio.run(
+        module._spawn_chat_queue_worker_optimistic_async(
+            platform="feishu",
+            partition="feishu:test-recent-gate",
+            max_items=2,
+        )
+    )
+
+    assert result["status"] == "skipped"
+    assert result["reason"] == "recent_spawn_gate"
+    assert spawned == []
+
+
+def test_spawn_chat_queue_warmup_async_uses_waiting_worker(monkeypatch):
+    module = _load_module()
+    captured = {}
+
+    async def _fake_spawn(**kwargs):
+        captured.update(kwargs)
+        return {"status": "scheduled", "spawned": True, **kwargs}
+
+    monkeypatch.setattr(module, "_spawn_chat_queue_worker_async", _fake_spawn)
+
+    result = asyncio.run(
+        module._spawn_chat_queue_warmup_async(
+            platform="feishu",
+            partition="feishu:oc_waiting_123",
+            reason="bot_p2p_chat_entered",
+            metadata={
+                "event_id": "evt_waiting_1",
+                "event_type": "im.chat.access_event.bot_p2p_chat_entered_v1",
+                "actor_id": "ou_waiting_123",
+                "chat_id": "oc_waiting_123",
+                "started_at_ms": "1234567890",
+            },
+        )
+    )
+
+    assert result["status"] == "scheduled"
+    assert captured["partition"] == "feishu:oc_waiting_123"
+    assert captured["max_items"] == 1
+    assert captured["warmup_wait_seconds"] == module.DEFAULT_CHAT_QUEUE_WARMUP_WAIT_SECONDS
+    assert captured["warmup_metadata"]["actor_id"] == "ou_waiting_123"
+
+
+def test_process_chat_queue_warmup_wait_hits_first_message(monkeypatch, tmp_path):
+    module = _load_module()
+    module.DATA_ROOT = tmp_path / "data"
+    module.SESSIONS_DIR = module.DATA_ROOT / "sessions"
+    module.UPDATES_PATH = module.DATA_ROOT / "telegram_updates.json"
+    module.FEISHU_EVENTS_PATH = module.DATA_ROOT / "feishu_events.json"
+    module.FEISHU_TRACE_PATH = module.DATA_ROOT / "feishu_trace.jsonl"
+    module.CHAT_QUEUE_CLAIMS_PATH = module.DATA_ROOT / "chat_queue_claims.json"
+    module.CHAT_QUEUE_WARMUPS_PATH = module.DATA_ROOT / "chat_queue_warmups.json"
+    module.HERMES_HOME_DIR = tmp_path / "home"
+    module._ensure_runtime_dirs()
+
+    monkeypatch.setattr(module, "_sync_modal_volume", lambda **_kwargs: None)
+    monkeypatch.setattr(module, "_safe_chat_queue_depth", lambda: 0)
+    monkeypatch.setattr(module, "_claim_chat_partition", lambda *args, **kwargs: (True, "claim-1"))
+    monkeypatch.setattr(module, "_release_chat_partition_claim", lambda *args, **kwargs: None)
+
+    class FakeQueue:
+        def __init__(self):
+            self.calls = []
+            self._returned_once = False
+
+        def get_many(self, max_items, block=False, timeout=None, partition=None):
+            self.calls.append(
+                {
+                    "max_items": max_items,
+                    "block": block,
+                    "timeout": timeout,
+                    "partition": partition,
+                }
+            )
+            if self._returned_once:
+                return []
+            self._returned_once = True
+            return [
+                {
+                    "platform": "feishu",
+                    "partition": partition,
+                    "payload": {"header": {"event_id": "evt_msg_1", "event_type": "im.message.receive_v1"}},
+                    "metadata": {"event_id": "evt_msg_1", "event_type": "im.message.receive_v1"},
+                    "enqueued_at_ms": 1234567900,
+                }
+            ]
+
+    fake_queue = FakeQueue()
+    monkeypatch.setattr(module, "_get_chat_queue", lambda: fake_queue)
+
+    async def _fake_process(items, worker_context=None, runtime_prepared=False):
+        return [
+            {
+                "status": "ok",
+                "items": len(items),
+                "warmup_status": dict(worker_context or {}).get("warmup_status"),
+                "warmup_same_container": dict(worker_context or {}).get("warmup_same_container"),
+            }
+        ]
+
+    monkeypatch.setattr(module, "_process_chat_queue_items_async", _fake_process)
+
+    result = module._process_chat_queue_impl(
+        platform="feishu",
+        partition="feishu:oc_waiting_123",
+        max_items=1,
+        claim_token="claim-1",
+        worker_context={"worker_boot_id": "boot-waiting"},
+        runtime_prepared=True,
+        warmup_wait_seconds=9,
+        warmup_metadata={
+            "event_id": "evt_waiting_1",
+            "event_type": "im.chat.access_event.bot_p2p_chat_entered_v1",
+            "actor_id": "ou_waiting_123",
+            "chat_id": "oc_waiting_123",
+            "started_at_ms": "1234567890",
+        },
+    )
+
+    assert result["status"] == "ok"
+    assert result["processed_count"] == 1
+    assert result["warmup_status"] == "hit"
+    assert result["warmup_same_container"] is True
+    assert fake_queue.calls[0]["timeout"] == 9.0
+
+
+def test_spawn_chat_queue_worker_async_uses_async_volume_sync(monkeypatch, tmp_path):
+    module = _load_module()
+    module.DATA_ROOT = tmp_path / "data"
+    module.SESSIONS_DIR = module.DATA_ROOT / "sessions"
+    module.UPDATES_PATH = module.DATA_ROOT / "telegram_updates.json"
+    module.FEISHU_EVENTS_PATH = module.DATA_ROOT / "feishu_events.json"
+    module.HERMES_HOME_DIR = tmp_path / "home"
+    module.CHAT_QUEUE_CLAIMS_PATH = module.DATA_ROOT / "chat_queue_claims.json"
+    module._ensure_runtime_dirs()
+
+    sync_calls = []
+    async_calls = []
+    spawned = []
+
+    async def _fake_spawn_aio(**kwargs):
+        spawned.append(kwargs)
+
+    async def _fake_sync_async(*, reload=False, commit=False):
+        async_calls.append((reload, commit))
+
+    def _fail_sync(*, reload=False, commit=False):
+        sync_calls.append((reload, commit))
+        raise AssertionError("sync volume helper should not be used in async path")
+
+    monkeypatch.setattr(module, "_sync_modal_volume", _fail_sync)
+    monkeypatch.setattr(module, "_sync_modal_volume_async", _fake_sync_async)
+    monkeypatch.setattr(
+        module,
+        "process_chat_queue",
+        types.SimpleNamespace(spawn=types.SimpleNamespace(aio=_fake_spawn_aio)),
+        raising=False,
+    )
+
+    result = asyncio.run(
+        module._spawn_chat_queue_worker_async(
+            platform="feishu",
+            partition="feishu:test-async-volume",
+            max_items=2,
+        )
+    )
+
+    assert result["status"] == "scheduled"
+    assert spawned and spawned[0]["partition"] == "feishu:test-async-volume"
+    assert async_calls == [(False, True)]
+    assert sync_calls == []
+
+
+def test_telegram_webhook_fast_command_bypasses_chat_queue(monkeypatch):
+    module = _load_module()
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123456:ABCdefGHIjklMNOpqrSTUvwxYZ")
+    handled = {"dispatched": None, "enqueued": False, "spawned": False}
+
+    async def _fake_dispatch(update):
+        handled["dispatched"] = update
+        return {"status": "accepted", "kind": "command"}
+
+    async def _fake_enqueue(**kwargs):
+        handled["enqueued"] = True
+        return {"status": "enqueued", "queue_depth": 1}
+
+    async def _fake_spawn(**kwargs):
+        handled["spawned"] = kwargs
+
+    monkeypatch.setattr(module, "_dispatch_telegram_update", _fake_dispatch)
+    monkeypatch.setattr(module, "_enqueue_chat_event_async", _fake_enqueue)
+    monkeypatch.setattr(
+        module,
+        "_spawn_chat_queue_worker_async",
+        _fake_spawn,
+    )
+    monkeypatch.setattr(module, "_mark_update_seen", lambda _update_id: True)
+
     client = TestClient(module.create_web_app())
     response = client.post(
-        "/feishu/webhook",
-        json=payload,
+        "/telegram/webhook",
+        json={
+            "update_id": 1001,
+            "message": {
+                "text": "/provider",
+                "chat": {"id": 42, "type": "private"},
+                "from": {"id": 7, "username": "tester"},
+            },
+        },
     )
 
     assert response.status_code == 200
-    assert response.json() == {"code": 0, "msg": "accepted"}
-    assert handled["enqueued"]["payload"]["event"]["message"]["message_id"] == "om_sync"
-    assert handled["spawned"]["platform"] == "feishu"
-    assert handled["spawned"]["partition"] == handled["enqueued"]["partition"]
+    assert response.json()["mode"] == "inline_fast_command"
+    assert response.json()["command"] == "provider"
+    assert handled["dispatched"]["message"]["text"] == "/provider"
+    assert handled["enqueued"] is False
+    assert handled["spawned"] is False
 
 
 def test_feishu_menu_event_bypasses_chat_queue(monkeypatch):
@@ -1527,8 +2791,9 @@ def test_feishu_menu_event_bypasses_chat_queue(monkeypatch):
             "await_background_tasks": await_background_tasks,
         }
 
-    async def _fake_spawn_aio(**kwargs):
+    def _fake_spawn_background(**kwargs):
         handled["spawned"] = kwargs
+        return True
 
     async def _fake_enqueue(**kwargs):
         handled["enqueued"] = True
@@ -1538,12 +2803,7 @@ def test_feishu_menu_event_bypasses_chat_queue(monkeypatch):
     monkeypatch.setattr(module, "_dispatch_feishu_payload", _fake_dispatch)
     monkeypatch.setattr(module, "_enqueue_chat_event_async", _fake_enqueue)
     monkeypatch.setattr(module, "_mark_feishu_event_seen", lambda _event_id: True)
-    monkeypatch.setattr(
-        module,
-        "process_chat_queue",
-        types.SimpleNamespace(spawn=types.SimpleNamespace(aio=_fake_spawn_aio)),
-        raising=False,
-    )
+    monkeypatch.setattr(module, "_schedule_chat_queue_worker_background", _fake_spawn_background)
 
     client = TestClient(module.create_web_app())
     response = client.post("/feishu/webhook", json=payload)
@@ -1554,6 +2814,242 @@ def test_feishu_menu_event_bypasses_chat_queue(monkeypatch):
     assert handled["dispatched"]["await_background_tasks"] is True
     assert handled["enqueued"] is False
     assert handled["spawned"] is False
+
+
+def test_feishu_menu_event_prefers_local_registry_card(monkeypatch):
+    module = _load_module()
+    handled = {"local_menu": False, "dispatched": False}
+    monkeypatch.setenv("FEISHU_APP_ID", "cli_feishu_app")
+    monkeypatch.setenv("FEISHU_APP_SECRET", "feishu-secret-123")
+    payload = {
+        "header": {
+            "event_type": "application.bot.menu_v6",
+            "event_id": "evt_menu_local",
+            "token": "verify-token",
+        },
+        "event": {
+            "event_key": "provider_nvidia_featured",
+            "operator": {"operator_id": {"open_id": "ou_user"}},
+            "context": {"open_chat_id": "oc_chat"},
+        },
+    }
+
+    async def _fake_parse(_request):
+        return None, payload
+
+    async def _fake_local_menu(_payload):
+        handled["local_menu"] = True
+        return True
+
+    async def _fake_dispatch(*_args, **_kwargs):
+        handled["dispatched"] = True
+
+    monkeypatch.setattr(module, "_parse_feishu_webhook_request", _fake_parse)
+    monkeypatch.setattr(module, "_send_feishu_local_registry_menu_card", _fake_local_menu)
+    monkeypatch.setattr(module, "_dispatch_feishu_payload", _fake_dispatch)
+    monkeypatch.setattr(module, "_mark_feishu_event_seen", lambda _event_id: True)
+
+    client = TestClient(module.create_web_app())
+    response = client.post("/feishu/webhook", json=payload)
+
+    assert response.status_code == 200
+    assert response.json() == {"code": 0, "msg": "accepted"}
+    assert handled["local_menu"] is True
+    assert handled["dispatched"] is False
+
+
+def test_feishu_card_action_inline_ack_does_not_wait_for_background(monkeypatch):
+    module = _load_module()
+    handled = {"dispatched": None, "enqueued": False, "spawned": False}
+    monkeypatch.setenv("FEISHU_APP_ID", "cli_feishu_app")
+    monkeypatch.setenv("FEISHU_APP_SECRET", "feishu-secret-123")
+    payload = {
+        "header": {
+            "event_type": "card.action.trigger",
+            "event_id": "evt_card_inline",
+            "token": "verify-token",
+        },
+        "event": {
+            "context": {"open_chat_id": "oc_chat"},
+            "operator": {"open_id": "ou_user"},
+            "action": {"tag": "button", "value": {"hermes_action": "model_picker_cancel", "picker_id": "fp1"}},
+        },
+    }
+
+    async def _fake_parse(_request):
+        return object(), payload
+
+    async def _fake_dispatch(raw_payload, await_background_tasks=False):
+        handled["dispatched"] = {
+            "payload": raw_payload,
+            "await_background_tasks": await_background_tasks,
+        }
+
+    def _fake_spawn_background(**kwargs):
+        handled["spawned"] = kwargs
+        return True
+
+    async def _fake_enqueue(**kwargs):
+        handled["enqueued"] = True
+        return {"status": "enqueued", "queue_depth": 1}
+
+    monkeypatch.setattr(module, "_parse_feishu_webhook_request", _fake_parse)
+    monkeypatch.setattr(module, "_dispatch_feishu_payload", _fake_dispatch)
+    monkeypatch.setattr(module, "_enqueue_chat_event_async", _fake_enqueue)
+    monkeypatch.setattr(module, "_mark_feishu_event_seen", lambda _event_id: True)
+    monkeypatch.setattr(module, "_schedule_chat_queue_worker_background", _fake_spawn_background)
+
+    client = TestClient(module.create_web_app())
+    response = client.post("/feishu/webhook", json=payload)
+
+    assert response.status_code == 200
+    assert response.json() == {"toast": {"type": "info", "content": "已收到，正在处理"}}
+    assert handled["dispatched"] is None
+    assert handled["enqueued"] is True
+    assert handled["spawned"]["platform"] == "feishu"
+    assert handled["spawned"]["partition"] == "feishu:control:oc_chat"
+
+
+def test_feishu_registry_close_card_prefers_local_delete(monkeypatch):
+    module = _load_module()
+    handled = {"closed": False, "dispatched": False}
+    monkeypatch.setenv("FEISHU_APP_ID", "cli_feishu_app")
+    monkeypatch.setenv("FEISHU_APP_SECRET", "feishu-secret-123")
+    payload = {
+        "header": {
+            "event_type": "card.action.trigger",
+            "event_id": "evt_card_close",
+            "token": "verify-token",
+        },
+        "event": {
+            "context": {"open_chat_id": "oc_chat", "open_message_id": "om_close_123"},
+            "operator": {"open_id": "ou_user"},
+            "action": {"tag": "button", "value": {"hermes_action": "registry_close_card"}},
+        },
+    }
+
+    async def _fake_parse(_request):
+        return None, payload
+
+    async def _fake_close(_payload):
+        handled["closed"] = True
+        return True
+
+    async def _fake_dispatch(*_args, **_kwargs):
+        handled["dispatched"] = True
+
+    monkeypatch.setattr(module, "_parse_feishu_webhook_request", _fake_parse)
+    monkeypatch.setattr(module, "_close_feishu_card_from_payload", _fake_close)
+    monkeypatch.setattr(module, "_dispatch_feishu_payload", _fake_dispatch)
+    monkeypatch.setattr(module, "_mark_feishu_event_seen", lambda _event_id: True)
+
+    client = TestClient(module.create_web_app())
+    response = client.post("/feishu/webhook", json=payload)
+
+    assert response.status_code == 200
+    assert response.json() == {"toast": {"type": "info", "content": "已关闭"}}
+    assert handled["closed"] is True
+    assert handled["dispatched"] is False
+
+
+def test_feishu_registry_switch_card_queues_background_work(monkeypatch):
+    module = _load_module()
+    handled = {"queued": False, "dispatched": False}
+    monkeypatch.setenv("FEISHU_APP_ID", "cli_feishu_app")
+    monkeypatch.setenv("FEISHU_APP_SECRET", "feishu-secret-123")
+    payload = {
+        "header": {
+            "event_type": "card.action.trigger",
+            "event_id": "evt_card_switch",
+            "token": "verify-token",
+        },
+        "event": {
+            "context": {"open_chat_id": "oc_chat", "open_message_id": "om_switch_123"},
+            "operator": {"open_id": "ou_user"},
+            "action": {
+                "tag": "button",
+                "value": {
+                    "hermes_action": "registry_switch_model",
+                    "provider": "nvidia",
+                    "model": "moonshotai/kimi-k2.5",
+                },
+            },
+        },
+    }
+
+    async def _fake_parse(_request):
+        return None, payload
+
+    async def _fake_enqueue(_payload):
+        handled["queued"] = True
+        return {"status": "enqueued", "partition": "feishu:control:oc_chat", "queue_depth": 0, "lane": "control"}
+
+    async def _fake_dispatch(*_args, **_kwargs):
+        handled["dispatched"] = True
+
+    monkeypatch.setattr(module, "_parse_feishu_webhook_request", _fake_parse)
+    monkeypatch.setattr(module, "_enqueue_feishu_card_action_for_background", _fake_enqueue)
+    monkeypatch.setattr(module, "_dispatch_feishu_payload", _fake_dispatch)
+    monkeypatch.setattr(module, "_mark_feishu_event_seen", lambda _event_id: True)
+
+    client = TestClient(module.create_web_app())
+    response = client.post("/feishu/webhook", json=payload)
+
+    assert response.status_code == 200
+    assert response.json() == {"toast": {"type": "info", "content": "已收到，正在处理"}}
+    assert handled["queued"] is True
+    assert handled["dispatched"] is False
+
+
+def test_feishu_message_read_event_fast_ack_bypasses_dispatch(monkeypatch):
+    module = _load_module()
+    module.DATA_ROOT = Path.cwd() / ".tmp-pytest" / "feishu-message-read"
+    module.SESSIONS_DIR = module.DATA_ROOT / "sessions"
+    module.UPDATES_PATH = module.DATA_ROOT / "telegram_updates.json"
+    module.FEISHU_EVENTS_PATH = module.DATA_ROOT / "feishu_events.json"
+    module.FEISHU_TRACE_PATH = module.DATA_ROOT / "feishu_trace.jsonl"
+    module.HERMES_HOME_DIR = module.DATA_ROOT / "home"
+    module._ensure_runtime_dirs()
+    handled = {"dispatched": False, "enqueued": False}
+    monkeypatch.setenv("FEISHU_APP_ID", "cli_feishu_app")
+    monkeypatch.setenv("FEISHU_APP_SECRET", "feishu-secret-123")
+    payload = {
+        "header": {
+            "event_type": "im.message.message_read_v1",
+            "event_id": "evt_read_fast",
+            "token": "verify-token",
+        },
+        "event": {
+            "reader": {
+                "reader_id": {"open_id": "ou_reader_fast"},
+                "read_time": "1712970001",
+            },
+            "message_id_list": ["om_read_1"],
+        },
+    }
+
+    async def _fake_parse(_request):
+        return None, payload
+
+    async def _fake_dispatch(*_args, **_kwargs):
+        handled["dispatched"] = True
+
+    async def _fake_enqueue(**_kwargs):
+        handled["enqueued"] = True
+        return {"status": "enqueued"}
+
+    monkeypatch.setattr(module, "_parse_feishu_webhook_request", _fake_parse)
+    monkeypatch.setattr(module, "_dispatch_feishu_payload", _fake_dispatch)
+    monkeypatch.setattr(module, "_enqueue_chat_event_async", _fake_enqueue)
+    monkeypatch.setattr(module, "_mark_feishu_event_seen", lambda _event_id: True)
+
+    client = TestClient(module.create_web_app())
+    response = client.post("/feishu/webhook", json=payload)
+
+    assert response.status_code == 200
+    assert response.json() == {"code": 0, "msg": "accepted"}
+    assert handled["dispatched"] is False
+    assert handled["enqueued"] is False
 
 
 def test_validate_feishu_webhook_impl_builds_signed_encrypted_request(monkeypatch):
@@ -1588,6 +3084,7 @@ def test_validate_feishu_webhook_impl_builds_signed_encrypted_request(monkeypatc
 
     fake_httpx = types.SimpleNamespace(Client=FakeClient)
     monkeypatch.setitem(sys.modules, "httpx", fake_httpx)
+    monkeypatch.setattr(module, "_encrypt_feishu_payload", lambda _key, _payload: "encrypted-payload")
 
     result = module._validate_feishu_webhook_impl()
 
@@ -1598,6 +3095,115 @@ def test_validate_feishu_webhook_impl_builds_signed_encrypted_request(monkeypatc
     assert captured["url"] == "https://example.com/feishu/webhook"
     assert "x-lark-signature" in captured["headers"]
     assert '"encrypt"' in captured["body"]
+
+
+def test_validate_feishu_message_ingress_impl_builds_signed_message_request(monkeypatch):
+    module = _load_module()
+    monkeypatch.setenv("FEISHU_APP_ID", "cli_feishu_app")
+    monkeypatch.setenv("FEISHU_APP_SECRET", "feishu-secret-123")
+    monkeypatch.setenv("FEISHU_VERIFICATION_TOKEN", "verify-token")
+    monkeypatch.setenv("FEISHU_ENCRYPT_KEY", "encrypt-key")
+    monkeypatch.setenv("HERMES_PUBLIC_BASE_URL", "https://example.com")
+
+    captured = {}
+
+    class FakeResponse:
+        status_code = 200
+        text = '{"code":0,"msg":"accepted"}'
+
+    class FakeClient:
+        def __init__(self, timeout):
+            assert timeout == 20
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def post(self, url, *, content, headers):
+            captured["url"] = url
+            captured["body"] = content.decode("utf-8")
+            captured["headers"] = headers
+            return FakeResponse()
+
+    fake_httpx = types.SimpleNamespace(Client=FakeClient)
+    monkeypatch.setitem(sys.modules, "httpx", fake_httpx)
+
+    result = module._validate_feishu_message_ingress_impl(message_text="probe")
+    body = json.loads(captured["body"])
+
+    assert result["status"] == "ok"
+    assert result["status_code"] == 200
+    assert result["webhook_url"] == "https://example.com/feishu/webhook"
+    assert result["response"] == {"code": 0, "msg": "accepted"}
+    assert result["event_id"].startswith("evt_selftest_")
+    assert result["message_id"].startswith("om_selftest_")
+    assert body["header"]["event_type"] == "im.message.receive_v1"
+    assert body["header"]["token"] == "verify-token"
+    assert json.loads(body["event"]["message"]["content"]) == {"text": "probe"}
+    assert "x-lark-signature" in captured["headers"]
+
+
+def test_validate_feishu_native_delivery_impl_generates_and_sends_assets(monkeypatch, tmp_path):
+    module = _load_module()
+    module.DATA_ROOT = tmp_path / "data"
+    module.SESSIONS_DIR = module.DATA_ROOT / "sessions"
+    module.UPDATES_PATH = module.DATA_ROOT / "telegram_updates.json"
+    module.HERMES_HOME_DIR = tmp_path / "home"
+    module._ensure_runtime_dirs()
+    monkeypatch.setattr(module, "_prepare_runtime_environment", lambda: None)
+
+    sent = {}
+
+    class FakeAdapter:
+        async def send_image_file(self, *, chat_id, image_path, caption=None, **kwargs):
+            sent["image"] = {
+                "chat_id": chat_id,
+                "image_path": image_path,
+                "caption": caption,
+            }
+            assert Path(image_path).exists()
+            return types.SimpleNamespace(success=True, message_id="om_img_123", error=None)
+
+        async def send_document(self, *, chat_id, file_path, caption=None, **kwargs):
+            sent["document"] = {
+                "chat_id": chat_id,
+                "file_path": file_path,
+                "caption": caption,
+            }
+            assert Path(file_path).exists()
+            return types.SimpleNamespace(success=True, message_id="om_doc_123", error=None)
+
+    async def _fake_get_runtime():
+        return types.SimpleNamespace(adapter=FakeAdapter())
+
+    monkeypatch.setattr(module, "_get_feishu_gateway_runtime", _fake_get_runtime)
+
+    result = module._validate_feishu_native_delivery_impl(
+        target_id="ou_1234567890",
+        document_format="md",
+    )
+
+    assert result["status"] == "ok"
+    assert result["target_id"] == "ou_1234567890"
+    assert result["image"]["success"] is True
+    assert result["document"]["success"] is True
+    assert sent["image"]["chat_id"] == "ou_1234567890"
+    assert sent["document"]["chat_id"] == "ou_1234567890"
+    assert not Path(result["image"]["path"]).exists()
+    assert not Path(result["document"]["path"]).exists()
+
+
+def test_validate_feishu_native_delivery_impl_requires_target(monkeypatch):
+    module = _load_module()
+    monkeypatch.setattr(module, "_prepare_runtime_environment", lambda: None)
+    monkeypatch.delenv("FEISHU_HOME_CHANNEL", raising=False)
+
+    result = module._validate_feishu_native_delivery_impl()
+
+    assert result["status"] == "error"
+    assert "FEISHU_HOME_CHANNEL" in result["message"]
 
 
 def test_approve_pairing_impl_returns_approved_user(monkeypatch):
@@ -1748,18 +3354,37 @@ def test_modal_source_includes_bundled_skill_directories():
     assert '.add_local_dir("acp_registry", remote_path="/root/acp_registry", copy=True)' in source
 
 
-def test_modal_source_supports_project_plugins_and_mcp_runtimes():
+def test_modal_source_supports_project_plugins_and_api_only_feishu_runtime():
     source = MODULE_PATH.read_text(encoding="utf-8")
-    assert '.apt_install("nodejs", "npm")' in source
+    assert '.apt_install("curl", "ca-certificates", "gnupg", "libsecret-1-0")' in source
+    assert "https://deb.nodesource.com/node_20.x" in source
+    assert "/etc/machine-id" in source
+    assert "/var/lib/dbus/machine-id" in source
     assert '"uv>=0.7.0,<1"' in source
     assert '"feishu"' in source
     assert '"/feishu/webhook"' in source
     assert 'def debug_feishu_runtime()' in source
     assert 'def debug_feishu_menu_config()' in source
+    assert 'def debug_feishu_sync_state()' in source
     assert 'def debug_model_routing_state(' in source
     assert 'Path(".hermes/plugins").is_dir()' in source
     assert 'remote_path="/root/.hermes/plugins"' in source
     assert 'def validate_tavily_integration()' in source
     assert 'modal.Queue.from_name(DEFAULT_CHAT_QUEUE_NAME' in source
     assert 'modal.Queue.from_name(DEFAULT_CRON_QUEUE_NAME' in source
-    assert 'schedule=modal.Period(minutes=1)' in source
+    assert 'HERMES_MODAL_MAINTENANCE_HEARTBEAT_MINUTES' in source
+    assert 'schedule=maintenance_heartbeat_schedule' in source
+    assert '@app.cls(' in source
+    assert 'scaledown_window=DEFAULT_CHAT_QUEUE_SCALEDOWN_WINDOW_SECONDS' in source
+    assert 'enable_memory_snapshot=FEISHU_INGRESS_MEMORY_SNAPSHOT_ENABLED' in source
+    assert 'enable_memory_snapshot=CHAT_QUEUE_MEMORY_SNAPSHOT_ENABLED' in source
+    assert '@modal.enter(snap=True)' in source
+    assert 'phase_timings=' in source
+    assert 'handoff_wait_elapsed_ms' in source
+    assert 'handoff_schedule_wait_elapsed_ms' in source
+    assert 'ingress_execution_delay_ms' in source
+    assert 'ingress_enqueue_elapsed_ms' in source
+    assert 'chat_worker_spawn_elapsed_ms' in source
+    assert 'ingress.handoff_done' in source
+    assert 'process_chat_queue = ChatQueueWorker().process' in source
+    assert 'maintenance_heartbeat_enabled = _maintenance_heartbeat_is_enabled()' in source

@@ -85,6 +85,18 @@ class SkillBundle:
     metadata: Dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass
+class MarketplaceMigrationCandidate:
+    """A normalized marketplace comparison row used by automation/planning."""
+    category: str
+    rank: int
+    skill: SkillMeta
+    coverage_status: str  # "covered" | "gap"
+    task_status: str      # "done" | "pending" | "in_progress" | "blocked"
+    local_matches: List[Dict[str, Any]] = field(default_factory=list)
+    notes: str = ""
+
+
 def _normalize_bundle_path(path_value: str, *, field_name: str, allow_nested: bool) -> str:
     """Normalize and validate bundle-controlled paths before touching disk."""
     if not isinstance(path_value, str):
@@ -1370,6 +1382,33 @@ class ClawHubSource(SkillSource):
     """
 
     BASE_URL = "https://clawhub.ai/api/v1"
+    _POPULARITY_KEYS = (
+        "installs",
+        "weeklyInstalls",
+        "monthlyInstalls",
+        "downloads",
+        "stars",
+        "likes",
+        "uses",
+        "favorites",
+        "score",
+        "popularity",
+        "trendingScore",
+    )
+    _GENERIC_CATEGORY_TAGS = frozenset({
+        "agent",
+        "agents",
+        "assistant",
+        "assistants",
+        "skill",
+        "skills",
+        "plugin",
+        "plugins",
+        "featured",
+        "popular",
+        "trending",
+        "latest",
+    })
 
     def source_id(self) -> str:
         return "clawhub"
@@ -1384,6 +1423,87 @@ class ClawHubSource(SkillSource):
         if isinstance(tags, dict):
             return [str(k) for k in tags if str(k) != "latest"]
         return []
+
+    @classmethod
+    def _extract_numeric_extra(cls, item: Dict[str, Any]) -> Dict[str, Any]:
+        extra: Dict[str, Any] = {}
+        for key in cls._POPULARITY_KEYS:
+            value = item.get(key)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                extra[key] = value
+
+        for key in ("category", "type"):
+            value = item.get(key)
+            if isinstance(value, str) and value.strip():
+                extra[key] = value.strip()
+
+        return extra
+
+    @classmethod
+    def _meta_from_item(cls, item: Dict[str, Any]) -> Optional[SkillMeta]:
+        slug = item.get("slug")
+        if not isinstance(slug, str) or not slug:
+            return None
+
+        display_name = item.get("displayName") or item.get("name") or slug
+        summary = item.get("summary") or item.get("description") or ""
+        tags = cls._normalize_tags(item.get("tags", []))
+        return SkillMeta(
+            name=str(display_name),
+            description=str(summary),
+            source="clawhub",
+            identifier=slug,
+            trust_level="community",
+            tags=tags,
+            extra=cls._extract_numeric_extra(item),
+        )
+
+    @classmethod
+    def _popularity_sort_key(cls, meta: SkillMeta) -> tuple:
+        extra = meta.extra if isinstance(meta.extra, dict) else {}
+        score = tuple(-float(extra.get(key, 0) or 0) for key in cls._POPULARITY_KEYS)
+        return score + (meta.name.lower(), meta.identifier.lower())
+
+    @classmethod
+    def _category_names(cls, meta: SkillMeta) -> List[str]:
+        categories: List[str] = []
+        extra = meta.extra if isinstance(meta.extra, dict) else {}
+
+        explicit_category = extra.get("category")
+        if isinstance(explicit_category, str) and explicit_category.strip():
+            categories.append(explicit_category.strip().lower())
+
+        for tag in meta.tags:
+            normalized = str(tag).strip().lower()
+            if not normalized or normalized in cls._GENERIC_CATEGORY_TAGS:
+                continue
+            if normalized not in categories:
+                categories.append(normalized)
+
+        return categories
+
+    def top_by_category(
+        self,
+        *,
+        limit_per_category: int = 10,
+        catalog: Optional[List[SkillMeta]] = None,
+    ) -> Dict[str, List[SkillMeta]]:
+        """Group catalog skills by category/tag and rank each category by popularity."""
+        catalog = catalog if catalog is not None else self._load_catalog_index()
+        grouped: Dict[str, List[SkillMeta]] = {}
+
+        for meta in catalog:
+            for category in self._category_names(meta):
+                grouped.setdefault(category, []).append(meta)
+
+        ranked: Dict[str, List[SkillMeta]] = {}
+        for category, entries in grouped.items():
+            ranked[category] = sorted(
+                self._dedupe_results(entries),
+                key=self._popularity_sort_key,
+            )[:limit_per_category]
+
+        return dict(sorted(ranked.items(), key=lambda item: item[0]))
 
     @staticmethod
     def _coerce_skill_payload(data: Any) -> Optional[Dict[str, Any]]:
@@ -1566,20 +1686,9 @@ class ClawHubSource(SkillSource):
 
         results = []
         for item in skills_data[:limit]:
-            slug = item.get("slug")
-            if not slug:
-                continue
-            display_name = item.get("displayName") or item.get("name") or slug
-            summary = item.get("summary") or item.get("description") or ""
-            tags = self._normalize_tags(item.get("tags", []))
-            results.append(SkillMeta(
-                name=display_name,
-                description=summary,
-                source="clawhub",
-                identifier=slug,
-                trust_level="community",
-                tags=tags,
-            ))
+            meta = self._meta_from_item(item)
+            if meta:
+                results.append(meta)
 
         final_results = self._finalize_search_results(query, results, limit)
         _write_index_cache(cache_key, [_skill_meta_to_dict(s) for s in final_results])
@@ -1687,21 +1796,11 @@ class ClawHubSource(SkillSource):
                 break
 
             for item in items:
-                slug = item.get("slug")
-                if not isinstance(slug, str) or not slug or slug in seen:
+                meta = self._meta_from_item(item)
+                if meta is None or meta.identifier in seen:
                     continue
-                seen.add(slug)
-                display_name = item.get("displayName") or item.get("name") or slug
-                summary = item.get("summary") or item.get("description") or ""
-                tags = self._normalize_tags(item.get("tags", []))
-                results.append(SkillMeta(
-                    name=display_name,
-                    description=summary,
-                    source="clawhub",
-                    identifier=slug,
-                    trust_level="community",
-                    tags=tags,
-                ))
+                seen.add(meta.identifier)
+                results.append(meta)
 
             cursor = data.get("nextCursor") if isinstance(data, dict) else None
             if not isinstance(cursor, str) or not cursor:
@@ -2293,7 +2392,11 @@ def _read_index_cache(key: str) -> Optional[Any]:
 
 def _write_index_cache(key: str, data: Any) -> None:
     """Write data to cache."""
-    INDEX_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        INDEX_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        logger.debug("Could not create cache directory %s: %s", INDEX_CACHE_DIR, e)
+        return
     # Ensure .ignore exists so ripgrep (and tools respecting .ignore) skip
     # this directory.  Cache files contain unvetted community content that
     # could include adversarial text (prompt injection via catalog entries).
@@ -2323,6 +2426,305 @@ def _skill_meta_to_dict(meta: SkillMeta) -> dict:
         "tags": meta.tags,
         "extra": meta.extra,
     }
+
+
+_BUNDLED_SKILL_ROOTS = ("skills", "optional-skills")
+_MARKETPLACE_QUEUE_FINAL_STATUSES = frozenset({"done", "blocked"})
+
+
+def _repo_skill_roots() -> List[Path]:
+    repo_root = Path(__file__).resolve().parent.parent
+    roots: List[Path] = []
+    for rel in _BUNDLED_SKILL_ROOTS:
+        root = repo_root / rel
+        if root.exists():
+            roots.append(root)
+    return roots
+
+
+def _extract_skill_frontmatter(skill_md: Path) -> Dict[str, Any]:
+    try:
+        raw = skill_md.read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    if not raw.startswith("---"):
+        return {}
+    _, _, remainder = raw.partition("---")
+    frontmatter, marker, _body = remainder.partition("\n---")
+    if not marker:
+        return {}
+    try:
+        parsed = yaml.safe_load(frontmatter)
+    except yaml.YAMLError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def bundled_skill_catalog(skill_roots: Optional[List[Path]] = None) -> List[SkillMeta]:
+    """Build metadata for the bundled Hermes skill catalog from the repo checkout."""
+    roots = skill_roots if skill_roots is not None else _repo_skill_roots()
+    catalog: List[SkillMeta] = []
+
+    for root in roots:
+        if not root.exists():
+            continue
+        source = "official" if root.name == "optional-skills" else "builtin"
+        trust_level = "builtin" if source == "builtin" else "trusted"
+        for skill_md in root.rglob("SKILL.md"):
+            relative = skill_md.relative_to(root)
+            if len(relative.parts) < 2:
+                continue
+            frontmatter = _extract_skill_frontmatter(skill_md)
+            name = str(frontmatter.get("name") or skill_md.parent.name)
+            description = str(frontmatter.get("description") or "")
+            tags = []
+            metadata = frontmatter.get("metadata")
+            if isinstance(metadata, dict):
+                hermes_meta = metadata.get("hermes")
+                if isinstance(hermes_meta, dict):
+                    raw_tags = hermes_meta.get("tags")
+                    if isinstance(raw_tags, list):
+                        tags = [str(tag) for tag in raw_tags if str(tag).strip()]
+            category = relative.parts[0]
+            catalog.append(
+                SkillMeta(
+                    name=name,
+                    description=description,
+                    source=source,
+                    identifier=f"{root.name}/{relative.parent.as_posix()}",
+                    trust_level=trust_level,
+                    path=relative.parent.as_posix(),
+                    tags=tags,
+                    extra={"category": category},
+                )
+            )
+    return catalog
+
+
+def _marketplace_tokens(*values: Any) -> set[str]:
+    tokens: set[str] = set()
+    for value in values:
+        if isinstance(value, (list, tuple, set)):
+            tokens.update(_marketplace_tokens(*list(value)))
+            continue
+        if value is None:
+            continue
+        text = str(value).strip().lower()
+        if not text:
+            continue
+        for token in re.split(r"[^a-z0-9]+", text):
+            if len(token) >= 3:
+                tokens.add(token)
+    return tokens
+
+
+def _local_skill_match_rows(
+    marketplace_skill: SkillMeta,
+    *,
+    category: str,
+    local_catalog: List[SkillMeta],
+    limit: int = 3,
+) -> List[Dict[str, Any]]:
+    target_tokens = _marketplace_tokens(
+        marketplace_skill.identifier,
+        marketplace_skill.name,
+        marketplace_skill.description,
+        category,
+        marketplace_skill.tags,
+    )
+    target_slug = marketplace_skill.identifier.split("/")[-1].lower()
+    target_name = marketplace_skill.name.strip().lower()
+    scored: List[Dict[str, Any]] = []
+
+    for local_meta in local_catalog:
+        local_category = str(local_meta.extra.get("category") or "").strip().lower()
+        local_slug = (local_meta.path or local_meta.identifier or local_meta.name).split("/")[-1].lower()
+        local_name = local_meta.name.strip().lower()
+        local_tokens = _marketplace_tokens(
+            local_meta.identifier,
+            local_meta.name,
+            local_meta.description,
+            local_category,
+            local_meta.tags,
+        )
+        overlap = sorted(target_tokens & local_tokens)
+        score = len(overlap)
+        if local_category and local_category == category:
+            score += 2
+        if local_slug == target_slug:
+            score += 10
+        if local_name == target_name:
+            score += 8
+        if score <= 0:
+            continue
+        scored.append(
+            {
+                "identifier": local_meta.identifier,
+                "name": local_meta.name,
+                "category": local_category,
+                "source": local_meta.source,
+                "score": score,
+                "matched_terms": overlap[:6],
+            }
+        )
+
+    scored.sort(key=lambda item: (-int(item["score"]), str(item["name"]).lower(), str(item["identifier"]).lower()))
+    return scored[:limit]
+
+
+def _migration_candidate_to_dict(candidate: MarketplaceMigrationCandidate) -> Dict[str, Any]:
+    return {
+        "category": candidate.category,
+        "rank": candidate.rank,
+        "name": candidate.skill.name,
+        "identifier": candidate.skill.identifier,
+        "description": candidate.skill.description,
+        "source": candidate.skill.source,
+        "tags": list(candidate.skill.tags),
+        "popularity": dict(candidate.skill.extra or {}),
+        "coverage_status": candidate.coverage_status,
+        "task_status": candidate.task_status,
+        "local_matches": list(candidate.local_matches),
+        "notes": candidate.notes,
+    }
+
+
+def build_clawhub_migration_queue(
+    *,
+    limit_per_category: int = 10,
+    catalog: Optional[List[SkillMeta]] = None,
+    local_catalog: Optional[List[SkillMeta]] = None,
+    existing_queue: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Compare ClawHub leaders against bundled Hermes skills and keep task status stable."""
+    source = ClawHubSource()
+    grouped = source.top_by_category(limit_per_category=limit_per_category, catalog=catalog)
+    local_entries = local_catalog if local_catalog is not None else bundled_skill_catalog()
+
+    prior_items: Dict[tuple[str, str], Dict[str, Any]] = {}
+    if isinstance(existing_queue, dict):
+        for item in existing_queue.get("items", []):
+            if not isinstance(item, dict):
+                continue
+            category = str(item.get("category") or "").strip().lower()
+            identifier = str(item.get("identifier") or "").strip()
+            if category and identifier:
+                prior_items[(category, identifier)] = item
+
+    items: List[Dict[str, Any]] = []
+    covered = 0
+    pending = 0
+
+    for category, entries in grouped.items():
+        for rank, meta in enumerate(entries, start=1):
+            matches = _local_skill_match_rows(meta, category=category, local_catalog=local_entries)
+            strongest_score = int(matches[0]["score"]) if matches else 0
+            is_covered = strongest_score >= 6
+            prior = prior_items.get((category, meta.identifier), {})
+            prior_status = str(prior.get("task_status") or "").strip().lower()
+            if is_covered:
+                task_status = "done"
+                coverage_status = "covered"
+                notes = (
+                    str(prior.get("notes") or "").strip()
+                    or f"Covered by Hermes skills: {', '.join(match['name'] for match in matches[:2])}"
+                )
+                covered += 1
+            else:
+                task_status = prior_status if prior_status in {"pending", "in_progress", "blocked", "done"} else "pending"
+                coverage_status = "gap"
+                notes = (
+                    str(prior.get("notes") or "").strip()
+                    or "No close bundled Hermes skill match found yet."
+                )
+                if task_status != "done":
+                    pending += 1
+
+            candidate = MarketplaceMigrationCandidate(
+                category=category,
+                rank=rank,
+                skill=meta,
+                coverage_status=coverage_status,
+                task_status=task_status,
+                local_matches=matches,
+                notes=notes,
+            )
+            items.append(_migration_candidate_to_dict(candidate))
+
+    categories = {
+        category: [item for item in items if item["category"] == category]
+        for category in sorted(grouped.keys())
+    }
+    summary = {
+        "total_items": len(items),
+        "categories": len(categories),
+        "covered_items": covered,
+        "pending_items": pending,
+        "finalized_items": sum(
+            1 for item in items if str(item.get("task_status") or "").strip().lower() in _MARKETPLACE_QUEUE_FINAL_STATUSES
+        ),
+    }
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "source": "clawhub",
+        "limit_per_category": limit_per_category,
+        "summary": summary,
+        "items": items,
+        "categories": categories,
+    }
+
+
+def load_marketplace_migration_queue(path: Union[str, Path]) -> Dict[str, Any]:
+    """Load a previously persisted marketplace migration queue."""
+    queue_path = Path(path)
+    if not queue_path.exists():
+        return {}
+    try:
+        data = json.loads(queue_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_clawhub_migration_queue(
+    path: Union[str, Path],
+    *,
+    limit_per_category: int = 10,
+    catalog: Optional[List[SkillMeta]] = None,
+    local_catalog: Optional[List[SkillMeta]] = None,
+    existing_queue: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Build and persist a ClawHub migration queue, preserving prior task state."""
+    queue_path = Path(path)
+    merged_existing_queue = (
+        existing_queue
+        if existing_queue is not None
+        else load_marketplace_migration_queue(queue_path)
+    )
+    queue = build_clawhub_migration_queue(
+        limit_per_category=limit_per_category,
+        catalog=catalog,
+        local_catalog=local_catalog,
+        existing_queue=merged_existing_queue,
+    )
+    queue_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = queue_path.with_suffix(f"{queue_path.suffix}.tmp")
+    temp_path.write_text(
+        json.dumps(queue, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    try:
+        temp_path.replace(queue_path)
+    except OSError:
+        queue_path.write_text(
+            json.dumps(queue, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        try:
+            temp_path.unlink()
+        except OSError:
+            pass
+    return queue
 
 
 # ---------------------------------------------------------------------------
