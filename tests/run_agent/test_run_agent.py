@@ -5,7 +5,6 @@ pieces. The OpenAI client and tool loading are mocked so no network calls
 are made.
 """
 
-import io
 import json
 import logging
 import re
@@ -19,7 +18,6 @@ import pytest
 
 import run_agent
 from run_agent import AIAgent
-from agent.error_classifier import FailoverReason
 from agent.prompt_builder import DEFAULT_AGENT_IDENTITY
 
 
@@ -136,48 +134,6 @@ def test_aiagent_reuses_existing_errors_log_handler():
                 handler.close()
         for handler in original_handlers:
             root_logger.addHandler(handler)
-
-
-class TestProviderModelNormalization:
-    def test_aiagent_strips_matching_native_provider_prefix(self):
-        with (
-            patch(
-                "run_agent.get_tool_definitions", return_value=_make_tool_defs("web_search")
-            ),
-            patch("run_agent.check_toolset_requirements", return_value={}),
-            patch("run_agent.OpenAI"),
-        ):
-            agent = AIAgent(
-                model="zai/glm-5.1",
-                provider="zai",
-                base_url="https://api.z.ai/api/paas/v4",
-                api_key="test-key-1234567890",
-                quiet_mode=True,
-                skip_context_files=True,
-                skip_memory=True,
-            )
-
-        assert agent.model == "glm-5.1"
-
-    def test_aiagent_keeps_aggregator_vendor_slug(self):
-        with (
-            patch(
-                "run_agent.get_tool_definitions", return_value=_make_tool_defs("web_search")
-            ),
-            patch("run_agent.check_toolset_requirements", return_value={}),
-            patch("run_agent.OpenAI"),
-        ):
-            agent = AIAgent(
-                model="anthropic/claude-sonnet-4.6",
-                provider="openrouter",
-                base_url="https://openrouter.ai/api/v1",
-                api_key="test-key-1234567890",
-                quiet_mode=True,
-                skip_context_files=True,
-                skip_memory=True,
-            )
-
-        assert agent.model == "anthropic/claude-sonnet-4.6"
 
 
 # ---------------------------------------------------------------------------
@@ -302,16 +258,44 @@ class TestStripThinkBlocks:
         assert "<think>" not in result
         assert "visible" in result
 
-    def test_thought_block_removed(self, agent):
-        """Gemma 4 uses <thought> tags for inline reasoning."""
-        result = agent._strip_think_blocks("<thought>internal reasoning</thought> answer")
-        assert "internal reasoning" not in result
-        assert "<thought>" not in result
-        assert "answer" in result
 
-    def test_orphaned_thought_tag(self, agent):
-        result = agent._strip_think_blocks("<thought>orphaned reasoning without close")
-        assert "<thought>" not in result
+class TestRepairToolCall:
+    def test_repairs_streaming_channel_suffix(self):
+        with (
+            patch(
+                "run_agent.get_tool_definitions",
+                return_value=_make_tool_defs("feishu_message_send"),
+            ),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+        ):
+            agent = AIAgent(
+                api_key="test-key",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+        assert (
+            agent._repair_tool_call("feishu_message_send<|channel|>commentary")
+            == "feishu_message_send"
+        )
+
+    def test_repairs_normalized_suffix_after_marker_cleanup(self):
+        with (
+            patch(
+                "run_agent.get_tool_definitions",
+                return_value=_make_tool_defs("browser_back"),
+            ),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+        ):
+            agent = AIAgent(
+                api_key="test-key",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+        assert agent._repair_tool_call("browser-back_final") == "browser_back"
 
 
 class TestExtractReasoning:
@@ -861,6 +845,281 @@ class TestBuildApiKwargs:
         kwargs = agent._build_api_kwargs(messages)
         assert kwargs["extra_body"]["provider"]["only"] == ["Anthropic"]
 
+    def test_openrouter_broadcast_trace_injected(self, agent, monkeypatch):
+        monkeypatch.setenv("OPENROUTER_BROADCAST_ENABLED", "true")
+        monkeypatch.setenv("OPENROUTER_BROADCAST_PRIVACY_MODE", "true")
+        agent.base_url = "https://openrouter.ai/api/v1"
+        agent._base_url_lower = agent.base_url.lower()
+        agent.provider = "openrouter"
+        agent.model = "qwen/qwen3-coder:free"
+        agent.platform = "feishu"
+        agent._user_id = "ou_1234567890"
+        agent._trace_session_key = "feishu:oc_test_chat"
+        agent._trace_metadata = {
+            "channel_type": "dm",
+            "route_selection": "sticky_hit",
+            "chat_id": "oc_raw_should_not_leak",
+        }
+
+        kwargs = agent._build_api_kwargs([{"role": "user", "content": "hi"}])
+
+        assert kwargs["user"].startswith("feishu:")
+        assert kwargs["extra_body"]["session_id"] == "feishu:oc_test_chat"
+        assert kwargs["extra_body"]["trace"]["platform"] == "feishu"
+        assert kwargs["extra_body"]["trace"]["channel_type"] == "dm"
+        assert kwargs["extra_body"]["trace"]["route_selection"] == "sticky_hit"
+        assert "chat_id" not in kwargs["extra_body"]["trace"]
+
+    def test_openrouter_broadcast_disabled_by_default(self, agent, monkeypatch):
+        monkeypatch.delenv("OPENROUTER_BROADCAST_ENABLED", raising=False)
+        agent.base_url = "https://openrouter.ai/api/v1"
+        agent._base_url_lower = agent.base_url.lower()
+        agent.provider = "openrouter"
+        agent._trace_session_key = "session-key"
+        agent._trace_metadata = {"channel_type": "dm"}
+
+        kwargs = agent._build_api_kwargs([{"role": "user", "content": "hi"}])
+
+        assert "user" not in kwargs
+        assert "session_id" not in kwargs.get("extra_body", {})
+        assert "trace" not in kwargs.get("extra_body", {})
+
+    def test_cloudflare_ai_gateway_dynamic_route_headers_for_coding(self, agent, monkeypatch):
+        monkeypatch.setenv("CLOUDFLARE_AI_GATEWAY_ROUTE_MODE", "dynamic_by_task_kind")
+        monkeypatch.setenv("CLOUDFLARE_AI_GATEWAY_ROUTE_CODING", "affiliate-coding")
+        monkeypatch.setenv("CLOUDFLARE_AI_GATEWAY_CACHE_MODE", "smart")
+        monkeypatch.setenv("CLOUDFLARE_AI_GATEWAY_REQUEST_TIMEOUT_MS", "9000")
+        monkeypatch.setenv("CLOUDFLARE_AI_GATEWAY_MAX_ATTEMPTS", "2")
+        agent.base_url = "https://gateway.ai.cloudflare.com/v1/account/gateway/compat"
+        agent._base_url_lower = agent.base_url.lower()
+        agent.model = "google-ai-studio/gemini-2.5-pro"
+        agent._trace_session_key = "feishu:oc_test_chat"
+        agent._trace_metadata = {
+            "correlation_id": "feishu:oc_test:evt_123",
+            "chat_id": "oc_test",
+            "message_id": "om_test",
+        }
+
+        kwargs = agent._build_api_kwargs([{"role": "user", "content": "请修复这段 Python 代码的报错并解释原因"}])
+
+        assert kwargs["model"] == "dynamic/affiliate-coding"
+        assert kwargs["extra_headers"]["cf-aig-skip-cache"] == "true"
+        assert kwargs["extra_headers"]["cf-aig-request-timeout"] == "9000"
+        assert kwargs["extra_headers"]["cf-aig-max-attempts"] == "2"
+        metadata = json.loads(kwargs["extra_headers"]["cf-aig-metadata"])
+        assert metadata["correlation_id"] == "feishu:oc_test:evt_123"
+        assert metadata["task_kind"] == "coding"
+        assert metadata["hermes_request"] == "google-ai-studio/gemini-2.5-pro=>dynamic/affiliate-coding"
+
+    def test_cloudflare_ai_gateway_general_route_uses_cache_ttl(self, agent, monkeypatch):
+        monkeypatch.setenv("CLOUDFLARE_AI_GATEWAY_ROUTE_MODE", "dynamic_by_task_kind")
+        monkeypatch.setenv("CLOUDFLARE_AI_GATEWAY_ROUTE_GENERAL", "affiliate-general")
+        monkeypatch.setenv("CLOUDFLARE_AI_GATEWAY_CACHE_MODE", "smart")
+        monkeypatch.setenv("CLOUDFLARE_AI_GATEWAY_CACHE_TTL_SECONDS", "180")
+        agent.base_url = "https://gateway.ai.cloudflare.com/v1/account/gateway/compat"
+        agent._base_url_lower = agent.base_url.lower()
+        agent.model = "openrouter/openai/gpt-4.1-mini"
+        agent.tools = []
+        agent._trace_session_key = "feishu:oc_test_chat"
+        agent._trace_metadata = {"chat_id": "oc_test"}
+
+        kwargs = agent._build_api_kwargs([{"role": "user", "content": "请简要总结今天的工作重点"}])
+
+        assert kwargs["model"] == "dynamic/affiliate-general"
+        assert kwargs["extra_headers"]["cf-aig-cache-ttl"] == "180"
+        assert "cf-aig-skip-cache" not in kwargs["extra_headers"]
+        metadata = json.loads(kwargs["extra_headers"]["cf-aig-metadata"])
+        assert metadata["hermes_request"] == "openrouter/openai/gpt-4.1-mini=>dynamic/affiliate-general"
+        assert metadata["session_id"] == "feishu:oc_test_chat"
+        assert metadata["task_kind"] == "general"
+
+    def test_cloudflare_ai_gateway_prompt_hash_cache_key_optional(self, agent, monkeypatch):
+        monkeypatch.setenv("CLOUDFLARE_AI_GATEWAY_CACHE_MODE", "smart")
+        monkeypatch.setenv("CLOUDFLARE_AI_GATEWAY_USE_PROMPT_CACHE_KEY", "true")
+        agent.base_url = "https://gateway.ai.cloudflare.com/v1/account/gateway/compat"
+        agent._base_url_lower = agent.base_url.lower()
+        agent.model = "openrouter/openai/gpt-4.1-mini"
+        agent.tools = []
+
+        kwargs = agent._build_api_kwargs([{"role": "user", "content": "What is a webhook acknowledgment?"}])
+
+        assert kwargs["extra_headers"]["cf-aig-cache-key"].startswith("hermes:general:")
+
+    def test_cloudflare_ai_gateway_metadata_derives_correlation_from_session_and_message(self, agent, monkeypatch):
+        monkeypatch.setenv("CLOUDFLARE_AI_GATEWAY_CACHE_MODE", "smart")
+        agent.base_url = "https://gateway.ai.cloudflare.com/v1/account/gateway/compat"
+        agent._base_url_lower = agent.base_url.lower()
+        agent.model = "openrouter/openai/gpt-4.1-mini"
+        agent.tools = []
+        agent._trace_session_key = "feishu:oc_test_chat"
+        agent._trace_metadata = {"message_id": "om_test"}
+
+        kwargs = agent._build_api_kwargs([{"role": "user", "content": "Summarize the release notes."}])
+
+        metadata = json.loads(kwargs["extra_headers"]["cf-aig-metadata"])
+        assert metadata["correlation_id"] == "feishu:oc_test_chat:om_test"
+        assert metadata["hermes_request"] == "openrouter/openai/gpt-4.1-mini"
+
+    def test_cloudflare_ai_gateway_metadata_caps_at_five_entries(self, agent, monkeypatch):
+        monkeypatch.delenv("CLOUDFLARE_AI_GATEWAY_ROUTE_MODE", raising=False)
+        agent.base_url = "https://gateway.ai.cloudflare.com/v1/account/gateway/compat"
+        agent._base_url_lower = agent.base_url.lower()
+        agent.model = "openrouter/free"
+        agent.tools = [
+            {"type": "function", "function": {"name": "browser_back"}},
+            {"type": "function", "function": {"name": "read_file"}},
+        ]
+        agent._trace_session_key = "feishu:oc_test_chat"
+        agent._trace_metadata = {
+            "correlation_id": "feishu:oc_test:evt_123",
+            "chat_id": "oc_test",
+            "message_id": "om_test",
+        }
+
+        kwargs = agent._build_api_kwargs([{"role": "user", "content": "Open the site and inspect it."}])
+
+        metadata = json.loads(kwargs["extra_headers"]["cf-aig-metadata"])
+        assert len(metadata) <= 5
+        assert metadata["correlation_id"] == "feishu:oc_test:evt_123"
+        assert metadata["task_kind"] == "general"
+        assert metadata["hermes_request"] == "openrouter/free=>dynamic/affiliate-tools"
+        assert metadata["tools_required"] is True
+        assert "tool_names" in metadata
+        assert "chat_id" not in metadata
+        assert "message_id" not in metadata
+        assert "session_id" not in metadata
+
+    def test_cloudflare_ai_gateway_defaults_to_metadata_only(self, agent, monkeypatch):
+        monkeypatch.delenv("CLOUDFLARE_AI_GATEWAY_ROUTE_MODE", raising=False)
+        monkeypatch.setenv("CLOUDFLARE_AI_GATEWAY_ROUTE_GENERAL", "affiliate-general")
+        agent.base_url = "https://gateway.ai.cloudflare.com/v1/account/gateway/compat"
+        agent._base_url_lower = agent.base_url.lower()
+        agent.model = "openrouter/openai/gpt-4.1-mini"
+        agent.tools = []
+        agent._trace_metadata = {"chat_id": "oc_test"}
+
+        kwargs = agent._build_api_kwargs([{"role": "user", "content": "Summarize the release notes."}])
+
+        assert kwargs["model"] == "openrouter/openai/gpt-4.1-mini"
+        metadata = json.loads(kwargs["extra_headers"]["cf-aig-metadata"])
+        assert metadata["task_kind"] == "general"
+
+    def test_cloudflare_ai_gateway_metadata_only_uses_dynamic_route_for_tools(self, agent, monkeypatch):
+        monkeypatch.delenv("CLOUDFLARE_AI_GATEWAY_ROUTE_MODE", raising=False)
+        monkeypatch.setenv("CLOUDFLARE_AI_GATEWAY_ROUTE_TOOLS", "affiliate-tools")
+        agent.base_url = "https://gateway.ai.cloudflare.com/v1/account/gateway/compat"
+        agent._base_url_lower = agent.base_url.lower()
+        agent.model = "openrouter/free"
+        agent.tools = [{"type": "function", "function": {"name": "browser_back"}}]
+        agent._trace_metadata = {"chat_id": "oc_test"}
+
+        kwargs = agent._build_api_kwargs([{"role": "user", "content": "Open the site and inspect it."}])
+
+        assert kwargs["model"] == "dynamic/affiliate-tools"
+        metadata = json.loads(kwargs["extra_headers"]["cf-aig-metadata"])
+        assert metadata["tools_required"] == "true"
+        assert "browser_back" in metadata["tool_names"]
+
+    def test_cloudflare_ai_gateway_metadata_only_defaults_tools_route(self, agent, monkeypatch):
+        monkeypatch.delenv("CLOUDFLARE_AI_GATEWAY_ROUTE_MODE", raising=False)
+        monkeypatch.delenv("CLOUDFLARE_AI_GATEWAY_ROUTE_TOOLS", raising=False)
+        monkeypatch.delenv("CLOUDFLARE_AI_GATEWAY_ROUTE_NAME", raising=False)
+        agent.base_url = "https://gateway.ai.cloudflare.com/v1/account/gateway/compat"
+        agent._base_url_lower = agent.base_url.lower()
+        agent.model = "openrouter/free"
+        agent.tools = [{"type": "function", "function": {"name": "browser_back"}}]
+
+        kwargs = agent._build_api_kwargs([{"role": "user", "content": "Open the site and inspect it."}])
+
+        assert kwargs["model"] == "dynamic/affiliate-tools"
+
+    def test_cloudflare_ai_gateway_creative_defaults_to_general_route(self, agent, monkeypatch):
+        monkeypatch.setenv("CLOUDFLARE_AI_GATEWAY_ROUTE_MODE", "dynamic_by_task_kind")
+        monkeypatch.delenv("CLOUDFLARE_AI_GATEWAY_ROUTE_GENERAL", raising=False)
+        monkeypatch.delenv("CLOUDFLARE_AI_GATEWAY_ROUTE_CREATIVE", raising=False)
+        agent.base_url = "https://gateway.ai.cloudflare.com/v1/account/gateway/compat"
+        agent._base_url_lower = agent.base_url.lower()
+        agent.model = "openrouter/free"
+        agent.tools = []
+
+        kwargs = agent._build_api_kwargs([{"role": "user", "content": "Write a catchy launch campaign script."}])
+
+        assert kwargs["model"] == "dynamic/affiliate-general"
+
+    def test_openrouter_broadcast_derives_correlation_id(self, agent, monkeypatch):
+        monkeypatch.setenv("OPENROUTER_BROADCAST_ENABLED", "true")
+        monkeypatch.setenv("OPENROUTER_BROADCAST_PRIVACY_MODE", "true")
+        agent.base_url = "https://openrouter.ai/api/v1"
+        agent._base_url_lower = agent.base_url.lower()
+        agent.provider = "openrouter"
+        agent.model = "qwen/qwen3-coder:free"
+        agent.platform = "feishu"
+        agent._trace_session_key = "feishu:oc_test_chat"
+        agent._trace_metadata = {"message_id": "om_test"}
+
+        kwargs = agent._build_api_kwargs([{"role": "user", "content": "hi"}])
+
+        assert kwargs["extra_body"]["trace"]["correlation_id"] == "feishu:oc_test_chat:om_test"
+
+    def test_extract_openrouter_usage_metadata(self, agent):
+        agent.base_url = "https://openrouter.ai/api/v1"
+        agent._base_url_lower = agent.base_url.lower()
+        agent.provider = "openrouter"
+        response = SimpleNamespace(
+            id="gen_123",
+            model="google/gemma-4-31b-it",
+            usage=SimpleNamespace(
+                prompt_tokens=1200,
+                completion_tokens=80,
+                total_tokens=1280,
+                cost=0.0012,
+                usage=0.0012,
+                usage_upstream=0.0009,
+                prompt_tokens_details=SimpleNamespace(
+                    cached_tokens=900,
+                    cache_write_tokens=120,
+                ),
+                cost_details=SimpleNamespace(
+                    upstream_inference_cost=0.0009,
+                    cache_discount=0.0003,
+                ),
+            ),
+        )
+
+        payload = agent._extract_openrouter_usage_metadata(response)
+
+        assert payload["generation_id"] == "gen_123"
+        assert payload["cost"] == pytest.approx(0.0012)
+        assert payload["upstream_inference_cost"] == pytest.approx(0.0009)
+        assert payload["cache_discount"] == pytest.approx(0.0003)
+        assert payload["cached_tokens"] == 900
+        assert payload["cache_write_tokens"] == 120
+        assert payload["usage"] == pytest.approx(0.0012)
+        assert payload["usage_upstream"] == pytest.approx(0.0009)
+
+    def test_usage_summary_hook_includes_provider_usage(self, agent):
+        agent.base_url = "https://openrouter.ai/api/v1"
+        agent._base_url_lower = agent.base_url.lower()
+        agent.provider = "openrouter"
+        response = SimpleNamespace(
+            id="gen_456",
+            model="google/gemma-4-31b-it",
+            usage=SimpleNamespace(
+                prompt_tokens=100,
+                completion_tokens=20,
+                total_tokens=120,
+                cost=0.0004,
+                cost_details=SimpleNamespace(upstream_inference_cost=0.0003),
+                prompt_tokens_details=SimpleNamespace(cached_tokens=50, cache_write_tokens=10),
+            ),
+        )
+
+        payload = agent._extract_openrouter_usage_metadata(response)
+
+        assert payload["prompt_tokens"] == 100
+        assert payload["completion_tokens"] == 20
+        assert payload["total_tokens"] == 120
+
     def test_reasoning_config_default_openrouter(self, agent):
         """Default reasoning config for OpenRouter should be medium."""
         agent.base_url = "https://openrouter.ai/api/v1"
@@ -880,7 +1139,6 @@ class TestBuildApiKwargs:
         assert kwargs["extra_body"]["reasoning"] == {"enabled": False}
 
     def test_reasoning_not_sent_for_unsupported_openrouter_model(self, agent):
-        agent.base_url = "https://openrouter.ai/api/v1"
         agent.model = "minimax/minimax-m2.5"
         messages = [{"role": "user", "content": "hi"}]
         kwargs = agent._build_api_kwargs(messages)
@@ -965,24 +1223,14 @@ class TestBuildApiKwargs:
         assert kwargs["messages"][0]["content"][0]["text"] == "hi"
         assert "cache_control" not in kwargs["messages"][0]["content"][0]
 
-    def test_qwen_portal_sends_explicit_max_tokens(self, agent):
-        """When the user explicitly sets max_tokens, it should be sent to Qwen Portal."""
+    def test_qwen_portal_omits_max_tokens(self, agent):
         agent.base_url = "https://portal.qwen.ai/v1"
         agent._base_url_lower = agent.base_url.lower()
         agent.max_tokens = 4096
         messages = [{"role": "system", "content": "sys"}, {"role": "user", "content": "hi"}]
         kwargs = agent._build_api_kwargs(messages)
-        assert kwargs["max_tokens"] == 4096
-
-    def test_qwen_portal_default_max_tokens(self, agent):
-        """When max_tokens is None, Qwen Portal gets a default of 65536
-        to prevent reasoning models from exhausting their output budget."""
-        agent.base_url = "https://portal.qwen.ai/v1"
-        agent._base_url_lower = agent.base_url.lower()
-        agent.max_tokens = None
-        messages = [{"role": "system", "content": "sys"}, {"role": "user", "content": "hi"}]
-        kwargs = agent._build_api_kwargs(messages)
-        assert kwargs["max_tokens"] == 65536
+        assert "max_tokens" not in kwargs
+        assert "max_completion_tokens" not in kwargs
 
 
 class TestBuildAssistantMessage:
@@ -1126,77 +1374,6 @@ class TestExecuteToolCalls:
         # Content should be replaced with persisted-output or truncation
         assert len(messages[0]["content"]) < 150_000
         assert ("Truncated" in messages[0]["content"] or "<persisted-output>" in messages[0]["content"])
-
-    def test_quiet_tool_output_suppressed_when_progress_callback_present(self, agent):
-        tc = _mock_tool_call(name="web_search", arguments='{"q":"test"}', call_id="c1")
-        mock_msg = _mock_assistant_msg(content="", tool_calls=[tc])
-        messages = []
-        agent.tool_progress_callback = lambda *args, **kwargs: None
-
-        with patch("run_agent.handle_function_call", return_value="search result"), \
-             patch.object(agent, "_safe_print") as mock_print:
-            agent._execute_tool_calls(mock_msg, messages, "task-1")
-
-        mock_print.assert_not_called()
-        assert len(messages) == 1
-        assert messages[0]["role"] == "tool"
-
-    def test_quiet_tool_output_prints_without_progress_callback(self, agent):
-        tc = _mock_tool_call(name="web_search", arguments='{"q":"test"}', call_id="c1")
-        mock_msg = _mock_assistant_msg(content="", tool_calls=[tc])
-        messages = []
-        agent.tool_progress_callback = None
-
-        with patch("run_agent.handle_function_call", return_value="search result"), \
-             patch.object(agent, "_safe_print") as mock_print:
-            agent._execute_tool_calls(mock_msg, messages, "task-1")
-
-        mock_print.assert_called_once()
-        assert "search" in str(mock_print.call_args.args[0]).lower()
-        assert len(messages) == 1
-        assert messages[0]["role"] == "tool"
-
-    def test_vprint_suppressed_in_parseable_quiet_mode(self, agent):
-        agent.suppress_status_output = True
-
-        with patch.object(agent, "_safe_print") as mock_print:
-            agent._vprint("status line", force=True)
-            agent._vprint("normal line")
-
-        mock_print.assert_not_called()
-
-    def test_run_conversation_suppresses_retry_noise_in_parseable_quiet_mode(self, agent):
-        class _RateLimitError(Exception):
-            status_code = 429
-
-            def __str__(self):
-                return "Error code: 429 - Rate limit exceeded."
-
-        responses = [_RateLimitError(), _mock_response(content="Recovered")]
-
-        def _fake_api_call(api_kwargs):
-            result = responses.pop(0)
-            if isinstance(result, Exception):
-                raise result
-            return result
-
-        agent.suppress_status_output = True
-        agent._interruptible_api_call = _fake_api_call
-        agent._persist_session = lambda *args, **kwargs: None
-        agent._save_trajectory = lambda *args, **kwargs: None
-        agent._save_session_log = lambda *args, **kwargs: None
-
-        captured = io.StringIO()
-        agent._print_fn = lambda *args, **kw: print(*args, file=captured, **kw)
-
-        with patch("run_agent.time.sleep", return_value=None):
-            result = agent.run_conversation("hello")
-
-        assert result["completed"] is True
-        assert result["final_response"] == "Recovered"
-        output = captured.getvalue()
-        assert "API call failed" not in output
-        assert "Rate limit reached" not in output
 
 
 class TestConcurrentToolExecution:
@@ -1576,7 +1753,6 @@ class TestHandleMaxIterations:
         assert "API down" in result
 
     def test_summary_skips_reasoning_for_unsupported_openrouter_model(self, agent):
-        agent.base_url = "https://openrouter.ai/api/v1"
         agent.model = "minimax/minimax-m2.5"
         resp = _mock_response(content="Summary")
         agent.client.chat.completions.create.return_value = resp
@@ -1707,6 +1883,27 @@ class TestRunConversation:
         assert result["completed"] is True
         assert result["api_calls"] == 2
 
+    def test_inline_think_blocks_reasoning_only_accepted(self, agent):
+        """Inline <think> reasoning-only responses accepted with (empty) content, no retries."""
+        self._setup_agent(agent)
+        empty_resp = _mock_response(
+            content="<think>internal reasoning</think>",
+            finish_reason="stop",
+        )
+        agent.client.chat.completions.create.side_effect = [empty_resp]
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("answer me")
+        assert result["completed"] is True
+        assert result["final_response"] == "(empty)"
+        assert result["api_calls"] == 1  # no retries
+        # Reasoning should be preserved in the assistant message
+        assistant_msgs = [m for m in result["messages"] if m.get("role") == "assistant"]
+        assert any(m.get("reasoning") for m in assistant_msgs)
+
     def test_reasoning_only_local_resumed_no_compression_triggered(self, agent):
         """Reasoning-only responses no longer trigger compression — prefill then accepted."""
         self._setup_agent(agent)
@@ -1722,9 +1919,9 @@ class TestRunConversation:
             {"role": "assistant", "content": "old answer"},
         ]
 
-        # 6 responses: original + 2 prefill + 3 retries after prefill exhaustion
+        # 3 responses: original + 2 prefill continuations (structured reasoning triggers prefill)
         with (
-            patch.object(agent, "_interruptible_api_call", side_effect=[empty_resp] * 6),
+            patch.object(agent, "_interruptible_api_call", side_effect=[empty_resp, empty_resp, empty_resp]),
             patch.object(agent, "_compress_context") as mock_compress,
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
@@ -1735,18 +1932,18 @@ class TestRunConversation:
         mock_compress.assert_not_called()  # no compression triggered
         assert result["completed"] is True
         assert result["final_response"] == "(empty)"
-        assert result["api_calls"] == 6  # 1 original + 2 prefill + 3 retries
+        assert result["api_calls"] == 3  # 1 original + 2 prefill continuations
 
     def test_reasoning_only_response_prefill_then_empty(self, agent):
-        """Structured reasoning-only triggers prefill (2), then retries (3), then (empty)."""
+        """Structured reasoning-only triggers prefill continuation (up to 2), then falls through to (empty)."""
         self._setup_agent(agent)
         empty_resp = _mock_response(
             content=None,
             finish_reason="stop",
             reasoning_content="structured reasoning answer",
         )
-        # 6 responses: 1 original + 2 prefill + 3 retries after prefill exhaustion
-        agent.client.chat.completions.create.side_effect = [empty_resp] * 6
+        # 3 responses: original + 2 prefill continuations, all reasoning-only
+        agent.client.chat.completions.create.side_effect = [empty_resp, empty_resp, empty_resp]
         with (
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
@@ -1755,7 +1952,7 @@ class TestRunConversation:
             result = agent.run_conversation("answer me")
         assert result["completed"] is True
         assert result["final_response"] == "(empty)"
-        assert result["api_calls"] == 6  # 1 original + 2 prefill + 3 retries
+        assert result["api_calls"] == 3  # 1 original + 2 prefill continuations
 
     def test_reasoning_only_prefill_succeeds_on_continuation(self, agent):
         """When prefill continuation produces content, it becomes the final response."""
@@ -1824,193 +2021,6 @@ class TestRunConversation:
         assert result["completed"] is True
         assert result["final_response"] == "Here is the actual answer."
         assert result["api_calls"] == 2  # 1 original + 1 nudge retry
-
-    def test_empty_response_triggers_fallback_provider(self, agent):
-        """After 3 empty retries, fallback provider is activated and produces content."""
-        self._setup_agent(agent)
-        agent.base_url = "http://127.0.0.1:1234/v1"
-        # Configure a fallback chain
-        agent._fallback_chain = [{"provider": "openrouter", "model": "anthropic/claude-sonnet-4"}]
-        agent._fallback_index = 0
-        agent._fallback_activated = False
-
-        empty_resp = _mock_response(content=None, finish_reason="stop")
-        content_resp = _mock_response(content="Fallback answer.", finish_reason="stop")
-        # 4 empty (1 orig + 3 retries), then fallback model answers
-        agent.client.chat.completions.create.side_effect = [
-            empty_resp, empty_resp, empty_resp, empty_resp, content_resp,
-        ]
-
-        fallback_called = {"called": False}
-
-        def _mock_fallback():
-            fallback_called["called"] = True
-            # Simulate what _try_activate_fallback does: just advance the
-            # index and set the flag (the client is already mocked).
-            agent._fallback_index = 1
-            agent._fallback_activated = True
-            agent.model = "anthropic/claude-sonnet-4"
-            agent.provider = "openrouter"
-            return True
-
-        with (
-            patch.object(agent, "_persist_session"),
-            patch.object(agent, "_save_trajectory"),
-            patch.object(agent, "_cleanup_task_resources"),
-            patch.object(agent, "_try_activate_fallback", side_effect=_mock_fallback),
-        ):
-            result = agent.run_conversation("answer me")
-        assert fallback_called["called"], "Fallback should have been triggered"
-        assert result["completed"] is True
-        assert result["final_response"] == "Fallback answer."
-
-    def test_empty_response_fallback_also_empty_returns_empty(self, agent):
-        """If fallback also returns empty, final response is (empty)."""
-        self._setup_agent(agent)
-        agent.base_url = "http://127.0.0.1:1234/v1"
-        agent._fallback_chain = [{"provider": "openrouter", "model": "anthropic/claude-sonnet-4"}]
-        agent._fallback_index = 0
-        agent._fallback_activated = False
-
-        empty_resp = _mock_response(content=None, finish_reason="stop")
-        # 4 empty from primary (1 + 3 retries), fallback activated,
-        # then 4 more empty from fallback (1 + 3 retries), no more fallbacks
-        agent.client.chat.completions.create.side_effect = [
-            empty_resp, empty_resp, empty_resp, empty_resp,  # primary exhausted
-            empty_resp, empty_resp, empty_resp, empty_resp,  # fallback exhausted
-        ]
-
-        def _mock_fallback():
-            if agent._fallback_index >= len(agent._fallback_chain):
-                return False
-            agent._fallback_index += 1
-            agent._fallback_activated = True
-            agent.model = "anthropic/claude-sonnet-4"
-            agent.provider = "openrouter"
-            return True
-
-        with (
-            patch.object(agent, "_persist_session"),
-            patch.object(agent, "_save_trajectory"),
-            patch.object(agent, "_cleanup_task_resources"),
-            patch.object(agent, "_try_activate_fallback", side_effect=_mock_fallback),
-        ):
-            result = agent.run_conversation("answer me")
-        assert result["completed"] is True
-        assert result["final_response"] == "(empty)"
-
-    def test_empty_response_emits_status_for_gateway(self, agent):
-        """_emit_status is called during empty retries so gateway users see feedback."""
-        self._setup_agent(agent)
-        agent.base_url = "http://127.0.0.1:1234/v1"
-
-        empty_resp = _mock_response(content=None, finish_reason="stop")
-        # 4 empty: 1 original + 3 retries, all empty, no fallback
-        agent.client.chat.completions.create.side_effect = [
-            empty_resp, empty_resp, empty_resp, empty_resp,
-        ]
-
-        status_messages = []
-
-        def _capture_status(msg):
-            status_messages.append(msg)
-
-        with (
-            patch.object(agent, "_persist_session"),
-            patch.object(agent, "_save_trajectory"),
-            patch.object(agent, "_cleanup_task_resources"),
-            patch.object(agent, "_emit_status", side_effect=_capture_status),
-        ):
-            result = agent.run_conversation("answer me")
-
-        assert result["final_response"] == "(empty)"
-        # Should have emitted retry statuses (3 retries) + final failure
-        retry_msgs = [m for m in status_messages if "retrying" in m.lower()]
-        assert len(retry_msgs) == 3, f"Expected 3 retry status messages, got {len(retry_msgs)}: {status_messages}"
-        failure_msgs = [m for m in status_messages if "no content" in m.lower() or "no fallback" in m.lower()]
-        assert len(failure_msgs) >= 1, f"Expected at least 1 failure status, got: {status_messages}"
-
-    def test_partial_stream_recovery_uses_streamed_content(self, agent):
-        """When streaming fails after partial delivery, recovered partial content becomes final response."""
-        self._setup_agent(agent)
-        # Simulate a partial-stream-stub response: content recovered from streaming
-        partial_resp = _mock_response(
-            content="Here is the partial answer that was stream",
-            finish_reason="stop",
-        )
-        agent.client.chat.completions.create.return_value = partial_resp
-        # Simulate that streaming had already delivered this text
-        agent._current_streamed_assistant_text = "Here is the partial answer that was stream"
-        with (
-            patch.object(agent, "_persist_session"),
-            patch.object(agent, "_save_trajectory"),
-            patch.object(agent, "_cleanup_task_resources"),
-        ):
-            result = agent.run_conversation("explain something")
-        # The partial content should be used as-is (not empty, not retried)
-        assert result["completed"] is True
-        assert result["final_response"] == "Here is the partial answer that was stream"
-        assert result["api_calls"] == 1  # No retries
-
-    def test_partial_stream_recovery_on_empty_stub(self, agent):
-        """When stub response has no content but text was streamed, use streamed text."""
-        self._setup_agent(agent)
-        # Stub response with no content (old behavior before fix)
-        empty_stub = _mock_response(content=None, finish_reason="stop")
-
-        def _fake_api_call(api_kwargs):
-            # Simulate what streaming does: accumulate text before returning
-            # a stub with no content (connection died mid-stream)
-            agent._current_streamed_assistant_text = "The answer to your question is that"
-            return empty_stub
-
-        status_messages = []
-
-        def _capture_status(msg):
-            status_messages.append(msg)
-
-        with (
-            patch.object(agent, "_interruptible_api_call", side_effect=_fake_api_call),
-            patch.object(agent, "_persist_session"),
-            patch.object(agent, "_save_trajectory"),
-            patch.object(agent, "_cleanup_task_resources"),
-            patch.object(agent, "_emit_status", side_effect=_capture_status),
-        ):
-            result = agent.run_conversation("ask me")
-        # Should recover partial streamed content, not fall through to (empty)
-        assert result["completed"] is True
-        assert result["final_response"] == "The answer to your question is that"
-        assert result["api_calls"] == 1  # No wasted retries
-        # Should emit the stream-interrupted status, NOT the empty-retry status
-        recovery_msgs = [m for m in status_messages if "stream interrupted" in m.lower()]
-        assert len(recovery_msgs) >= 1, f"Expected stream recovery status, got: {status_messages}"
-        # Should NOT have retry statuses
-        retry_msgs = [m for m in status_messages if "retrying" in m.lower()]
-        assert len(retry_msgs) == 0, f"Should not retry when stream content exists: {status_messages}"
-
-    def test_partial_stream_recovery_preempts_prior_turn_fallback(self, agent):
-        """Partial streamed content takes priority over _last_content_with_tools fallback."""
-        self._setup_agent(agent)
-        # Set up the prior-turn fallback content (from a previous turn with tool calls)
-        agent._last_content_with_tools = "Old content from prior turn with tools"
-        # Stub response with no content
-        empty_stub = _mock_response(content=None, finish_reason="stop")
-
-        def _fake_api_call(api_kwargs):
-            # Simulate partial streaming before connection death
-            agent._current_streamed_assistant_text = "Fresh partial content from this turn"
-            return empty_stub
-
-        with (
-            patch.object(agent, "_interruptible_api_call", side_effect=_fake_api_call),
-            patch.object(agent, "_persist_session"),
-            patch.object(agent, "_save_trajectory"),
-            patch.object(agent, "_cleanup_task_resources"),
-        ):
-            result = agent.run_conversation("question")
-        # Should use the streamed content, not the old prior-turn fallback
-        assert result["final_response"] == "Fresh partial content from this turn"
-        assert result["api_calls"] == 1
 
     def test_nous_401_refreshes_after_remint_and_retries(self, agent):
         self._setup_agent(agent)
@@ -2161,9 +2171,8 @@ class TestRunConversation:
         assert "Thinking Budget Exhausted" in result["final_response"]
         assert "/thinkon" in result["final_response"]
 
-    def test_length_empty_content_without_think_tags_retries_normally(self, agent):
-        """When finish_reason='length' and content is None but no think tags,
-        fall through to normal continuation retry (not thinking-exhaustion)."""
+    def test_length_empty_content_detected_as_thinking_exhausted(self, agent):
+        """When finish_reason='length' and content is None/empty, detect exhaustion."""
         self._setup_agent(agent)
         resp = _mock_response(content=None, finish_reason="length")
         agent.client.chat.completions.create.return_value = resp
@@ -2175,101 +2184,12 @@ class TestRunConversation:
         ):
             result = agent.run_conversation("hello")
 
-        # Without think tags, the agent should attempt continuation retries
-        # (up to 3), not immediately fire thinking-exhaustion.
-        assert result["api_calls"] == 3
         assert result["completed"] is False
-
-    def test_length_with_tool_calls_returns_partial_without_executing_tools(self, agent):
-        self._setup_agent(agent)
-        bad_tc = _mock_tool_call(
-            name="write_file",
-            arguments='{"path":"report.md","content":"partial',
-            call_id="c1",
-        )
-        resp = _mock_response(content="", finish_reason="length", tool_calls=[bad_tc])
-        agent.client.chat.completions.create.return_value = resp
-
-        with (
-            patch("run_agent.handle_function_call") as mock_handle_function_call,
-            patch.object(agent, "_persist_session"),
-            patch.object(agent, "_save_trajectory"),
-            patch.object(agent, "_cleanup_task_resources"),
-        ):
-            result = agent.run_conversation("write the report")
-
-        assert result["completed"] is False
-        assert result["partial"] is True
-        assert "truncated due to output length limit" in result["error"]
-        mock_handle_function_call.assert_not_called()
-
-    def test_truncated_tool_call_retries_once_before_refusing(self, agent):
-        """When tool call args are truncated, the agent retries the API call
-        once. If the retry succeeds (valid JSON args), tool execution proceeds."""
-        self._setup_agent(agent)
-        agent.valid_tool_names.add("write_file")
-        bad_tc = _mock_tool_call(
-            name="write_file",
-            arguments='{"path":"report.md","content":"partial',
-            call_id="c1",
-        )
-        truncated_resp = _mock_response(
-            content="", finish_reason="length", tool_calls=[bad_tc],
-        )
-        good_tc = _mock_tool_call(
-            name="write_file",
-            arguments='{"path":"report.md","content":"full content"}',
-            call_id="c2",
-        )
-        good_resp = _mock_response(
-            content="", finish_reason="stop", tool_calls=[good_tc],
-        )
-        with (
-            patch("run_agent.handle_function_call", return_value='{"success":true}') as mock_hfc,
-            patch.object(agent, "_persist_session"),
-            patch.object(agent, "_save_trajectory"),
-            patch.object(agent, "_cleanup_task_resources"),
-        ):
-            # First call: truncated → retry. Second: valid → execute tool.
-            # Third: final text response.
-            final_resp = _mock_response(content="Done!", finish_reason="stop")
-            agent.client.chat.completions.create.side_effect = [
-                truncated_resp, good_resp, final_resp,
-            ]
-            result = agent.run_conversation("write the report")
-
-        # Tool was executed on the retry (good_resp)
-        mock_hfc.assert_called_once()
-        assert result["final_response"] == "Done!"
-
-    def test_truncated_tool_args_detected_when_finish_reason_not_length(self, agent):
-        """When a router rewrites finish_reason from 'length' to 'tool_calls',
-        truncated JSON arguments should still be detected and refused rather
-        than wasting 3 retry attempts."""
-        self._setup_agent(agent)
-        agent.valid_tool_names.add("write_file")
-        bad_tc = _mock_tool_call(
-            name="write_file",
-            arguments='{"path":"report.md","content":"partial',
-            call_id="c1",
-        )
-        resp = _mock_response(
-            content="", finish_reason="tool_calls", tool_calls=[bad_tc],
-        )
-        agent.client.chat.completions.create.return_value = resp
-
-        with (
-            patch("run_agent.handle_function_call") as mock_handle_function_call,
-            patch.object(agent, "_persist_session"),
-            patch.object(agent, "_save_trajectory"),
-            patch.object(agent, "_cleanup_task_resources"),
-        ):
-            result = agent.run_conversation("write the report")
-
-        assert result["completed"] is False
-        assert result["partial"] is True
-        assert "truncated due to output length limit" in result["error"]
-        mock_handle_function_call.assert_not_called()
+        assert result["api_calls"] == 1
+        assert "reasoning" in result["error"].lower()
+        # User-friendly message is returned
+        assert result["final_response"] is not None
+        assert "Thinking Budget Exhausted" in result["final_response"]
 
 
 class TestRetryExhaustion:
@@ -2341,28 +2261,6 @@ class TestRetryExhaustion:
         assert result.get("failed") is True
         assert "error" in result
         assert "rate limited" in result["error"]
-
-    def test_build_api_kwargs_error_no_unbound_local(self, agent):
-        """When _build_api_kwargs raises, except handler must not crash with UnboundLocalError.
-
-        Regression: _dump_api_request_debug(api_kwargs, ...) in the except block
-        referenced api_kwargs before it was assigned when _build_api_kwargs threw.
-        """
-        self._setup_agent(agent)
-        with (
-            patch.object(agent, "_build_api_kwargs", side_effect=ValueError("bad messages")),
-            patch.object(agent, "_persist_session"),
-            patch.object(agent, "_save_trajectory"),
-            patch.object(agent, "_cleanup_task_resources"),
-            patch("run_agent.time", self._make_fast_time_mock()),
-        ):
-            result = agent.run_conversation("hello")
-        # Must surface the real error, not UnboundLocalError
-        assert result.get("completed") is False
-        assert result.get("failed") is True
-        assert "error" in result
-        assert "UnboundLocalError" not in result.get("error", "")
-        assert "bad messages" in result["error"]
 
 
 # ---------------------------------------------------------------------------
@@ -2518,29 +2416,6 @@ class TestCredentialPoolRecovery:
         recovered, retry_same = agent._recover_with_credential_pool(
             status_code=402,
             has_retried_429=False,
-        )
-
-        assert recovered is True
-        assert retry_same is False
-        agent._swap_credential.assert_called_once_with(next_entry)
-
-    def test_recover_with_pool_rotates_on_billing_reason_even_with_http_400(self, agent):
-        next_entry = SimpleNamespace(label="secondary")
-
-        class _Pool:
-            def mark_exhausted_and_rotate(self, *, status_code, error_context=None):
-                assert status_code == 400
-                assert error_context == {"reason": "out_of_extra_usage"}
-                return next_entry
-
-        agent._credential_pool = _Pool()
-        agent._swap_credential = MagicMock()
-
-        recovered, retry_same = agent._recover_with_credential_pool(
-            status_code=400,
-            has_retried_429=False,
-            classified_reason=FailoverReason.billing,
-            error_context={"reason": "out_of_extra_usage"},
         )
 
         assert recovered is True
@@ -2816,12 +2691,74 @@ class TestSystemPromptStability:
         assert "Hermes Agent" in agent._cached_system_prompt
 
 class TestBudgetPressure:
-    """Budget exhaustion grace call system."""
+    """Budget pressure warning system (issue #414)."""
 
-    def test_grace_call_flags_initialized(self, agent):
-        """Agent should have budget grace call flags."""
-        assert agent._budget_exhausted_injected is False
-        assert agent._budget_grace_call is False
+    def test_no_warning_below_caution(self, agent):
+        agent.max_iterations = 60
+        assert agent._get_budget_warning(30) is None
+
+    def test_caution_at_70_percent(self, agent):
+        agent.max_iterations = 60
+        msg = agent._get_budget_warning(42)
+        assert msg is not None
+        assert "[BUDGET:" in msg
+        assert "18 iterations left" in msg
+
+    def test_warning_at_90_percent(self, agent):
+        agent.max_iterations = 60
+        msg = agent._get_budget_warning(54)
+        assert "[BUDGET WARNING:" in msg
+        assert "Provide your final response NOW" in msg
+
+    def test_last_iteration(self, agent):
+        agent.max_iterations = 60
+        msg = agent._get_budget_warning(59)
+        assert "1 iteration(s) left" in msg
+
+    def test_disabled(self, agent):
+        agent.max_iterations = 60
+        agent._budget_pressure_enabled = False
+        assert agent._get_budget_warning(55) is None
+
+    def test_zero_max_iterations(self, agent):
+        agent.max_iterations = 0
+        assert agent._get_budget_warning(0) is None
+
+    def test_injects_into_json_tool_result(self, agent):
+        """Warning should be injected as _budget_warning field in JSON tool results."""
+        import json
+        agent.max_iterations = 10
+        messages = [
+            {"role": "tool", "content": json.dumps({"output": "done", "exit_code": 0}), "tool_call_id": "tc1"}
+        ]
+        warning = agent._get_budget_warning(9)
+        assert warning is not None
+        # Simulate the injection logic
+        last_content = messages[-1]["content"]
+        parsed = json.loads(last_content)
+        parsed["_budget_warning"] = warning
+        messages[-1]["content"] = json.dumps(parsed, ensure_ascii=False)
+        result = json.loads(messages[-1]["content"])
+        assert "_budget_warning" in result
+        assert "BUDGET WARNING" in result["_budget_warning"]
+        assert result["output"] == "done"  # original content preserved
+
+    def test_appends_to_non_json_tool_result(self, agent):
+        """Warning should be appended as text for non-JSON tool results."""
+        agent.max_iterations = 10
+        messages = [
+            {"role": "tool", "content": "plain text result", "tool_call_id": "tc1"}
+        ]
+        warning = agent._get_budget_warning(9)
+        # Simulate injection logic for non-JSON
+        last_content = messages[-1]["content"]
+        try:
+            import json
+            json.loads(last_content)
+        except (json.JSONDecodeError, TypeError):
+            messages[-1]["content"] = last_content + f"\n\n{warning}"
+        assert "plain text result" in messages[-1]["content"]
+        assert "BUDGET WARNING" in messages[-1]["content"]
 
 
 class TestSafeWriter:
@@ -3187,6 +3124,52 @@ def test_is_openai_client_closed_falls_back_to_http_client():
     assert AIAgent._is_openai_client_closed(ClientWithHttpClient(http_closed=True)) is True
 
 
+def test_create_openai_client_disables_env_proxy_for_local_endpoint():
+    with (
+        patch("run_agent.get_tool_definitions", return_value=_make_tool_defs("web_search")),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI") as mock_openai,
+    ):
+        mock_openai.return_value = MagicMock()
+        agent = AIAgent(
+            api_key="local-key",
+            base_url="http://127.0.0.1:11434/v1",
+            provider="custom",
+            api_mode="chat_completions",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+
+        _, kwargs = mock_openai.call_args
+        http_client = kwargs.get("http_client")
+
+        assert http_client is not None
+        assert http_client._trust_env is False
+        http_client.close()
+
+
+def test_create_openai_client_keeps_default_transport_for_remote_endpoint():
+    with (
+        patch("run_agent.get_tool_definitions", return_value=_make_tool_defs("web_search")),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI") as mock_openai,
+    ):
+        mock_openai.return_value = MagicMock()
+        AIAgent(
+            api_key="remote-key",
+            base_url="https://openrouter.ai/api/v1",
+            provider="openrouter",
+            api_mode="chat_completions",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+
+        _, kwargs = mock_openai.call_args
+        assert "http_client" not in kwargs
+
+
 class TestAnthropicBaseUrlPassthrough:
     """Bug fix: base_url was filtered with 'anthropic in base_url', blocking proxies."""
 
@@ -3387,20 +3370,6 @@ class TestStreamingApiCall:
         assert tc[0].function.name == "search"
         assert tc[1].function.name == "read"
 
-    def test_truncated_tool_call_args_upgrade_finish_reason_to_length(self, agent):
-        chunks = [
-            _make_chunk(tool_calls=[_make_tc_delta(0, "call_1", "write_file", '{"path":"x.txt","content":"hel')]),
-        ]
-        agent.client.chat.completions.create.return_value = iter(chunks)
-
-        resp = agent._interruptible_streaming_api_call({"messages": []})
-
-        tc = resp.choices[0].message.tool_calls
-        assert len(tc) == 1
-        assert tc[0].function.name == "write_file"
-        assert tc[0].function.arguments == '{"path":"x.txt","content":"hel'
-        assert resp.choices[0].finish_reason == "length"
-
     def test_ollama_reused_index_separate_tool_calls(self, agent):
         """Ollama sends every tool call at index 0 with different ids.
 
@@ -3500,8 +3469,8 @@ class TestStreamingApiCall:
         call_kwargs = agent.client.chat.completions.create.call_args
         assert call_kwargs[1].get("stream") is True or call_kwargs.kwargs.get("stream") is True
 
-    def test_api_exception_propagates_no_non_streaming_fallback(self, agent):
-        """When streaming fails before any deltas, error propagates to the main retry loop."""
+    def test_api_exception_falls_back_to_non_streaming(self, agent):
+        """When streaming fails before any deltas, fallback to non-streaming is attempted."""
         agent.client.chat.completions.create.side_effect = ConnectionError("fail")
         # Prevent stream retry logic from replacing the mock client
         with patch.object(agent, "_replace_primary_openai_client", return_value=False):

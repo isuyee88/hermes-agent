@@ -9,6 +9,12 @@ from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_CLOUDFLARE_AI_GATEWAY_BASE_URL = (
+    "https://gateway.ai.cloudflare.com/v1/"
+    "d1215a30b84b673ef0367010b0e78c10/affiliate-manager"
+)
+DEFAULT_CLOUDFLARE_AI_GATEWAY_PROVIDER_ALLOWLIST = {"openrouter", "nvidia"}
+
 from hermes_cli import auth as auth_mod
 from agent.credential_pool import CredentialPool, PooledCredential, get_custom_provider_pool_key, load_pool
 from hermes_cli.auth import (
@@ -16,7 +22,6 @@ from hermes_cli.auth import (
     DEFAULT_CODEX_BASE_URL,
     DEFAULT_QWEN_BASE_URL,
     PROVIDER_REGISTRY,
-    _agent_key_is_usable,
     format_auth_error,
     resolve_provider,
     resolve_nous_runtime_credentials,
@@ -26,12 +31,77 @@ from hermes_cli.auth import (
     resolve_external_process_provider_credentials,
     has_usable_secret,
 )
-from hermes_cli.config import get_compatible_custom_providers, load_config
+from hermes_cli.config import load_config
 from hermes_constants import OPENROUTER_BASE_URL
 
 
 def _normalize_custom_provider_name(value: str) -> str:
     return value.strip().lower().replace(" ", "-")
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = str(os.getenv(name, "") or "").strip().lower()
+    if not raw:
+        return default
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _normalize_cloudflare_ai_gateway_base_url(raw_url: str) -> str:
+    base_url = str(raw_url or "").strip().rstrip("/")
+    if not base_url:
+        return ""
+
+    lower = base_url.lower()
+    if lower.endswith("/chat/completions"):
+        base_url = base_url[: -len("/chat/completions")]
+        lower = base_url.lower()
+    if lower.endswith("/v1/chat/completions"):
+        base_url = base_url[: -len("/v1/chat/completions")]
+        lower = base_url.lower()
+    if not lower.endswith("/compat"):
+        base_url = f"{base_url}/compat"
+    return base_url.rstrip("/")
+
+
+def _cloudflare_ai_gateway_base_url() -> str:
+    return _normalize_cloudflare_ai_gateway_base_url(
+        os.getenv("CLOUDFLARE_AI_GATEWAY_BASE_URL", DEFAULT_CLOUDFLARE_AI_GATEWAY_BASE_URL)
+    )
+
+
+def _cloudflare_ai_gateway_provider_allowlist() -> set[str]:
+    raw = str(os.getenv("HERMES_CLOUDFLARE_AI_GATEWAY_PROVIDERS", "") or "").strip()
+    if not raw:
+        return set(DEFAULT_CLOUDFLARE_AI_GATEWAY_PROVIDER_ALLOWLIST)
+    return {
+        item.strip().lower()
+        for item in raw.split(",")
+        if item.strip()
+    }
+
+
+def _should_route_via_cloudflare_ai_gateway(provider: str, *, api_mode: str) -> bool:
+    if not _env_flag("HERMES_INFERENCE_USE_CLOUDFLARE_AI_GATEWAY", default=False):
+        return False
+    if api_mode != "chat_completions":
+        return False
+    if not _cloudflare_ai_gateway_base_url():
+        return False
+    return str(provider or "").strip().lower() in _cloudflare_ai_gateway_provider_allowlist()
+
+
+def _resolve_cloudflare_ai_gateway_api_key(*candidates: Any) -> str:
+    ordered = [
+        os.getenv("CLOUDFLARE_API_TOKEN", ""),
+        os.getenv("CLOUDFLARE_AI_GATEWAY_API_KEY", ""),
+        os.getenv("AI_GATEWAY_API_KEY", ""),
+        *candidates,
+    ]
+    api_key = next(
+        (str(candidate or "").strip() for candidate in ordered if has_usable_secret(candidate)),
+        "",
+    )
+    return api_key or "no-key-required"
 
 
 def _detect_api_mode_for_url(base_url: str) -> Optional[str]:
@@ -275,56 +345,14 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
             return None
 
     config = load_config()
-    
-    # First check providers: dict (new-style user-defined providers)
-    providers = config.get("providers")
-    if isinstance(providers, dict):
-        for ep_name, entry in providers.items():
-            if not isinstance(entry, dict):
-                continue
-            # Match exact name or normalized name
-            name_norm = _normalize_custom_provider_name(ep_name)
-            # Resolve the API key from the env var name stored in key_env
-            key_env = str(entry.get("key_env", "") or "").strip()
-            resolved_api_key = os.getenv(key_env, "").strip() if key_env else ""
-
-            if requested_norm in {ep_name, name_norm, f"custom:{name_norm}"}:
-                # Found match by provider key
-                base_url = entry.get("api") or entry.get("url") or entry.get("base_url") or ""
-                if base_url:
-                    return {
-                        "name": entry.get("name", ep_name),
-                        "base_url": base_url.strip(),
-                        "api_key": resolved_api_key,
-                        "model": entry.get("default_model", ""),
-                    }
-            # Also check the 'name' field if present
-            display_name = entry.get("name", "")
-            if display_name:
-                display_norm = _normalize_custom_provider_name(display_name)
-                if requested_norm in {display_name, display_norm, f"custom:{display_norm}"}:
-                    # Found match by display name
-                    base_url = entry.get("api") or entry.get("url") or entry.get("base_url") or ""
-                    if base_url:
-                        return {
-                            "name": display_name,
-                            "base_url": base_url.strip(),
-                            "api_key": resolved_api_key,
-                            "model": entry.get("default_model", ""),
-                        }
-
-    # Fall back to custom_providers: list (legacy format)
     custom_providers = config.get("custom_providers")
-    if isinstance(custom_providers, dict):
-        logger.warning(
-            "custom_providers in config.yaml is a dict, not a list. "
-            "Each entry must be prefixed with '-' in YAML. "
-            "Run 'hermes doctor' for details."
-        )
-        return None
-
-    custom_providers = get_compatible_custom_providers(config)
-    if not custom_providers:
+    if not isinstance(custom_providers, list):
+        if isinstance(custom_providers, dict):
+            logger.warning(
+                "custom_providers in config.yaml is a dict, not a list. "
+                "Each entry must be prefixed with '-' in YAML. "
+                "Run 'hermes doctor' for details."
+            )
         return None
 
     for entry in custom_providers:
@@ -336,27 +364,16 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
             continue
         name_norm = _normalize_custom_provider_name(name)
         menu_key = f"custom:{name_norm}"
-        provider_key = str(entry.get("provider_key", "") or "").strip()
-        provider_key_norm = _normalize_custom_provider_name(provider_key) if provider_key else ""
-        provider_menu_key = f"custom:{provider_key_norm}" if provider_key_norm else ""
-        if requested_norm not in {name_norm, menu_key, provider_key_norm, provider_menu_key}:
+        if requested_norm not in {name_norm, menu_key}:
             continue
         result = {
             "name": name.strip(),
             "base_url": base_url.strip(),
             "api_key": str(entry.get("api_key", "") or "").strip(),
         }
-        key_env = str(entry.get("key_env", "") or "").strip()
-        if key_env:
-            result["key_env"] = key_env
-        if provider_key:
-            result["provider_key"] = provider_key
         api_mode = _parse_api_mode(entry.get("api_mode"))
         if api_mode:
             result["api_mode"] = api_mode
-        model_name = str(entry.get("model", "") or "").strip()
-        if model_name:
-            result["model"] = model_name
         return result
 
     return None
@@ -382,23 +399,17 @@ def _resolve_named_custom_runtime(
     # Check if a credential pool exists for this custom endpoint
     pool_result = _try_resolve_from_custom_pool(base_url, "custom", custom_provider.get("api_mode"))
     if pool_result:
-        # Propagate the model name even when using pooled credentials —
-        # the pool doesn't know about the custom_providers model field.
-        model_name = custom_provider.get("model")
-        if model_name:
-            pool_result["model"] = model_name
         return pool_result
 
     api_key_candidates = [
         (explicit_api_key or "").strip(),
         str(custom_provider.get("api_key", "") or "").strip(),
-        os.getenv(str(custom_provider.get("key_env", "") or "").strip(), "").strip(),
         os.getenv("OPENAI_API_KEY", "").strip(),
         os.getenv("OPENROUTER_API_KEY", "").strip(),
     ]
     api_key = next((candidate for candidate in api_key_candidates if has_usable_secret(candidate)), "")
 
-    result = {
+    return {
         "provider": "custom",
         "api_mode": custom_provider.get("api_mode")
         or _detect_api_mode_for_url(base_url)
@@ -407,11 +418,6 @@ def _resolve_named_custom_runtime(
         "api_key": api_key or "no-key-required",
         "source": f"custom_provider:{custom_provider.get('name', requested_provider)}",
     }
-    # Propagate the model name so callers can override self.model when the
-    # provider name differs from the actual model string the API expects.
-    if custom_provider.get("model"):
-        result["model"] = custom_provider["model"]
-    return result
 
 
 def _resolve_openrouter_runtime(
@@ -499,6 +505,14 @@ def _resolve_openrouter_runtime(
 
     if effective_provider == "custom" and not api_key and not _is_openrouter_url:
         api_key = "no-key-required"
+
+    if not explicit_base_url and _should_route_via_cloudflare_ai_gateway(
+        effective_provider,
+        api_mode=_parse_api_mode(model_cfg.get("api_mode")) or _detect_api_mode_for_url(base_url) or "chat_completions",
+    ):
+        base_url = _cloudflare_ai_gateway_base_url()
+        api_key = _resolve_cloudflare_ai_gateway_api_key(api_key)
+        source = "cloudflare-ai-gateway"
 
     return {
         "provider": effective_provider,
@@ -608,7 +622,7 @@ def _resolve_explicit_runtime(
 
         base_url = explicit_base_url
         if not base_url:
-            if provider in ("kimi-coding", "kimi-coding-cn"):
+            if provider == "kimi-coding":
                 creds = resolve_api_key_provider_credentials(provider)
                 base_url = creds.get("base_url", "").rstrip("/")
             else:
@@ -696,6 +710,12 @@ def resolve_runtime_provider(
             and not has_custom_endpoint
             and not has_runtime_override
         )
+        if _env_flag("HERMES_INFERENCE_USE_CLOUDFLARE_AI_GATEWAY", default=False):
+            if provider in _cloudflare_ai_gateway_provider_allowlist() and _cloudflare_ai_gateway_base_url():
+                should_use_pool = False
+    elif _env_flag("HERMES_INFERENCE_USE_CLOUDFLARE_AI_GATEWAY", default=False):
+        if provider in _cloudflare_ai_gateway_provider_allowlist() and _cloudflare_ai_gateway_base_url():
+            should_use_pool = False
 
     try:
         pool = load_pool(provider) if should_use_pool else None
@@ -709,21 +729,6 @@ def resolve_runtime_provider(
                 getattr(entry, "runtime_api_key", None)
                 or getattr(entry, "access_token", "")
             )
-        # For Nous, the pool entry's runtime_api_key is the agent_key — a
-        # short-lived inference credential (~30 min TTL).  The pool doesn't
-        # refresh it during selection (that would trigger network calls in
-        # non-runtime contexts like `hermes auth list`).  If the key is
-        # expired, clear pool_api_key so we fall through to
-        # resolve_nous_runtime_credentials() which handles refresh + mint.
-        if provider == "nous" and entry is not None and pool_api_key:
-            min_ttl = max(60, int(os.getenv("HERMES_NOUS_MIN_KEY_TTL_SECONDS", "1800")))
-            nous_state = {
-                "agent_key": getattr(entry, "agent_key", None),
-                "agent_key_expires_at": getattr(entry, "agent_key_expires_at", None),
-            }
-            if not _agent_key_is_usable(nous_state, min_ttl):
-                logger.debug("Nous pool entry agent_key expired/missing, falling through to runtime resolution")
-                pool_api_key = ""
         if entry is not None and pool_api_key:
             return _resolve_runtime_from_pool_entry(
                 provider=provider,
@@ -835,8 +840,32 @@ def resolve_runtime_provider(
 
     # API-key providers (z.ai/GLM, Kimi, MiniMax, MiniMax-CN)
     pconfig = PROVIDER_REGISTRY.get(provider)
+    if provider == "nvidia" and pconfig is None:
+        creds = resolve_api_key_provider_credentials(provider)
+        api_key = creds.get("api_key", "")
+        cfg_provider = str(model_cfg.get("provider") or "").strip().lower()
+        cfg_base_url = ""
+        if cfg_provider == provider:
+            cfg_base_url = (model_cfg.get("base_url") or "").strip().rstrip("/")
+        base_url = cfg_base_url or creds.get("base_url", "").rstrip("/")
+        api_mode = "chat_completions"
+        if not explicit_base_url and _should_route_via_cloudflare_ai_gateway(provider, api_mode=api_mode):
+            base_url = _cloudflare_ai_gateway_base_url()
+            api_key = _resolve_cloudflare_ai_gateway_api_key(creds.get("api_key", ""))
+            source = "cloudflare-ai-gateway"
+        else:
+            source = creds.get("source", "env")
+        return {
+            "provider": provider,
+            "api_mode": api_mode,
+            "base_url": base_url,
+            "api_key": api_key,
+            "source": source,
+            "requested_provider": requested_provider,
+        }
     if pconfig and pconfig.auth_type == "api_key":
         creds = resolve_api_key_provider_credentials(provider)
+        api_key = creds.get("api_key", "")
         # Honour model.base_url from config.yaml when the configured provider
         # matches this provider — mirrors the Anthropic path above.  Without
         # this, users who set model.base_url to e.g. api.minimaxi.com/anthropic
@@ -865,12 +894,19 @@ def resolve_runtime_provider(
         # Strip trailing /v1 for OpenCode Anthropic models (see comment above).
         if api_mode == "anthropic_messages" and provider in ("opencode-zen", "opencode-go"):
             base_url = re.sub(r"/v1/?$", "", base_url)
+
+        if not explicit_base_url and _should_route_via_cloudflare_ai_gateway(provider, api_mode=api_mode):
+            base_url = _cloudflare_ai_gateway_base_url()
+            api_key = _resolve_cloudflare_ai_gateway_api_key(creds.get("api_key", ""))
+            source = "cloudflare-ai-gateway"
+        else:
+            source = creds.get("source", "env")
         return {
             "provider": provider,
             "api_mode": api_mode,
             "base_url": base_url,
-            "api_key": creds.get("api_key", ""),
-            "source": creds.get("source", "env"),
+            "api_key": api_key,
+            "source": source,
             "requested_provider": requested_provider,
         }
 

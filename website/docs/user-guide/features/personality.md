@@ -181,6 +181,12 @@ Hermes ships with built-in personalities you can switch to with `/personality`.
 | **technical** | Detailed, accurate technical expert |
 | **creative** | Innovative, outside-the-box thinking |
 | **teacher** | Patient educator with clear examples |
+| **board** | Chairman / board-review mode for strategy, risk, and stop-go decisions |
+| **ceo** | Startup operator mode for goals, priorities, and execution cadence |
+| **grow** | Growth mode for distribution, conversion, and product packaging |
+| **cto** | Technical delivery mode for implementation, reliability, and cost |
+| **staff** | Chief-of-staff mode for synthesis, coordination, and follow-through |
+| **sev** | Incident commander mode for triage, recovery, and postmortems |
 | **kawaii** | Cute expressions, sparkles, and enthusiasm ★ |
 | **catgirl** | Neko-chan with cat-like expressions, nya~ |
 | **pirate** | Captain Hermes, tech-savvy buccaneer |
@@ -197,6 +203,8 @@ Hermes ships with built-in personalities you can switch to with `/personality`.
 
 ```text
 /personality
+/personality ceo
+/personality cto
 /personality concise
 /personality technical
 ```
@@ -204,7 +212,7 @@ Hermes ships with built-in personalities you can switch to with `/personality`.
 ### Messaging platforms
 
 ```text
-/personality teacher
+/personality staff
 ```
 
 These are convenient overlays, but your global `SOUL.md` still gives Hermes its persistent default personality unless the overlay meaningfully changes it.

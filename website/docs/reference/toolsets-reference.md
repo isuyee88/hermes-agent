@@ -80,7 +80,29 @@ These expand to multiple core toolsets, providing a convenient shorthand for com
 | Toolset | Expands to | Use case |
 |---------|-----------|----------|
 | `debugging` | `patch`, `process`, `read_file`, `search_files`, `terminal`, `web_extract`, `web_search`, `write_file` | Debug sessions — file access, terminal, and web research without browser or delegation overhead. |
-| `safe` | `image_generate`, `vision_analyze`, `web_extract`, `web_search` | Read-only research and media generation. No file writes, no terminal access, no code execution. Good for untrusted or constrained environments. |
+| `safe` | `image_generate`, `mixture_of_agents`, `vision_analyze`, `web_extract`, `web_search` | Read-only research and media generation. No file writes, no terminal access, no code execution. Good for untrusted or constrained environments. |
+
+## Role Presets
+
+These presets are tuned for startup and affiliate-team workflows where Hermes needs both reasoning and execution surfaces:
+
+| Toolset | Highlights | Best for |
+|---------|------------|----------|
+| `founder-max` | Browser, terminal, file, code execution, delegation, messaging | Founder / CEO work, cross-functional execution, high-agency operator loops |
+| `growth-max` | Browser, web, vision, image generation, messaging | Funnel review, growth experiments, landing-page walkthroughs |
+| `content-max` | Browser, web, vision, image generation | Editorial research, repurposing, creative QA |
+| `seo-max` | Browser, web, file, memory | SERP research, site inspection, on-page reviews |
+| `ads-max` | Browser, web, vision, image generation | Paid acquisition diagnosis, creative iteration |
+| `bd-max` | Browser, web, messaging, memory | Partner research, outreach, follow-up planning |
+| `ops-max` | Browser, messaging, cronjob, memory | Publishing flows, handoffs, recurring operating loops |
+| `finance-max` | File, code execution, web, memory | ROI review, reconciliations, profitability analysis |
+| `cto-max` | `founder-max` + `debugging` | Technical leadership, implementation, verification |
+| `collab-safe` | Browser, web, messaging, memory; no terminal/file mutation | High-capability messaging surfaces such as Feishu or API control rooms |
+
+Project-specific note:
+
+- If collaboration backends are central to your operation, layer native integration toolsets on top of role presets instead of bloating the preset itself.
+- Example: `cli: [founder-max, feishu]` keeps the startup operator preset generic while giving your project full Feishu workspace reach.
 
 ## Platform Toolsets
 
@@ -88,8 +110,8 @@ Platform toolsets define the complete tool configuration for a deployment target
 
 | Toolset | Differences from `hermes-cli` |
 |---------|-------------------------------|
-| `hermes-cli` | Full toolset — all 36 tools including `clarify`. The default for interactive CLI sessions. |
-| `hermes-acp` | Drops `clarify`, `cronjob`, `image_generate`, `send_message`, `text_to_speech`, homeassistant tools. Focused on coding tasks in IDE context. |
+| `hermes-cli` | Full toolset — all 38 tools including `clarify`. The default for interactive CLI sessions. |
+| `hermes-acp` | Drops `clarify`, `cronjob`, `image_generate`, `mixture_of_agents`, `send_message`, `text_to_speech`, homeassistant tools. Focused on coding tasks in IDE context. |
 | `hermes-api-server` | Drops `clarify`, `send_message`, and `text_to_speech`. Adds everything else — suitable for programmatic access where user interaction isn't possible. |
 | `hermes-telegram` | Same as `hermes-cli`. |
 | `hermes-discord` | Same as `hermes-cli`. |
@@ -103,8 +125,6 @@ Platform toolsets define the complete tool configuration for a deployment target
 | `hermes-dingtalk` | Same as `hermes-cli`. |
 | `hermes-feishu` | Same as `hermes-cli`. |
 | `hermes-wecom` | Same as `hermes-cli`. |
-| `hermes-wecom-callback` | WeCom callback toolset — enterprise self-built app messaging (full access). |
-| `hermes-weixin` | Same as `hermes-cli`. |
 | `hermes-bluebubbles` | Same as `hermes-cli`. |
 | `hermes-homeassistant` | Same as `hermes-cli`. |
 | `hermes-webhook` | Same as `hermes-cli`. |

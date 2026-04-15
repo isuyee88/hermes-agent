@@ -164,6 +164,72 @@ So Hermes will not pretend a server has resources/prompts if it does not.
 
 ## Common patterns
 
+### Pattern 0: startup / affiliate stack
+
+For operator-heavy teams, keep the MCP surface layered instead of exposing every server everywhere:
+
+- `knowledge-core`: docs, project knowledge, code, bounded filesystem
+- `growth-data`: SEO, analytics, ads, research, reporting
+- `bd-stack`: CRM, outreach, contacts, partner notes
+- `finance-stack`: reconciliation, payout, billing, ROI inputs
+- `restricted`: deletes, refunds, budget-changing or account-admin actions
+
+Practical rule:
+
+- `CLI` can see the broadest MCP surface
+- messaging surfaces should prefer `collab-safe` plus a small allowlist of MCP servers
+- use `tools.include` first, `tools.exclude` second
+- only enable `resources` / `prompts` when they materially improve the workflow
+
+Concrete template:
+
+```yaml
+mcp_servers:
+  knowledge_core:
+    command: "npx"
+    args: ["-y", "@modelcontextprotocol/server-filesystem", "/workspace/docs"]
+    tools:
+      include: [read_file, list_directory, search_files]
+      prompts: false
+      resources: false
+
+  growth_data:
+    url: "https://mcp.analytics.example.com"
+    headers:
+      Authorization: "Bearer ${ANALYTICS_MCP_TOKEN}"
+    tools:
+      include: [run_report, list_dashboards, get_dashboard]
+      prompts: false
+      resources: false
+
+  bd_stack:
+    url: "https://mcp.crm.example.com"
+    headers:
+      Authorization: "Bearer ${CRM_MCP_TOKEN}"
+    tools:
+      include: [list_accounts, get_account, list_contacts]
+      prompts: false
+      resources: false
+
+  finance_stack:
+    url: "https://mcp.finance.example.com"
+    headers:
+      Authorization: "Bearer ${FINANCE_MCP_TOKEN}"
+    tools:
+      include: [list_invoices, get_invoice, list_payouts]
+      prompts: false
+      resources: false
+```
+
+Recommended pairing:
+
+- `cli`
+  broadest visibility across `knowledge_core`, `growth_data`, `bd_stack`, and `finance_stack`
+- `feishu`, `telegram`, other messaging surfaces
+  only the smallest allowlist needed for that platform's operator workflow
+- `restricted`
+  keep destructive or account-admin MCP servers out of normal toolsets entirely unless a session explicitly needs them
+
 ### Pattern 1: local project assistant
 
 Use MCP for a repo-local filesystem or git server when you want Hermes to reason over a bounded workspace.

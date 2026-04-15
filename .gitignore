@@ -51,9 +51,6 @@ ignored/
 .worktrees/
 environments/benchmarks/evals/
 
-# Web UI build output
-hermes_cli/web_dist/
-
 # Release script temp files
 .release_notes.md
 mini-swe-agent/
@@ -61,4 +58,25 @@ mini-swe-agent/
 # Nix
 .direnv/
 result
-website/static/api/skills-index.json
+
+# Temp/modal debug files
+.tmp-*
+.modal-debug/
+.modal-py3*/
+.playwright-cli/
+tmp-modal-*
+scripts/feishu-bot-eval.mjs
+scripts/feishu-web-bot-eval.mjs
+tools/model_registry_refresh.py
+tests/tools/test_model_registry_refresh.py
+# Modal inspect temp
+tmp-modal-inspect/
+# Random hash-named temp files
+[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*
+_[0-9a-f]*
+
+# Local runtime/plugin state
+.hermes/
+
+# Cloudflare Wrangler local cache
+**/.wrangler/

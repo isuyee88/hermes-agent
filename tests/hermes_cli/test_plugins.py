@@ -1,5 +1,6 @@
 """Tests for the Hermes plugin system (hermes_cli.plugins)."""
 
+import json
 import logging
 import os
 import sys
@@ -89,6 +90,51 @@ class TestPluginDiscovery:
         mgr.discover_and_load()
 
         assert "proj_plugin" not in mgr._plugins
+
+    def test_discover_project_plugins_via_config_flag(self, tmp_path, monkeypatch):
+        """Project plugins can also be enabled via config.yaml."""
+        project_dir = tmp_path / "project"
+        project_dir.mkdir()
+        monkeypatch.chdir(project_dir)
+        plugins_dir = project_dir / ".hermes" / "plugins"
+        _make_plugin_dir(plugins_dir, "proj_plugin")
+
+        fake_home = tmp_path / "hermes_test"
+        fake_home.mkdir(exist_ok=True)
+        monkeypatch.setenv("HERMES_HOME", str(fake_home))
+        (fake_home / "config.yaml").write_text(
+            yaml.dump({"plugins": {"enable_project": True}}),
+            encoding="utf-8",
+        )
+
+        mgr = PluginManager()
+        mgr.discover_and_load()
+
+        assert "proj_plugin" in mgr._plugins
+        assert mgr._plugins["proj_plugin"].enabled
+
+    def test_discover_project_plugins_from_parent_repo_root(self, tmp_path, monkeypatch):
+        """Nested app cwd still discovers the nearest ancestor project plugin dir."""
+        repo_root = tmp_path / "repo"
+        app_dir = repo_root / "hermes-agent"
+        app_dir.mkdir(parents=True)
+        plugins_dir = repo_root / ".hermes" / "plugins"
+        _make_plugin_dir(plugins_dir, "ancestor_plugin")
+
+        fake_home = tmp_path / "hermes_test"
+        fake_home.mkdir(exist_ok=True)
+        monkeypatch.setenv("HERMES_HOME", str(fake_home))
+        (fake_home / "config.yaml").write_text(
+            yaml.dump({"plugins": {"enable_project": True}}),
+            encoding="utf-8",
+        )
+        monkeypatch.chdir(app_dir)
+
+        mgr = PluginManager()
+        mgr.discover_and_load()
+
+        assert "ancestor_plugin" in mgr._plugins
+        assert mgr._plugins["ancestor_plugin"].enabled
 
     def test_discover_is_idempotent(self, tmp_path, monkeypatch):
         """Calling discover_and_load() twice does not duplicate plugins."""
@@ -388,6 +434,90 @@ class TestPluginToolVisibility:
         tools3 = get_tool_definitions(quiet_mode=True)
         tool_names3 = [t["function"]["name"] for t in tools3]
         assert "vis_tool" in tool_names3
+
+    def test_startup_ops_style_plugin_tool_returns_recent_events(self, tmp_path, monkeypatch):
+        import hermes_cli.plugins as plugins_mod
+
+        plugins_dir = tmp_path / "hermes_test" / "plugins"
+        plugin_dir = plugins_dir / "startup_ops"
+        plugin_dir.mkdir(parents=True)
+        (plugin_dir / "plugin.yaml").write_text(
+            yaml.dump({"name": "startup_ops", "version": "0.1.0"}),
+            encoding="utf-8",
+        )
+        (plugin_dir / "__init__.py").write_text(
+            "import json\n"
+            "from pathlib import Path\n"
+            "LOG = Path(__file__).resolve().parent / 'events.jsonl'\n"
+            "def recent(args, **kwargs):\n"
+            "    events = []\n"
+            "    if LOG.exists():\n"
+            "        for line in LOG.read_text(encoding='utf-8').splitlines():\n"
+            "            events.append(json.loads(line))\n"
+            "    return json.dumps({'events': events}, ensure_ascii=False)\n"
+            "def post_tool(**kwargs):\n"
+            "    with LOG.open('a', encoding='utf-8') as fh:\n"
+            "        fh.write(json.dumps({'kind': 'post_tool_call', 'tool_name': kwargs.get('tool_name')}, ensure_ascii=False) + '\\n')\n"
+            "def register(ctx):\n"
+            "    ctx.register_tool(name='startup_ops_recent_events', toolset='plugin_startup_ops', schema={'name': 'startup_ops_recent_events', 'description': 'recent events', 'parameters': {'type': 'object', 'properties': {}}}, handler=recent)\n"
+            "    ctx.register_hook('post_tool_call', post_tool)\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_test"))
+
+        mgr = PluginManager()
+        mgr.discover_and_load()
+        monkeypatch.setattr(plugins_mod, "_plugin_manager", mgr)
+        mgr.invoke_hook("post_tool_call", tool_name="browser_navigate", args={}, result="{}", task_id="s1")
+
+        from tools.registry import registry
+
+        payload = json.loads(registry.dispatch("startup_ops_recent_events", {}))
+        assert payload["events"][0]["tool_name"] == "browser_navigate"
+
+    def test_startup_ops_style_plugin_summary_aggregates_tools(self, tmp_path, monkeypatch):
+        import hermes_cli.plugins as plugins_mod
+
+        plugins_dir = tmp_path / "hermes_test" / "plugins"
+        plugin_dir = plugins_dir / "startup_ops"
+        plugin_dir.mkdir(parents=True)
+        (plugin_dir / "plugin.yaml").write_text(
+            yaml.dump({"name": "startup_ops", "version": "0.1.0"}),
+            encoding="utf-8",
+        )
+        (plugin_dir / "__init__.py").write_text(
+            "import json\n"
+            "from collections import Counter\n"
+            "from pathlib import Path\n"
+            "LOG = Path(__file__).resolve().parent / 'events.jsonl'\n"
+            "def summary(args, **kwargs):\n"
+            "    events = []\n"
+            "    if LOG.exists():\n"
+            "        for line in LOG.read_text(encoding='utf-8').splitlines():\n"
+            "            events.append(json.loads(line))\n"
+            "    counter = Counter(e.get('tool_name') for e in events if e.get('tool_name'))\n"
+            "    return json.dumps({'top_tools': counter.most_common()}, ensure_ascii=False)\n"
+            "def post_tool(**kwargs):\n"
+            "    with LOG.open('a', encoding='utf-8') as fh:\n"
+            "        fh.write(json.dumps({'kind': 'post_tool_call', 'tool_name': kwargs.get('tool_name')}, ensure_ascii=False) + '\\n')\n"
+            "def register(ctx):\n"
+            "    ctx.register_tool(name='startup_ops_summary', toolset='plugin_startup_ops', schema={'name': 'startup_ops_summary', 'description': 'summary', 'parameters': {'type': 'object', 'properties': {}}}, handler=summary)\n"
+            "    ctx.register_hook('post_tool_call', post_tool)\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_test"))
+
+        mgr = PluginManager()
+        mgr.discover_and_load()
+        monkeypatch.setattr(plugins_mod, "_plugin_manager", mgr)
+        mgr.invoke_hook("post_tool_call", tool_name="browser_navigate", args={}, result="{}", task_id="s1")
+        mgr.invoke_hook("post_tool_call", tool_name="browser_navigate", args={}, result="{}", task_id="s1")
+        mgr.invoke_hook("post_tool_call", tool_name="web_search", args={}, result="{}", task_id="s1")
+
+        from tools.registry import registry
+
+        payload = json.loads(registry.dispatch("startup_ops_summary", {}))
+        assert payload["top_tools"][0] == ["browser_navigate", 2]
 
 
 # ── TestPluginManagerList ──────────────────────────────────────────────────

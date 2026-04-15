@@ -65,6 +65,10 @@ Every installed skill is automatically a slash command. Just type its name:
 /ascii-art Make a banner that says "HELLO WORLD"
 /plan Design a REST API for a todo app
 /github-pr-workflow Create a PR for the auth refactor
+/affiliate-os Audit our affiliate operating bottleneck and propose this week's plan
+/browser-ops Walk through our landing page and identify the first three conversion blockers
+/automation-os Turn our weekly competitor page check into a recurring monitored workflow
+/content-os Turn this launch note into a blog post + X thread + email outline
 
 # Just the skill name (no task) loads it and lets you describe what you need
 /excalidraw

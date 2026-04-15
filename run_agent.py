@@ -87,14 +87,13 @@ from agent.model_metadata import (
     fetch_model_metadata,
     estimate_tokens_rough, estimate_messages_tokens_rough, estimate_request_tokens_rough,
     get_next_probe_tier, parse_context_limit_from_error,
-    parse_available_output_tokens_from_error,
     save_context_length, is_local_endpoint,
     query_ollama_num_ctx,
 )
 from agent.context_compressor import ContextCompressor
 from agent.subdirectory_hints import SubdirectoryHintTracker
 from agent.prompt_caching import apply_anthropic_cache_control
-from agent.prompt_builder import build_skills_system_prompt, build_context_files_prompt, build_environment_hints, load_soul_md, TOOL_USE_ENFORCEMENT_GUIDANCE, TOOL_USE_ENFORCEMENT_MODELS, DEVELOPER_ROLE_MODELS, GOOGLE_MODEL_OPERATIONAL_GUIDANCE, OPENAI_MODEL_EXECUTION_GUIDANCE
+from agent.prompt_builder import build_skills_system_prompt, build_context_files_prompt, load_soul_md, TOOL_USE_ENFORCEMENT_GUIDANCE, TOOL_USE_ENFORCEMENT_MODELS, DEVELOPER_ROLE_MODELS, GOOGLE_MODEL_OPERATIONAL_GUIDANCE, OPENAI_MODEL_EXECUTION_GUIDANCE
 from agent.usage_pricing import estimate_usage_cost, normalize_usage
 from agent.display import (
     KawaiiSpinner, build_tool_preview as _build_tool_preview,
@@ -117,7 +116,7 @@ class _SafeWriter:
     daemon, the stdout/stderr pipe can become unavailable (idle timeout, buffer
     exhaustion, socket reset). Any print() call then raises
     ``OSError: [Errno 5] Input/output error``, which can crash agent setup or
-    run_conversation() — especially via double-fault when an except handler
+    run_conversation() 鈥?especially via double-fault when an except handler
     also tries to print.
 
     Additionally, when subagents run in ThreadPoolExecutor threads, the shared
@@ -173,7 +172,7 @@ class IterationBudget:
     Each agent (parent or subagent) gets its own ``IterationBudget``.
     The parent's budget is capped at ``max_iterations`` (default 90).
     Each subagent gets an independent budget capped at
-    ``delegation.max_iterations`` (default 50) — this means total
+    ``delegation.max_iterations`` (default 50) 鈥?this means total
     iterations across parent + subagents can exceed the parent's cap.
     Users control the per-subagent limit via ``delegation.max_iterations``
     in config.yaml.
@@ -280,14 +279,14 @@ def _should_parallelize_tool_batch(tool_calls) -> bool:
             function_args = json.loads(tool_call.function.arguments)
         except Exception:
             logging.debug(
-                "Could not parse args for %s — defaulting to sequential; raw=%s",
+                "Could not parse args for %s 鈥?defaulting to sequential; raw=%s",
                 tool_name,
                 tool_call.function.arguments[:200],
             )
             return False
         if not isinstance(function_args, dict):
             logging.debug(
-                "Non-dict args for %s (%s) — defaulting to sequential",
+                "Non-dict args for %s (%s) 鈥?defaulting to sequential",
                 tool_name,
                 type(function_args).__name__,
             )
@@ -339,7 +338,10 @@ def _paths_overlap(left: Path, right: Path) -> bool:
 
 _SURROGATE_RE = re.compile(r'[\ud800-\udfff]')
 
-
+_BUDGET_WARNING_RE = re.compile(
+    r"\[BUDGET(?:\s+WARNING)?:\s+Iteration\s+\d+/\d+\..*?\]",
+    re.DOTALL,
+)
 
 
 def _sanitize_surrogates(text: str) -> str:
@@ -356,9 +358,8 @@ def _sanitize_surrogates(text: str) -> str:
 def _sanitize_messages_surrogates(messages: list) -> bool:
     """Sanitize surrogate characters from all string content in a messages list.
 
-    Walks message dicts in-place. Returns True if any surrogates were found
-    and replaced, False otherwise. Covers content/text, name, and tool call
-    metadata/arguments so retries don't fail on a non-content field.
+    Walks message dicts in-place.  Returns True if any surrogates were found
+    and replaced, False otherwise.
     """
     found = False
     for msg in messages:
@@ -375,135 +376,46 @@ def _sanitize_messages_surrogates(messages: list) -> bool:
                     if isinstance(text, str) and _SURROGATE_RE.search(text):
                         part["text"] = _SURROGATE_RE.sub('\ufffd', text)
                         found = True
-        name = msg.get("name")
-        if isinstance(name, str) and _SURROGATE_RE.search(name):
-            msg["name"] = _SURROGATE_RE.sub('\ufffd', name)
-            found = True
-        tool_calls = msg.get("tool_calls")
-        if isinstance(tool_calls, list):
-            for tc in tool_calls:
-                if not isinstance(tc, dict):
-                    continue
-                tc_id = tc.get("id")
-                if isinstance(tc_id, str) and _SURROGATE_RE.search(tc_id):
-                    tc["id"] = _SURROGATE_RE.sub('\ufffd', tc_id)
-                    found = True
-                fn = tc.get("function")
-                if isinstance(fn, dict):
-                    fn_name = fn.get("name")
-                    if isinstance(fn_name, str) and _SURROGATE_RE.search(fn_name):
-                        fn["name"] = _SURROGATE_RE.sub('\ufffd', fn_name)
-                        found = True
-                    fn_args = fn.get("arguments")
-                    if isinstance(fn_args, str) and _SURROGATE_RE.search(fn_args):
-                        fn["arguments"] = _SURROGATE_RE.sub('\ufffd', fn_args)
-                        found = True
     return found
 
 
-def _strip_non_ascii(text: str) -> str:
-    """Remove non-ASCII characters, replacing with closest ASCII equivalent or removing.
+def _strip_budget_warnings_from_history(messages: list) -> None:
+    """Remove budget pressure warnings from tool-result messages in-place.
 
-    Used as a last resort when the system encoding is ASCII and can't handle
-    any non-ASCII characters (e.g. LANG=C on Chromebooks).
+    Budget warnings are turn-scoped signals that must not leak into replayed
+    history.  They live in tool-result ``content`` either as a JSON key
+    (``_budget_warning``) or appended plain text.
     """
-    return text.encode('ascii', errors='ignore').decode('ascii')
-
-
-def _sanitize_messages_non_ascii(messages: list) -> bool:
-    """Strip non-ASCII characters from all string content in a messages list.
-
-    This is a last-resort recovery for systems with ASCII-only encoding
-    (LANG=C, Chromebooks, minimal containers).  Returns True if any
-    non-ASCII content was found and sanitized.
-    """
-    found = False
     for msg in messages:
-        if not isinstance(msg, dict):
+        if not isinstance(msg, dict) or msg.get("role") != "tool":
             continue
-        # Sanitize content (string)
         content = msg.get("content")
-        if isinstance(content, str):
-            sanitized = _strip_non_ascii(content)
-            if sanitized != content:
-                msg["content"] = sanitized
-                found = True
-        elif isinstance(content, list):
-            for part in content:
-                if isinstance(part, dict):
-                    text = part.get("text")
-                    if isinstance(text, str):
-                        sanitized = _strip_non_ascii(text)
-                        if sanitized != text:
-                            part["text"] = sanitized
-                            found = True
-        # Sanitize name field (can contain non-ASCII in tool results)
-        name = msg.get("name")
-        if isinstance(name, str):
-            sanitized = _strip_non_ascii(name)
-            if sanitized != name:
-                msg["name"] = sanitized
-                found = True
-        # Sanitize tool_calls
-        tool_calls = msg.get("tool_calls")
-        if isinstance(tool_calls, list):
-            for tc in tool_calls:
-                if isinstance(tc, dict):
-                    fn = tc.get("function", {})
-                    if isinstance(fn, dict):
-                        fn_args = fn.get("arguments")
-                        if isinstance(fn_args, str):
-                            sanitized = _strip_non_ascii(fn_args)
-                            if sanitized != fn_args:
-                                fn["arguments"] = sanitized
-                                found = True
-    return found
+        if not isinstance(content, str) or "_budget_warning" not in content and "[BUDGET" not in content:
+            continue
 
+        # Try JSON first (the common case: _budget_warning key in a dict)
+        try:
+            parsed = json.loads(content)
+            if isinstance(parsed, dict) and "_budget_warning" in parsed:
+                del parsed["_budget_warning"]
+                msg["content"] = json.dumps(parsed, ensure_ascii=False)
+                continue
+        except (json.JSONDecodeError, TypeError):
+            pass
 
-def _sanitize_tools_non_ascii(tools: list) -> bool:
-    """Strip non-ASCII characters from tool payloads in-place."""
-    return _sanitize_structure_non_ascii(tools)
-
-
-def _sanitize_structure_non_ascii(payload: Any) -> bool:
-    """Strip non-ASCII characters from nested dict/list payloads in-place."""
-    found = False
-
-    def _walk(node):
-        nonlocal found
-        if isinstance(node, dict):
-            for key, value in node.items():
-                if isinstance(value, str):
-                    sanitized = _strip_non_ascii(value)
-                    if sanitized != value:
-                        node[key] = sanitized
-                        found = True
-                elif isinstance(value, (dict, list)):
-                    _walk(value)
-        elif isinstance(node, list):
-            for idx, value in enumerate(node):
-                if isinstance(value, str):
-                    sanitized = _strip_non_ascii(value)
-                    if sanitized != value:
-                        node[idx] = sanitized
-                        found = True
-                elif isinstance(value, (dict, list)):
-                    _walk(value)
-
-    _walk(payload)
-    return found
-
-
-
+        # Fallback: strip the text pattern from plain-text tool results
+        cleaned = _BUDGET_WARNING_RE.sub("", content).strip()
+        if cleaned != content:
+            msg["content"] = cleaned
 
 
 # =========================================================================
-# Large tool result handler — save oversized output to temp file
+# Large tool result handler 鈥?save oversized output to temp file
 # =========================================================================
 
 
 # =========================================================================
-# Qwen Portal headers — mimics QwenCode CLI for portal.qwen.ai compatibility.
+# Qwen Portal headers 鈥?mimics QwenCode CLI for portal.qwen.ai compatibility.
 # Extracted as a module-level helper so both __init__ and
 # _apply_client_headers_for_base_url can share it.
 # =========================================================================
@@ -531,7 +443,7 @@ class AIAgent:
     for AI models that support function calling.
     """
 
-    # ── Class-level context pressure dedup (survives across instances) ──
+    # 鈹€鈹€ Class-level context pressure dedup (survives across instances) 鈹€鈹€
     # The gateway creates a new AIAgent per message, so instance-level flags
     # reset every time.  This dict tracks {session_id: (warn_level, timestamp)}
     # to suppress duplicate warnings within a cooldown window.
@@ -583,13 +495,10 @@ class AIAgent:
         clarify_callback: callable = None,
         step_callback: callable = None,
         stream_delta_callback: callable = None,
-        interim_assistant_callback: callable = None,
         tool_gen_callback: callable = None,
         status_callback: callable = None,
         max_tokens: int = None,
         reasoning_config: Dict[str, Any] = None,
-        service_tier: str = None,
-        request_overrides: Dict[str, Any] = None,
         prefill_messages: List[Dict[str, Any]] = None,
         platform: str = None,
         user_id: str = None,
@@ -604,6 +513,8 @@ class AIAgent:
         checkpoint_max_snapshots: int = 50,
         pass_session_id: bool = False,
         persist_session: bool = True,
+        trace_session_key: str = None,
+        trace_metadata: Dict[str, Any] = None,
     ):
         """
         Initialize the AI Agent.
@@ -640,6 +551,8 @@ class AIAgent:
                 Example: [{"role": "user", "content": "Hi!"}, {"role": "assistant", "content": "Hello!"}]
             platform (str): The interface platform the user is on (e.g. "cli", "telegram", "discord", "whatsapp").
                 Used to inject platform-specific formatting hints into the system prompt.
+            trace_session_key (str): Stable session identifier for OpenRouter broadcast tracing.
+            trace_metadata (Dict): Optional sanitized metadata to attach to OpenRouter trace payloads.
             skip_context_files (bool): If True, skip auto-injection of SOUL.md, AGENTS.md, and .cursorrules
                 into the system prompt. Use this for batch processing and data generation to avoid
                 polluting trajectories with user-specific persona or project instructions.
@@ -648,7 +561,7 @@ class AIAgent:
 
         self.model = model
         self.max_iterations = max_iterations
-        # Shared iteration budget — parent creates, children inherit.
+        # Shared iteration budget 鈥?parent creates, children inherit.
         # Consumed by every LLM turn across parent + all subagents.
         self.iteration_budget = iteration_budget or IterationBudget(max_iterations)
         self.tool_delay = tool_delay
@@ -658,7 +571,9 @@ class AIAgent:
         self.ephemeral_system_prompt = ephemeral_system_prompt
         self.platform = platform  # "cli", "telegram", "discord", "whatsapp", etc.
         self._user_id = user_id  # Platform user identifier (gateway sessions)
-        # Pluggable print function — CLI replaces this with _cprint so that
+        self._trace_session_key = str(trace_session_key or "").strip()
+        self._trace_metadata = dict(trace_metadata or {})
+        # Pluggable print function 鈥?CLI replaces this with _cprint so that
         # raw ANSI status lines are routed through prompt_toolkit's renderer
         # instead of going directly to stdout where patch_stdout's StdoutProxy
         # would mangle the escape sequences.  None = use builtins.print.
@@ -694,25 +609,10 @@ class AIAgent:
         else:
             self.api_mode = "chat_completions"
 
-        try:
-            from hermes_cli.model_normalize import (
-                _AGGREGATOR_PROVIDERS,
-                normalize_model_for_provider,
-            )
-
-            if self.provider not in _AGGREGATOR_PROVIDERS:
-                self.model = normalize_model_for_provider(self.model, self.provider)
-        except Exception:
-            pass
-
-        # GPT-5.x models require the Responses API path — they are rejected
-        # on /v1/chat/completions by both OpenAI and OpenRouter.  Also
-        # auto-upgrade for direct OpenAI URLs (api.openai.com) since all
-        # newer tool-calling models prefer Responses there.
-        if self.api_mode == "chat_completions" and (
-            self._is_direct_openai_url()
-            or self._model_requires_responses_api(self.model)
-        ):
+        # Direct OpenAI sessions use the Responses API path.  GPT-5.x tool
+        # calls with reasoning are rejected on /v1/chat/completions, and
+        # Hermes is a tool-using client by default.
+        if self.api_mode == "chat_completions" and self._is_direct_openai_url():
             self.api_mode = "codex_responses"
 
         # Pre-warm OpenRouter model metadata cache in a background thread.
@@ -727,25 +627,23 @@ class AIAgent:
         self.tool_progress_callback = tool_progress_callback
         self.tool_start_callback = tool_start_callback
         self.tool_complete_callback = tool_complete_callback
-        self.suppress_status_output = False
         self.thinking_callback = thinking_callback
         self.reasoning_callback = reasoning_callback
+        self._reasoning_deltas_fired = False  # Set by _fire_reasoning_delta, reset per API call
         self.clarify_callback = clarify_callback
         self.step_callback = step_callback
         self.stream_delta_callback = stream_delta_callback
-        self.interim_assistant_callback = interim_assistant_callback
         self.status_callback = status_callback
         self.tool_gen_callback = tool_gen_callback
 
         
-        # Tool execution state — allows _vprint during tool execution
+        # Tool execution state 鈥?allows _vprint during tool execution
         # even when stream consumers are registered (no tokens streaming then)
         self._executing_tools = False
 
         # Interrupt mechanism for breaking out of tool loops
         self._interrupt_requested = False
         self._interrupt_message = None  # Optional message that triggered interrupt
-        self._execution_thread_id: int | None = None  # Set at run_conversation() start
         self._client_lock = threading.RLock()
         
         # Subagent delegation state
@@ -768,36 +666,31 @@ class AIAgent:
         # Model response configuration
         self.max_tokens = max_tokens  # None = use model default
         self.reasoning_config = reasoning_config  # None = use default (medium for OpenRouter)
-        self.service_tier = service_tier
-        self.request_overrides = dict(request_overrides or {})
         self.prefill_messages = prefill_messages or []  # Prefilled conversation turns
-        self._force_ascii_payload = False
         
         # Anthropic prompt caching: auto-enabled for Claude models via OpenRouter.
         # Reduces input costs by ~75% on multi-turn conversations by caching the
         # conversation prefix. Uses system_and_3 strategy (4 breakpoints).
         is_openrouter = self._is_openrouter_url()
         is_claude = "claude" in self.model.lower()
-        is_native_anthropic = self.api_mode == "anthropic_messages" and self.provider == "anthropic"
+        is_native_anthropic = self.api_mode == "anthropic_messages"
         self._use_prompt_caching = (is_openrouter and is_claude) or is_native_anthropic
         self._cache_ttl = "5m"  # Default 5-minute TTL (1.25x write cost)
         
-        # Iteration budget: the LLM is only notified when it actually exhausts
-        # the iteration budget (api_call_count >= max_iterations).  At that
-        # point we inject ONE message, allow one final API call, and if the
-        # model doesn't produce a text response, force a user-message asking
-        # it to summarise.  No intermediate pressure warnings — they caused
-        # models to "give up" prematurely on complex tasks (#7915).
-        self._budget_exhausted_injected = False
-        self._budget_grace_call = False
+        # Iteration budget pressure: warn the LLM as it approaches max_iterations.
+        # Warnings are injected into the last tool result JSON (not as separate
+        # messages) so they don't break message structure or invalidate caching.
+        self._budget_caution_threshold = 0.7   # 70% 鈥?nudge to start wrapping up
+        self._budget_warning_threshold = 0.9   # 90% 鈥?urgent, respond now
+        self._budget_pressure_enabled = True
 
         # Context pressure warnings: notify the USER (not the LLM) as context
-        # fills up.  Purely informational — displayed in CLI output and sent via
+        # fills up.  Purely informational 鈥?displayed in CLI output and sent via
         # status_callback for gateway platforms.  Does NOT inject into messages.
         # Tiered: fires at 85% and again at 95% of compaction threshold.
         self._context_pressure_warned_at = 0.0  # highest tier already shown
 
-        # Activity tracking — updated on each API call, tool execution, and
+        # Activity tracking 鈥?updated on each API call, tool execution, and
         # stream chunk.  Used by the gateway timeout handler to report what the
         # agent was doing when it was killed, and by the "still working"
         # notifications to show progress.
@@ -806,11 +699,11 @@ class AIAgent:
         self._current_tool: str | None = None
         self._api_call_count: int = 0
 
-        # Rate limit tracking — updated from x-ratelimit-* response headers
+        # Rate limit tracking 鈥?updated from x-ratelimit-* response headers
         # after each API call.  Accessed by /usage slash command.
         self._rate_limit_state: Optional["RateLimitState"] = None
 
-        # Centralized logging — agent.log (INFO+) and errors.log (WARNING+)
+        # Centralized logging 鈥?agent.log (INFO+) and errors.log (WARNING+)
         # both live under ~/.hermes/logs/.  Idempotent, so gateway mode
         # (which creates a new AIAgent per message) won't duplicate handlers.
         from hermes_logging import setup_logging, setup_verbose_logging
@@ -837,14 +730,9 @@ class AIAgent:
         # Internal stream callback (set during streaming TTS).
         # Initialized here so _vprint can reference it before run_conversation.
         self._stream_callback = None
-        # Deferred paragraph break flag — set after tool iterations so a
+        # Deferred paragraph break flag 鈥?set after tool iterations so a
         # single "\n\n" is prepended to the next real text delta.
         self._stream_needs_break = False
-        # Visible assistant text already delivered through live token callbacks
-        # during the current model response. Used to avoid re-sending the same
-        # commentary when the provider later returns it as a completed interim
-        # assistant message.
-        self._current_streamed_assistant_text = ""
 
         # Optional current-turn user-message override used when the API-facing
         # user message intentionally differs from the persisted transcript
@@ -882,12 +770,12 @@ class AIAgent:
             self.client = None
             self._client_kwargs = {}
             if not self.quiet_mode:
-                print(f"🤖 AI Agent initialized with model: {self.model} (Anthropic native)")
+                print(f"馃 AI Agent initialized with model: {self.model} (Anthropic native)")
                 if effective_key and len(effective_key) > 12:
-                    print(f"🔑 Using token: {effective_key[:8]}...{effective_key[-4:]}")
+                    print(f"馃攽 Using token: {effective_key[:8]}...{effective_key[-4:]}")
         else:
             if api_key and base_url:
-                # Explicit credentials from CLI/gateway — construct directly.
+                # Explicit credentials from CLI/gateway 鈥?construct directly.
                 # The runtime provider resolver already handled auth for us.
                 client_kwargs = {"api_key": api_key, "base_url": base_url}
                 if self.provider == "copilot-acp":
@@ -906,12 +794,12 @@ class AIAgent:
                     client_kwargs["default_headers"] = copilot_default_headers()
                 elif "api.kimi.com" in effective_base.lower():
                     client_kwargs["default_headers"] = {
-                        "User-Agent": "KimiCLI/1.30.0",
+                        "User-Agent": "KimiCLI/1.3",
                     }
                 elif "portal.qwen.ai" in effective_base.lower():
                     client_kwargs["default_headers"] = _qwen_portal_headers()
             else:
-                # No explicit creds — use the centralized provider router
+                # No explicit creds 鈥?use the centralized provider router
                 from agent.auxiliary_client import resolve_provider_client
                 _routed_client, _ = resolve_provider_client(
                     self.provider or "auto", model=self.model, raw_codex=True)
@@ -949,7 +837,7 @@ class AIAgent:
 
             # Enable fine-grained tool streaming for Claude on OpenRouter.
             # Without this, Anthropic buffers the entire tool call and goes
-            # silent for minutes while thinking — OpenRouter's upstream proxy
+            # silent for minutes while thinking 鈥?OpenRouter's upstream proxy
             # times out during the silence.  The beta header makes Anthropic
             # stream tool call arguments token-by-token, keeping the
             # connection alive.
@@ -966,23 +854,22 @@ class AIAgent:
                     client_kwargs["default_headers"] = headers
 
             self.api_key = client_kwargs.get("api_key", "")
-            self.base_url = client_kwargs.get("base_url", self.base_url)
             try:
                 self.client = self._create_openai_client(client_kwargs, reason="agent_init", shared=True)
                 if not self.quiet_mode:
-                    print(f"🤖 AI Agent initialized with model: {self.model}")
+                    print(f"馃 AI Agent initialized with model: {self.model}")
                     if base_url:
-                        print(f"🔗 Using custom base URL: {base_url}")
+                        print(f"馃敆 Using custom base URL: {base_url}")
                     # Always show API key info (masked) for debugging auth issues
                     key_used = client_kwargs.get("api_key", "none")
                     if key_used and key_used != "dummy-key" and len(key_used) > 12:
-                        print(f"🔑 Using API key: {key_used[:8]}...{key_used[-4:]}")
+                        print(f"馃攽 Using API key: {key_used[:8]}...{key_used[-4:]}")
                     else:
-                        print(f"⚠️  Warning: API key appears invalid or missing (got: '{key_used[:20] if key_used else 'none'}...')")
+                        print(f"鈿狅笍  Warning: API key appears invalid or missing (got: '{key_used[:20] if key_used else 'none'}...')")
             except Exception as e:
                 raise RuntimeError(f"Failed to initialize OpenAI client: {e}")
         
-        # Provider fallback chain — ordered list of backup providers tried
+        # Provider fallback chain 鈥?ordered list of backup providers tried
         # when the primary is exhausted (rate-limit, overload, connection
         # failure).  Supports both legacy single-dict ``fallback_model`` and
         # new list ``fallback_providers`` format.
@@ -997,15 +884,16 @@ class AIAgent:
             self._fallback_chain = []
         self._fallback_index = 0
         self._fallback_activated = False
+        self._turn_fallback_activations = 0
         # Legacy attribute kept for backward compat (tests, external callers)
         self._fallback_model = self._fallback_chain[0] if self._fallback_chain else None
         if self._fallback_chain and not self.quiet_mode:
             if len(self._fallback_chain) == 1:
                 fb = self._fallback_chain[0]
-                print(f"🔄 Fallback model: {fb['model']} ({fb['provider']})")
+                print(f"馃攧 Fallback model: {fb['model']} ({fb['provider']})")
             else:
-                print(f"🔄 Fallback chain ({len(self._fallback_chain)} providers): " +
-                      " → ".join(f"{f['model']} ({f['provider']})" for f in self._fallback_chain))
+                print(f"馃攧 Fallback chain ({len(self._fallback_chain)} providers): " +
+                      " 鈫?".join(f"{f['model']} ({f['provider']})" for f in self._fallback_chain))
 
         # Get available tools with filtering
         self.tools = get_tool_definitions(
@@ -1020,36 +908,36 @@ class AIAgent:
             self.valid_tool_names = {tool["function"]["name"] for tool in self.tools}
             tool_names = sorted(self.valid_tool_names)
             if not self.quiet_mode:
-                print(f"🛠️  Loaded {len(self.tools)} tools: {', '.join(tool_names)}")
+                print(f"馃洜锔? Loaded {len(self.tools)} tools: {', '.join(tool_names)}")
                 
                 # Show filtering info if applied
                 if enabled_toolsets:
-                    print(f"   ✅ Enabled toolsets: {', '.join(enabled_toolsets)}")
+                    print(f"   鉁?Enabled toolsets: {', '.join(enabled_toolsets)}")
                 if disabled_toolsets:
-                    print(f"   ❌ Disabled toolsets: {', '.join(disabled_toolsets)}")
+                    print(f"   鉂?Disabled toolsets: {', '.join(disabled_toolsets)}")
         elif not self.quiet_mode:
-            print("🛠️  No tools loaded (all tools filtered out or unavailable)")
+            print("馃洜锔? No tools loaded (all tools filtered out or unavailable)")
         
         # Check tool requirements
         if self.tools and not self.quiet_mode:
             requirements = check_toolset_requirements()
             missing_reqs = [name for name, available in requirements.items() if not available]
             if missing_reqs:
-                print(f"⚠️  Some tools may not work due to missing requirements: {missing_reqs}")
+                print(f"鈿狅笍  Some tools may not work due to missing requirements: {missing_reqs}")
         
         # Show trajectory saving status
         if self.save_trajectories and not self.quiet_mode:
-            print("📝 Trajectory saving enabled")
+            print("馃摑 Trajectory saving enabled")
         
         # Show ephemeral system prompt status
         if self.ephemeral_system_prompt and not self.quiet_mode:
             prompt_preview = self.ephemeral_system_prompt[:60] + "..." if len(self.ephemeral_system_prompt) > 60 else self.ephemeral_system_prompt
-            print(f"🔒 Ephemeral system prompt: '{prompt_preview}' (not saved to trajectories)")
+            print(f"馃敀 Ephemeral system prompt: '{prompt_preview}' (not saved to trajectories)")
         
         # Show prompt caching status
         if self._use_prompt_caching and not self.quiet_mode:
             source = "native Anthropic" if is_native_anthropic else "Claude via OpenRouter"
-            print(f"💾 Prompt caching: ENABLED ({source}, {self._cache_ttl} TTL)")
+            print(f"馃捑 Prompt caching: ENABLED ({source}, {self._cache_ttl} TTL)")
         
         # Session logging setup - auto-save conversation trajectories for debugging
         self.session_start = datetime.now()
@@ -1074,7 +962,7 @@ class AIAgent:
         # Cached system prompt -- built once per session, only rebuilt on compression
         self._cached_system_prompt: Optional[str] = None
         
-        # Filesystem checkpoint manager (transparent — not a tool)
+        # Filesystem checkpoint manager (transparent 鈥?not a tool)
         from tools.checkpoint_manager import CheckpointManager
         self._checkpoint_mgr = CheckpointManager(
             enabled=checkpoints_enabled,
@@ -1102,7 +990,7 @@ class AIAgent:
             except Exception as e:
                 # Transient SQLite lock contention (e.g. CLI and gateway writing
                 # concurrently) must NOT permanently disable session_search for
-                # this agent.  Keep _session_db alive — subsequent message
+                # this agent.  Keep _session_db alive 鈥?subsequent message
                 # flushes and session_search calls will still work once the
                 # lock clears.  The session row may be missing from the index
                 # for this run, but that is recoverable (flushes upsert rows).
@@ -1148,7 +1036,7 @@ class AIAgent:
         
 
 
-        # Memory provider plugin (external — one at a time, alongside built-in)
+        # Memory provider plugin (external 鈥?one at a time, alongside built-in)
         # Reads memory.provider from config to select which plugin to activate.
         self._memory_manager = None
         if not skip_memory:
@@ -1158,7 +1046,7 @@ class AIAgent:
                 # Auto-migrate: if Honcho was actively configured (enabled +
                 # credentials) but memory.provider is not set, activate the
                 # honcho plugin automatically.  Just having the config file
-                # is not enough — the user may have disabled Honcho or the
+                # is not enough 鈥?the user may have disabled Honcho or the
                 # file may be from a different tool.
                 if not _mem_provider_name:
                     try:
@@ -1175,7 +1063,7 @@ class AIAgent:
                             except Exception:
                                 pass
                             if not self.quiet_mode:
-                                print("  ✓ Auto-migrated Honcho to memory provider plugin.")
+                                print("  鉁?Auto-migrated Honcho to memory provider plugin.")
                                 print("    Your config and data are preserved.\n")
                     except Exception:
                         pass
@@ -1232,7 +1120,7 @@ class AIAgent:
         except Exception:
             pass
 
-        # Tool-use enforcement config: "auto" (default — matches hardcoded
+        # Tool-use enforcement config: "auto" (default 鈥?matches hardcoded
         # model list), true (always), false (never), or list of substrings.
         _agent_section = _agent_cfg.get("agent", {})
         if not isinstance(_agent_section, dict):
@@ -1247,6 +1135,7 @@ class AIAgent:
             _compression_cfg = {}
         compression_threshold = float(_compression_cfg.get("threshold", 0.50))
         compression_enabled = str(_compression_cfg.get("enabled", True)).lower() in ("true", "1", "yes")
+        compression_summary_model = _compression_cfg.get("summary_model") or None
         compression_target_ratio = float(_compression_cfg.get("target_ratio", 0.20))
         compression_protect_last = int(_compression_cfg.get("protect_last_n", 20))
 
@@ -1262,131 +1151,41 @@ class AIAgent:
             except (TypeError, ValueError):
                 _config_context_length = None
 
-        # Store for reuse in switch_model (so config override persists across model switches)
-        self._config_context_length = _config_context_length
-
         # Check custom_providers per-model context_length
         if _config_context_length is None:
-            try:
-                from hermes_cli.config import get_compatible_custom_providers
-                _custom_providers = get_compatible_custom_providers(_agent_cfg)
-            except Exception:
-                _custom_providers = _agent_cfg.get("custom_providers")
-                if not isinstance(_custom_providers, list):
-                    _custom_providers = []
-            for _cp_entry in _custom_providers:
-                if not isinstance(_cp_entry, dict):
-                    continue
-                _cp_url = (_cp_entry.get("base_url") or "").rstrip("/")
-                if _cp_url and _cp_url == self.base_url.rstrip("/"):
-                    _cp_models = _cp_entry.get("models", {})
-                    if isinstance(_cp_models, dict):
-                        _cp_model_cfg = _cp_models.get(self.model, {})
-                        if isinstance(_cp_model_cfg, dict):
-                            _cp_ctx = _cp_model_cfg.get("context_length")
-                            if _cp_ctx is not None:
-                                try:
-                                    _config_context_length = int(_cp_ctx)
-                                except (TypeError, ValueError):
-                                    pass
-                    break
+            _custom_providers = _agent_cfg.get("custom_providers")
+            if isinstance(_custom_providers, list):
+                for _cp_entry in _custom_providers:
+                    if not isinstance(_cp_entry, dict):
+                        continue
+                    _cp_url = (_cp_entry.get("base_url") or "").rstrip("/")
+                    if _cp_url and _cp_url == self.base_url.rstrip("/"):
+                        _cp_models = _cp_entry.get("models", {})
+                        if isinstance(_cp_models, dict):
+                            _cp_model_cfg = _cp_models.get(self.model, {})
+                            if isinstance(_cp_model_cfg, dict):
+                                _cp_ctx = _cp_model_cfg.get("context_length")
+                                if _cp_ctx is not None:
+                                    try:
+                                        _config_context_length = int(_cp_ctx)
+                                    except (TypeError, ValueError):
+                                        pass
+                        break
         
-        # Select context engine: config-driven (like memory providers).
-        # 1. Check config.yaml context.engine setting
-        # 2. Check plugins/context_engine/<name>/ directory (repo-shipped)
-        # 3. Check general plugin system (user-installed plugins)
-        # 4. Fall back to built-in ContextCompressor
-        _selected_engine = None
-        _engine_name = "compressor"  # default
-        try:
-            _ctx_cfg = _agent_cfg.get("context", {}) if isinstance(_agent_cfg, dict) else {}
-            _engine_name = _ctx_cfg.get("engine", "compressor") or "compressor"
-        except Exception:
-            pass
-
-        if _engine_name != "compressor":
-            # Try loading from plugins/context_engine/<name>/
-            try:
-                from plugins.context_engine import load_context_engine
-                _selected_engine = load_context_engine(_engine_name)
-            except Exception as _ce_load_err:
-                logger.debug("Context engine load from plugins/context_engine/: %s", _ce_load_err)
-
-            # Try general plugin system as fallback
-            if _selected_engine is None:
-                try:
-                    from hermes_cli.plugins import get_plugin_context_engine
-                    _candidate = get_plugin_context_engine()
-                    if _candidate and _candidate.name == _engine_name:
-                        _selected_engine = _candidate
-                except Exception:
-                    pass
-
-            if _selected_engine is None:
-                logger.warning(
-                    "Context engine '%s' not found — falling back to built-in compressor",
-                    _engine_name,
-                )
-        # else: config says "compressor" — use built-in, don't auto-activate plugins
-
-        if _selected_engine is not None:
-            self.context_compressor = _selected_engine
-            if not self.quiet_mode:
-                logger.info("Using context engine: %s", _selected_engine.name)
-        else:
-            self.context_compressor = ContextCompressor(
-                model=self.model,
-                threshold_percent=compression_threshold,
-                protect_first_n=3,
-                protect_last_n=compression_protect_last,
-                summary_target_ratio=compression_target_ratio,
-                summary_model_override=None,
-                quiet_mode=self.quiet_mode,
-                base_url=self.base_url,
-                api_key=getattr(self, "api_key", ""),
-                config_context_length=_config_context_length,
-                provider=self.provider,
-                api_mode=self.api_mode,
-            )
+        self.context_compressor = ContextCompressor(
+            model=self.model,
+            threshold_percent=compression_threshold,
+            protect_first_n=3,
+            protect_last_n=compression_protect_last,
+            summary_target_ratio=compression_target_ratio,
+            summary_model_override=compression_summary_model,
+            quiet_mode=self.quiet_mode,
+            base_url=self.base_url,
+            api_key=getattr(self, "api_key", ""),
+            config_context_length=_config_context_length,
+            provider=self.provider,
+        )
         self.compression_enabled = compression_enabled
-
-        # Reject models whose context window is below the minimum required
-        # for reliable tool-calling workflows (64K tokens).
-        from agent.model_metadata import MINIMUM_CONTEXT_LENGTH
-        _ctx = getattr(self.context_compressor, "context_length", 0)
-        if _ctx and _ctx < MINIMUM_CONTEXT_LENGTH:
-            raise ValueError(
-                f"Model {self.model} has a context window of {_ctx:,} tokens, "
-                f"which is below the minimum {MINIMUM_CONTEXT_LENGTH:,} required "
-                f"by Hermes Agent.  Choose a model with at least "
-                f"{MINIMUM_CONTEXT_LENGTH // 1000}K context, or set "
-                f"model.context_length in config.yaml to override."
-            )
-
-        # Inject context engine tool schemas (e.g. lcm_grep, lcm_describe, lcm_expand)
-        self._context_engine_tool_names: set = set()
-        if hasattr(self, "context_compressor") and self.context_compressor and self.tools is not None:
-            for _schema in self.context_compressor.get_tool_schemas():
-                _wrapped = {"type": "function", "function": _schema}
-                self.tools.append(_wrapped)
-                _tname = _schema.get("name", "")
-                if _tname:
-                    self.valid_tool_names.add(_tname)
-                    self._context_engine_tool_names.add(_tname)
-
-        # Notify context engine of session start
-        if hasattr(self, "context_compressor") and self.context_compressor:
-            try:
-                self.context_compressor.on_session_start(
-                    self.session_id,
-                    hermes_home=str(get_hermes_home()),
-                    platform=self.platform or "cli",
-                    model=self.model,
-                    context_length=getattr(self.context_compressor, "context_length", 0),
-                )
-            except Exception as _ce_err:
-                logger.debug("Context engine on_session_start: %s", _ce_err)
-
         self._subdirectory_hints = SubdirectoryHintTracker(
             working_dir=os.getenv("TERMINAL_CWD") or None,
         )
@@ -1405,8 +1204,12 @@ class AIAgent:
         self.session_estimated_cost_usd = 0.0
         self.session_cost_status = "unknown"
         self.session_cost_source = "none"
+        self.session_billed_cost_usd = 0.0
+        self.session_upstream_inference_cost_usd = 0.0
+        self.session_cache_discount_usd = 0.0
+        self._last_provider_usage_metadata: dict[str, Any] = {}
         
-        # ── Ollama num_ctx injection ──
+        # 鈹€鈹€ Ollama num_ctx injection 鈹€鈹€
         # Ollama defaults to 2048 context regardless of the model's capabilities.
         # When running against an Ollama server, detect the model's max context
         # and pass num_ctx on every chat request so the full window is used.
@@ -1435,15 +1238,9 @@ class AIAgent:
 
         if not self.quiet_mode:
             if compression_enabled:
-                print(f"📊 Context limit: {self.context_compressor.context_length:,} tokens (compress at {int(compression_threshold*100)}% = {self.context_compressor.threshold_tokens:,})")
+                print(f"馃搳 Context limit: {self.context_compressor.context_length:,} tokens (compress at {int(compression_threshold*100)}% = {self.context_compressor.threshold_tokens:,})")
             else:
-                print(f"📊 Context limit: {self.context_compressor.context_length:,} tokens (auto-compression disabled)")
-
-        # Check immediately so CLI users see the warning at startup.
-        # Gateway status_callback is not yet wired, so any warning is stored
-        # in _compression_warning and replayed in the first run_conversation().
-        self._compression_warning = None
-        self._check_compression_model_feasibility()
+                print(f"馃搳 Context limit: {self.context_compressor.context_length:,} tokens (auto-compression disabled)")
 
         # Snapshot primary runtime for per-turn restoration.  When fallback
         # activates during a turn, the next turn restores these values so the
@@ -1458,13 +1255,11 @@ class AIAgent:
             "api_key": getattr(self, "api_key", ""),
             "client_kwargs": dict(self._client_kwargs),
             "use_prompt_caching": self._use_prompt_caching,
-            # Context engine state that _try_activate_fallback() overwrites.
-            # Use getattr for model/base_url/api_key/provider since plugin
-            # engines may not have these (they're ContextCompressor-specific).
-            "compressor_model": getattr(_cc, "model", self.model),
-            "compressor_base_url": getattr(_cc, "base_url", self.base_url),
+            # Compressor state that _try_activate_fallback() overwrites
+            "compressor_model": _cc.model,
+            "compressor_base_url": _cc.base_url,
             "compressor_api_key": getattr(_cc, "api_key", ""),
-            "compressor_provider": getattr(_cc, "provider", self.provider),
+            "compressor_provider": _cc.provider,
             "compressor_context_length": _cc.context_length,
             "compressor_threshold_tokens": _cc.threshold_tokens,
         }
@@ -1506,14 +1301,68 @@ class AIAgent:
         self.session_estimated_cost_usd = 0.0
         self.session_cost_status = "unknown"
         self.session_cost_source = "none"
+        self.session_billed_cost_usd = 0.0
+        self.session_upstream_inference_cost_usd = 0.0
+        self.session_cache_discount_usd = 0.0
+        self._last_provider_usage_metadata = {}
         
-        # Turn counter (added after reset_session_state was first written — #2635)
+        # Turn counter (added after reset_session_state was first written 鈥?#2635)
         self._user_turn_count = 0
 
-        # Context engine reset (works for both built-in compressor and plugins)
+        # Context compressor internal counters (if present)
         if hasattr(self, "context_compressor") and self.context_compressor:
-            self.context_compressor.on_session_reset()
+            self.context_compressor.last_prompt_tokens = 0
+            self.context_compressor.last_completion_tokens = 0
+            self.context_compressor.last_total_tokens = 0
+            self.context_compressor.compression_count = 0
+            self.context_compressor._context_probed = False
+            self.context_compressor._context_probe_persistable = False
+            # Iterative summary from previous session must not bleed into new one (#2635)
+            self.context_compressor._previous_summary = None
     
+    def _model_registry_identity(self, response_model: str | None = None) -> tuple[str, str]:
+        provider = str(getattr(self, "provider", "") or "").strip().lower()
+        model = str(response_model or getattr(self, "model", "") or "").strip()
+        return provider, model
+
+    def _note_model_registry_failure(
+        self,
+        *,
+        error_text: str,
+        failure_reason: str,
+        error_code: str | int | None = None,
+        response_model: str | None = None,
+        mirror_to_bitable: bool | None = True,
+    ) -> None:
+        provider, model = self._model_registry_identity(response_model=response_model)
+        if not provider or not model:
+            return
+        try:
+            from tools.model_registry_refresh import note_model_registry_failure
+
+            note_model_registry_failure(
+                provider=provider,
+                model=model,
+                error_text=error_text,
+                failure_reason=failure_reason,
+                error_code=error_code,
+                min_interval_seconds=30,
+                mirror_to_bitable=mirror_to_bitable,
+            )
+        except Exception as exc:
+            logger.debug("Failed to note model registry failure for %s/%s: %s", provider, model, exc)
+
+    def _note_model_registry_success(self, *, response_model: str | None = None) -> None:
+        provider, model = self._model_registry_identity(response_model=response_model)
+        if not provider or not model:
+            return
+        try:
+            from tools.model_registry_refresh import note_model_registry_success
+
+            note_model_registry_success(provider=provider, model=model)
+        except Exception as exc:
+            logger.debug("Failed to note model registry success for %s/%s: %s", provider, model, exc)
+
     def switch_model(self, new_model, new_provider, api_key='', base_url='', api_mode=''):
         """Switch the model/provider in-place for a live agent.
 
@@ -1531,14 +1380,14 @@ class AIAgent:
         import logging
         from hermes_cli.providers import determine_api_mode
 
-        # ── Determine api_mode if not provided ──
+        # 鈹€鈹€ Determine api_mode if not provided 鈹€鈹€
         if not api_mode:
             api_mode = determine_api_mode(new_provider, base_url)
 
         old_model = self.model
         old_provider = self.provider
 
-        # ── Swap core runtime fields ──
+        # 鈹€鈹€ Swap core runtime fields 鈹€鈹€
         self.model = new_model
         self.provider = new_provider
         self.base_url = base_url or self.base_url
@@ -1546,18 +1395,14 @@ class AIAgent:
         if api_key:
             self.api_key = api_key
 
-        # ── Build new client ──
+        # 鈹€鈹€ Build new client 鈹€鈹€
         if api_mode == "anthropic_messages":
             from agent.anthropic_adapter import (
                 build_anthropic_client,
                 resolve_anthropic_token,
                 _is_oauth_token,
             )
-            # Only fall back to ANTHROPIC_TOKEN when the provider is actually Anthropic.
-            # Other anthropic_messages providers (MiniMax, Alibaba, etc.) must use their own
-            # API key — falling back would send Anthropic credentials to third-party endpoints.
-            _is_native_anthropic = new_provider == "anthropic"
-            effective_key = (api_key or self.api_key or resolve_anthropic_token() or "") if _is_native_anthropic else (api_key or self.api_key or "")
+            effective_key = api_key or self.api_key or resolve_anthropic_token() or ""
             self.api_key = effective_key
             self._anthropic_api_key = effective_key
             self._anthropic_base_url = base_url or getattr(self, "_anthropic_base_url", None)
@@ -1580,14 +1425,14 @@ class AIAgent:
                 shared=True,
             )
 
-        # ── Re-evaluate prompt caching ──
-        is_native_anthropic = api_mode == "anthropic_messages" and new_provider == "anthropic"
+        # 鈹€鈹€ Re-evaluate prompt caching 鈹€鈹€
+        is_native_anthropic = api_mode == "anthropic_messages"
         self._use_prompt_caching = (
             ("openrouter" in (self.base_url or "").lower() and "claude" in new_model.lower())
             or is_native_anthropic
         )
 
-        # ── Update context compressor ──
+        # 鈹€鈹€ Update context compressor 鈹€鈹€
         if hasattr(self, "context_compressor") and self.context_compressor:
             from agent.model_metadata import get_model_context_length
             new_context_length = get_model_context_length(
@@ -1595,21 +1440,20 @@ class AIAgent:
                 base_url=self.base_url,
                 api_key=self.api_key,
                 provider=self.provider,
-                config_context_length=getattr(self, "_config_context_length", None),
             )
-            self.context_compressor.update_model(
-                model=self.model,
-                context_length=new_context_length,
-                base_url=self.base_url,
-                api_key=getattr(self, "api_key", ""),
-                provider=self.provider,
-                api_mode=self.api_mode,
+            self.context_compressor.model = self.model
+            self.context_compressor.base_url = self.base_url
+            self.context_compressor.api_key = self.api_key
+            self.context_compressor.provider = self.provider
+            self.context_compressor.context_length = new_context_length
+            self.context_compressor.threshold_tokens = int(
+                new_context_length * self.context_compressor.threshold_percent
             )
 
-        # ── Invalidate cached system prompt so it rebuilds next turn ──
+        # 鈹€鈹€ Invalidate cached system prompt so it rebuilds next turn 鈹€鈹€
         self._cached_system_prompt = None
 
-        # ── Update _primary_runtime so the change persists across turns ──
+        # 鈹€鈹€ Update _primary_runtime so the change persists across turns 鈹€鈹€
         _cc = self.context_compressor if hasattr(self, "context_compressor") and self.context_compressor else None
         self._primary_runtime = {
             "model": self.model,
@@ -1619,10 +1463,10 @@ class AIAgent:
             "api_key": getattr(self, "api_key", ""),
             "client_kwargs": dict(self._client_kwargs),
             "use_prompt_caching": self._use_prompt_caching,
-            "compressor_model": getattr(_cc, "model", self.model) if _cc else self.model,
-            "compressor_base_url": getattr(_cc, "base_url", self.base_url) if _cc else self.base_url,
+            "compressor_model": _cc.model if _cc else self.model,
+            "compressor_base_url": _cc.base_url if _cc else self.base_url,
             "compressor_api_key": getattr(_cc, "api_key", "") if _cc else "",
-            "compressor_provider": getattr(_cc, "provider", self.provider) if _cc else self.provider,
+            "compressor_provider": _cc.provider if _cc else self.provider,
             "compressor_context_length": _cc.context_length if _cc else 0,
             "compressor_threshold_tokens": _cc.threshold_tokens if _cc else 0,
         }
@@ -1633,7 +1477,7 @@ class AIAgent:
                 "is_anthropic_oauth": self._is_anthropic_oauth,
             })
 
-        # ── Reset fallback state ──
+        # 鈹€鈹€ Reset fallback state 鈹€鈹€
         self._fallback_activated = False
         self._fallback_index = 0
 
@@ -1661,7 +1505,7 @@ class AIAgent:
             pass
 
     def _vprint(self, *args, force: bool = False, **kwargs):
-        """Verbose print — suppressed when actively streaming tokens.
+        """Verbose print 鈥?suppressed when actively streaming tokens.
 
         Pass ``force=True`` for error/warning messages that should always be
         shown even during streaming playback (TTS or display).
@@ -1673,14 +1517,7 @@ class AIAgent:
         After the main response has been delivered and the remaining tool
         calls are post-response housekeeping (``_mute_post_response``),
         all non-forced output is suppressed.
-
-        ``suppress_status_output`` is a stricter CLI automation mode used by
-        parseable single-query flows such as ``hermes chat -q``. In that mode,
-        all status/diagnostic prints routed through ``_vprint`` are suppressed
-        so stdout stays machine-readable.
         """
-        if getattr(self, "suppress_status_output", False):
-            return
         if not force and getattr(self, "_mute_post_response", False):
             return
         if not force and self._has_stream_consumers() and not self._executing_tools:
@@ -1706,17 +1543,6 @@ class AIAgent:
         except (AttributeError, ValueError, OSError):
             return False
 
-    def _should_emit_quiet_tool_messages(self) -> bool:
-        """Return True when quiet-mode tool summaries should print directly.
-
-        When the caller provides ``tool_progress_callback`` (for example the CLI
-        TUI or a gateway progress renderer), that callback owns progress display.
-        Emitting quiet-mode summary lines here duplicates progress and leaks tool
-        previews into flows that are expected to stay silent, such as
-        ``hermes chat -q``.
-        """
-        return self.quiet_mode and not self.tool_progress_callback
-
     def _emit_status(self, message: str) -> None:
         """Emit a lifecycle status message to both CLI and gateway channels.
 
@@ -1724,7 +1550,7 @@ class AIAgent:
         visible regardless of verbose/quiet mode.  Gateway consumers receive
         it through ``status_callback("lifecycle", ...)``.
 
-        This helper never raises — exceptions are swallowed so it cannot
+        This helper never raises 鈥?exceptions are swallowed so it cannot
         interrupt the retry/fallback logic.
         """
         try:
@@ -1737,132 +1563,6 @@ class AIAgent:
             except Exception:
                 logger.debug("status_callback error in _emit_status", exc_info=True)
 
-    def _current_main_runtime(self) -> Dict[str, str]:
-        """Return the live main runtime for session-scoped auxiliary routing."""
-        return {
-            "model": getattr(self, "model", "") or "",
-            "provider": getattr(self, "provider", "") or "",
-            "base_url": getattr(self, "base_url", "") or "",
-            "api_key": getattr(self, "api_key", "") or "",
-            "api_mode": getattr(self, "api_mode", "") or "",
-        }
-
-    def _check_compression_model_feasibility(self) -> None:
-        """Warn at session start if the auxiliary compression model's context
-        window is smaller than the main model's compression threshold.
-
-        When the auxiliary model cannot fit the content that needs summarising,
-        compression will either fail outright (the LLM call errors) or produce
-        a severely truncated summary.
-
-        Called during ``__init__`` so CLI users see the warning immediately
-        (via ``_vprint``).  The gateway sets ``status_callback`` *after*
-        construction, so ``_replay_compression_warning()`` re-sends the
-        stored warning through the callback on the first
-        ``run_conversation()`` call.
-        """
-        if not self.compression_enabled:
-            return
-        try:
-            from agent.auxiliary_client import get_text_auxiliary_client
-            from agent.model_metadata import get_model_context_length
-
-            client, aux_model = get_text_auxiliary_client(
-                "compression",
-                main_runtime=self._current_main_runtime(),
-            )
-            if client is None or not aux_model:
-                msg = (
-                    "⚠ No auxiliary LLM provider configured — context "
-                    "compression will drop middle turns without a summary. "
-                    "Run `hermes setup` or set OPENROUTER_API_KEY."
-                )
-                self._compression_warning = msg
-                self._emit_status(msg)
-                logger.warning(
-                    "No auxiliary LLM provider for compression — "
-                    "summaries will be unavailable."
-                )
-                return
-
-            aux_base_url = str(getattr(client, "base_url", ""))
-            aux_api_key = str(getattr(client, "api_key", ""))
-
-            # Read user-configured context_length for the compression model.
-            # Custom endpoints often don't support /models API queries so
-            # get_model_context_length() falls through to the 128K default,
-            # ignoring the explicit config value.  Pass it as the highest-
-            # priority hint so the configured value is always respected.
-            _aux_cfg = (self.config or {}).get("auxiliary", {}).get("compression", {})
-            _aux_context_config = _aux_cfg.get("context_length") if isinstance(_aux_cfg, dict) else None
-            if _aux_context_config is not None:
-                try:
-                    _aux_context_config = int(_aux_context_config)
-                except (TypeError, ValueError):
-                    _aux_context_config = None
-
-            aux_context = get_model_context_length(
-                aux_model,
-                base_url=aux_base_url,
-                api_key=aux_api_key,
-                config_context_length=_aux_context_config,
-            )
-
-            threshold = self.context_compressor.threshold_tokens
-            if aux_context < threshold:
-                # Suggest a threshold that would fit the aux model,
-                # rounded down to a clean percentage.
-                safe_pct = int((aux_context / self.context_compressor.context_length) * 100)
-                msg = (
-                    f"⚠ Compression model ({aux_model}) context "
-                    f"is {aux_context:,} tokens, but the main model's "
-                    f"compression threshold is {threshold:,} tokens. "
-                    f"Context compression will not be possible — the "
-                    f"content to summarise will exceed the auxiliary "
-                    f"model's context window.\n"
-                    f"  Fix options (config.yaml):\n"
-                    f"  1. Use a larger compression model:\n"
-                    f"       auxiliary:\n"
-                    f"         compression:\n"
-                    f"           model: <model-with-{threshold:,}+-context>\n"
-                    f"  2. Lower the compression threshold to fit "
-                    f"the current model:\n"
-                    f"       compression:\n"
-                    f"         threshold: 0.{safe_pct:02d}"
-                )
-                self._compression_warning = msg
-                self._emit_status(msg)
-                logger.warning(
-                    "Auxiliary compression model %s has %d token context, "
-                    "below the main model's compression threshold of %d "
-                    "tokens — compression summaries will fail or be "
-                    "severely truncated.",
-                    aux_model,
-                    aux_context,
-                    threshold,
-                )
-        except Exception as exc:
-            logger.debug(
-                "Compression feasibility check failed (non-fatal): %s", exc
-            )
-
-    def _replay_compression_warning(self) -> None:
-        """Re-send the compression warning through ``status_callback``.
-
-        During ``__init__`` the gateway's ``status_callback`` is not yet
-        wired, so ``_emit_status`` only reaches ``_vprint`` (CLI).  This
-        method is called once at the start of the first
-        ``run_conversation()`` — by then the gateway has set the callback,
-        so every platform (Telegram, Discord, Slack, etc.) receives the
-        warning.
-        """
-        msg = getattr(self, "_compression_warning", None)
-        if msg and self.status_callback:
-            try:
-                self.status_callback("lifecycle", msg)
-            except Exception:
-                pass
-
     def _is_direct_openai_url(self, base_url: str = None) -> bool:
         """Return True when a base URL targets OpenAI's native API."""
         url = (base_url or self._base_url_lower).lower()
@@ -1872,20 +1572,301 @@ class AIAgent:
         """Return True when the base URL targets OpenRouter."""
         return "openrouter" in self._base_url_lower
 
-    @staticmethod
-    def _model_requires_responses_api(model: str) -> bool:
-        """Return True for models that require the Responses API path.
+    def _is_cloudflare_ai_gateway_url(self, base_url: str = None) -> bool:
+        """Return True when the base URL targets Cloudflare AI Gateway."""
+        url = str(base_url or self.base_url or "").strip().lower()
+        return "gateway.ai.cloudflare.com" in url
 
-        GPT-5.x models are rejected on /v1/chat/completions by both
-        OpenAI and OpenRouter (error: ``unsupported_api_for_model``).
-        Detect these so the correct api_mode is set regardless of
-        which provider is serving the model.
-        """
-        m = model.lower()
-        # Strip vendor prefix (e.g. "openai/gpt-5.4" → "gpt-5.4")
-        if "/" in m:
-            m = m.rsplit("/", 1)[-1]
-        return m.startswith("gpt-5")
+    @staticmethod
+    def _stringify_message_content(content: Any) -> str:
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts: list[str] = []
+            for item in content:
+                if isinstance(item, dict):
+                    text = item.get("text")
+                    if isinstance(text, str) and text.strip():
+                        parts.append(text.strip())
+            return "\n".join(parts)
+        return ""
+
+    def _infer_cloudflare_gateway_task_kind(self, api_messages: list) -> str:
+        explicit = str((self._trace_metadata or {}).get("task_kind") or "").strip().lower()
+        if explicit in {"general", "coding", "creative", "image", "vision"}:
+            return "image" if explicit == "vision" else explicit
+
+        flattened = "\n".join(
+            self._stringify_message_content(message.get("content"))
+            for message in api_messages
+            if isinstance(message, dict)
+        ).lower()
+
+        for message in api_messages:
+            if not isinstance(message, dict):
+                continue
+            content = message.get("content")
+            if not isinstance(content, list):
+                continue
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                part_type = str(item.get("type") or "").strip().lower()
+                if part_type in {"image_url", "input_image"}:
+                    return "image"
+        image_hints = (
+            "image", "logo", "vision", "screenshot", "poster", "cover", "illustration",
+            "thumbnail", "photo", "picture", "draw", "generate image",
+        )
+        coding_hints = (
+            "code", "coding", "bug", "debug", "stack trace", "traceback", "exception",
+            "python", "javascript", "typescript", "sql", "regex", "function",
+            "implement", "deploy", "interface", "api",
+        )
+        creative_hints = (
+            "copywriting", "copy", "article", "blog", "thread", "tweet", "newsletter",
+            "script", "campaign", "landing page", "title", "creative", "rewrite",
+            "marketing", "content", "outline",
+        )
+
+        if any(hint in flattened for hint in image_hints):
+            return "image"
+        if any(hint in flattened for hint in coding_hints):
+            return "coding"
+        if any(hint in flattened for hint in creative_hints):
+            return "creative"
+        return "general"
+
+    def _cloudflare_gateway_route_name_for_kind(self, task_kind: str) -> str:
+        normalized = str(task_kind or "").strip().lower() or "general"
+        default_map = {
+            "general": "affiliate-general",
+            "coding": "affiliate-coding",
+            "creative": "affiliate-general",
+            "image": "affiliate-general",
+        }
+        env_map = {
+            "general": "CLOUDFLARE_AI_GATEWAY_ROUTE_GENERAL",
+            "coding": "CLOUDFLARE_AI_GATEWAY_ROUTE_CODING",
+            "creative": "CLOUDFLARE_AI_GATEWAY_ROUTE_CREATIVE",
+            "image": "CLOUDFLARE_AI_GATEWAY_ROUTE_IMAGE",
+        }
+        configured = str(os.getenv(env_map.get(normalized, ""), "")).strip()
+        if configured:
+            return configured
+        if normalized in {"creative", "image"}:
+            general_configured = str(os.getenv("CLOUDFLARE_AI_GATEWAY_ROUTE_GENERAL", "")).strip()
+            if general_configured:
+                return general_configured
+        return default_map.get(normalized, "")
+
+    def _cloudflare_gateway_route_mode(self) -> str:
+        return str(
+            os.getenv("CLOUDFLARE_AI_GATEWAY_ROUTE_MODE", "metadata_only") or "metadata_only"
+        ).strip().lower()
+
+    def _cloudflare_gateway_tool_route_name(self, task_kind: str) -> str:
+        explicit = str(os.getenv("CLOUDFLARE_AI_GATEWAY_ROUTE_TOOLS", "") or "").strip()
+        if explicit:
+            return explicit
+        fixed = str(os.getenv("CLOUDFLARE_AI_GATEWAY_ROUTE_NAME", "") or "").strip()
+        if fixed:
+            return fixed
+        default_tool_route = "affiliate-tools"
+        if self._is_cloudflare_ai_gateway_url():
+            return default_tool_route
+        return self._cloudflare_gateway_route_name_for_kind(task_kind)
+
+    def _select_cloudflare_gateway_model(self, api_messages: list) -> tuple[str | None, str]:
+        if not self._is_cloudflare_ai_gateway_url():
+            return None, "general"
+        current_model = str(self.model or "").strip()
+        task_kind = self._infer_cloudflare_gateway_task_kind(api_messages)
+        if current_model.startswith("dynamic/"):
+            return current_model, task_kind
+        route_mode = self._cloudflare_gateway_route_mode()
+        if route_mode in {"metadata_only", "headers_only", "none", "off"} and bool(getattr(self, "tools", None)):
+            route_name = self._cloudflare_gateway_tool_route_name(task_kind)
+            if not route_name:
+                return None, task_kind
+            return f"dynamic/{route_name}", task_kind
+        if route_mode in {"metadata_only", "headers_only", "none", "off"}:
+            return None, task_kind
+        if route_mode in {"single_dynamic", "fixed_dynamic"}:
+            route_name = str(os.getenv("CLOUDFLARE_AI_GATEWAY_ROUTE_NAME", "") or "").strip()
+            if not route_name:
+                return None, task_kind
+            return f"dynamic/{route_name}", task_kind
+        route_name = self._cloudflare_gateway_route_name_for_kind(task_kind)
+        if not route_name:
+            return None, task_kind
+        return f"dynamic/{route_name}", task_kind
+
+    def _cloudflare_gateway_cache_headers(self, *, api_messages: list, task_kind: str) -> dict[str, str]:
+        headers: dict[str, str] = {}
+        if not self._is_cloudflare_ai_gateway_url():
+            return headers
+
+        cache_mode = str(os.getenv("CLOUDFLARE_AI_GATEWAY_CACHE_MODE", "smart") or "smart").strip().lower()
+        if cache_mode in {"off", "disabled", "none"}:
+            headers["cf-aig-skip-cache"] = "true"
+            return headers
+
+        if cache_mode == "smart" and (bool(getattr(self, "tools", None)) or task_kind in {"coding", "creative", "image"}):
+            headers["cf-aig-skip-cache"] = "true"
+            return headers
+
+        ttl_value = str(os.getenv("CLOUDFLARE_AI_GATEWAY_CACHE_TTL_SECONDS", "120") or "120").strip()
+        try:
+            ttl_seconds = int(ttl_value)
+        except ValueError:
+            ttl_seconds = 120
+        if ttl_seconds <= 0:
+            headers["cf-aig-skip-cache"] = "true"
+            return headers
+
+        headers["cf-aig-cache-ttl"] = str(ttl_seconds)
+        if self._env_flag("CLOUDFLARE_AI_GATEWAY_USE_PROMPT_CACHE_KEY", default=False):
+            cache_payload = {
+                "model": str(self.model or "").strip(),
+                "task_kind": task_kind,
+                "messages": [
+                    {
+                        "role": str(message.get("role") or "").strip(),
+                        "content": self._stringify_message_content(message.get("content")),
+                    }
+                    for message in api_messages
+                    if isinstance(message, dict)
+                ],
+            }
+            digest = hashlib.sha256(
+                json.dumps(cache_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+            ).hexdigest()
+            headers["cf-aig-cache-key"] = f"hermes:{task_kind}:{digest[:32]}"
+        return headers
+
+    def _build_cloudflare_gateway_metadata(
+        self,
+        *,
+        task_kind: str,
+        selected_model: str,
+        requested_model: str,
+    ) -> dict[str, Any]:
+        # Cloudflare AI Gateway stores only the first five metadata entries.
+        # Keep this payload intentionally small and stable so the most useful
+        # identifiers always survive into gateway logs and filters.
+        metadata: dict[str, Any] = {}
+
+        def _put(key: str, value: Any, *, limit: int = 120) -> None:
+            if len(metadata) >= 5:
+                return
+            if value in (None, ""):
+                return
+            if isinstance(value, bool):
+                metadata[key] = value
+                return
+            normalized = str(value).strip()
+            if not normalized:
+                return
+            metadata[key] = normalized[:limit]
+
+        derived_correlation_id = self._derive_trace_correlation_id()
+        trace_metadata = self._trace_metadata or {}
+        _put("correlation_id", derived_correlation_id)
+        _put("task_kind", task_kind)
+        requested_model_value = str(requested_model or "").strip()
+        selected_model_value = str(selected_model or "").strip()
+        hermes_request = requested_model_value
+        if (
+            requested_model_value
+            and selected_model_value
+            and selected_model_value != requested_model_value
+        ):
+            hermes_request = f"{requested_model_value}=>{selected_model_value}"
+        _put("hermes_request", hermes_request, limit=120)
+
+        tool_names = []
+        for tool in list(getattr(self, "tools", None) or []):
+            if not isinstance(tool, dict):
+                continue
+            function_payload = tool.get("function") or {}
+            tool_name = str(function_payload.get("name") or "").strip()
+            if tool_name:
+                tool_names.append(tool_name)
+            if len(tool_names) >= 4:
+                break
+        if tool_names:
+            tools_required_value: Any = True
+            if str(os.getenv("CLOUDFLARE_AI_GATEWAY_ROUTE_TOOLS", "") or "").strip():
+                # Preserve legacy string metadata for explicit tools-route
+                # deployments that already filter on the literal "true".
+                tools_required_value = "true"
+            _put("tools_required", tools_required_value)
+            _put("tool_names", ",".join(tool_names), limit=120)
+        else:
+            _put("session_id", self._trace_session_key or "")
+
+        # Only keep lower-level identifiers when they add value beyond the
+        # derived correlation id or task/tool routing tags above.
+        if "correlation_id" not in metadata:
+            _put("chat_id", trace_metadata.get("chat_id"))
+            _put("message_id", trace_metadata.get("message_id"))
+
+        if len(metadata) < 5 and "session_id" not in metadata:
+            _put("session_id", self._trace_session_key or "")
+        return metadata
+
+    def _derive_trace_correlation_id(self) -> str:
+        explicit = str((self._trace_metadata or {}).get("correlation_id") or "").strip()
+        if explicit:
+            return explicit
+
+        message_id = str((self._trace_metadata or {}).get("message_id") or "").strip()
+        if self._trace_session_key and message_id:
+            return f"{self._trace_session_key}:{message_id}"[:160]
+
+        chat_id = str((self._trace_metadata or {}).get("chat_id") or "").strip()
+        if self.platform and chat_id and message_id:
+            return f"{self.platform}:{chat_id}:{message_id}"[:160]
+
+        if self._trace_session_key:
+            return str(self._trace_session_key).strip()[:160]
+
+        return ""
+
+    def _build_cloudflare_gateway_headers(
+        self,
+        *,
+        api_messages: list,
+        selected_model: str,
+        requested_model: str,
+        task_kind: str,
+    ) -> dict[str, str]:
+        if not self._is_cloudflare_ai_gateway_url():
+            return {}
+
+        headers = self._cloudflare_gateway_cache_headers(api_messages=api_messages, task_kind=task_kind)
+        metadata = self._build_cloudflare_gateway_metadata(
+            task_kind=task_kind,
+            selected_model=selected_model,
+            requested_model=requested_model,
+        )
+        if metadata:
+            headers["cf-aig-metadata"] = json.dumps(metadata, ensure_ascii=False, separators=(",", ":"))
+
+        request_timeout = str(os.getenv("CLOUDFLARE_AI_GATEWAY_REQUEST_TIMEOUT_MS", "")).strip()
+        if request_timeout:
+            headers["cf-aig-request-timeout"] = request_timeout
+        max_attempts = str(os.getenv("CLOUDFLARE_AI_GATEWAY_MAX_ATTEMPTS", "")).strip()
+        if max_attempts:
+            headers["cf-aig-max-attempts"] = max_attempts
+        retry_delay = str(os.getenv("CLOUDFLARE_AI_GATEWAY_RETRY_DELAY_MS", "")).strip()
+        if retry_delay:
+            headers["cf-aig-retry-delay"] = retry_delay
+        backoff = str(os.getenv("CLOUDFLARE_AI_GATEWAY_BACKOFF", "")).strip().lower()
+        if backoff:
+            headers["cf-aig-backoff"] = backoff
+        return headers
 
     def _max_tokens_param(self, value: int) -> dict:
         """Return the correct max tokens kwarg for the current provider.
@@ -1926,13 +1907,12 @@ class AIAgent:
         if not content:
             return ""
         # Strip all reasoning tag variants: <think>, <thinking>, <THINKING>,
-        # <reasoning>, <REASONING_SCRATCHPAD>, <thought> (Gemma 4)
+        # <reasoning>, <REASONING_SCRATCHPAD>
         content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL)
         content = re.sub(r'<thinking>.*?</thinking>', '', content, flags=re.DOTALL | re.IGNORECASE)
         content = re.sub(r'<reasoning>.*?</reasoning>', '', content, flags=re.DOTALL)
         content = re.sub(r'<REASONING_SCRATCHPAD>.*?</REASONING_SCRATCHPAD>', '', content, flags=re.DOTALL)
-        content = re.sub(r'<thought>.*?</thought>', '', content, flags=re.DOTALL | re.IGNORECASE)
-        content = re.sub(r'</?(?:think|thinking|reasoning|thought|REASONING_SCRATCHPAD)>\s*', '', content, flags=re.IGNORECASE)
+        content = re.sub(r'</?(?:think|thinking|reasoning|REASONING_SCRATCHPAD)>\s*', '', content, flags=re.IGNORECASE)
         return content
 
     def _looks_like_codex_intermediate_ack(
@@ -1952,7 +1932,7 @@ class AIAgent:
             return False
 
         has_future_ack = bool(
-            re.search(r"\b(i['’]ll|i will|let me|i can do that|i can help with that)\b", assistant_text)
+            re.search(r"\b(i['鈥橾ll|i will|let me|i can do that|i can help with that)\b", assistant_text)
         )
         if not has_future_ack:
             return False
@@ -2026,13 +2006,20 @@ class AIAgent:
         
         # Check direct reasoning field
         if hasattr(assistant_message, 'reasoning') and assistant_message.reasoning:
-            reasoning_parts.append(assistant_message.reasoning)
+            reasoning_value = assistant_message.reasoning
+            if isinstance(reasoning_value, str) and reasoning_value.strip():
+                reasoning_parts.append(reasoning_value)
         
         # Check reasoning_content field (alternative name used by some providers)
         if hasattr(assistant_message, 'reasoning_content') and assistant_message.reasoning_content:
             # Don't duplicate if same as reasoning
-            if assistant_message.reasoning_content not in reasoning_parts:
-                reasoning_parts.append(assistant_message.reasoning_content)
+            reasoning_content = assistant_message.reasoning_content
+            if (
+                isinstance(reasoning_content, str)
+                and reasoning_content.strip()
+                and reasoning_content not in reasoning_parts
+            ):
+                reasoning_parts.append(reasoning_content)
         
         # Check reasoning_details array (OpenRouter unified format)
         # Format: [{"type": "reasoning.summary", "summary": "...", ...}, ...]
@@ -2046,7 +2033,7 @@ class AIAgent:
                         or detail.get('content')
                         or detail.get('text')
                     )
-                    if summary and summary not in reasoning_parts:
+                    if isinstance(summary, str) and summary.strip() and summary not in reasoning_parts:
                         reasoning_parts.append(summary)
 
         # Some providers embed reasoning directly inside assistant content
@@ -2057,7 +2044,6 @@ class AIAgent:
             inline_patterns = (
                 r"<think>(.*?)</think>",
                 r"<thinking>(.*?)</thinking>",
-                r"<thought>(.*?)</thought>",
                 r"<reasoning>(.*?)</reasoning>",
                 r"<REASONING_SCRATCHPAD>(.*?)</REASONING_SCRATCHPAD>",
             )
@@ -2110,7 +2096,7 @@ class AIAgent:
     _MEMORY_REVIEW_PROMPT = (
         "Review the conversation above and consider saving to memory if appropriate.\n\n"
         "Focus on:\n"
-        "1. Has the user revealed things about themselves — their persona, desires, "
+        "1. Has the user revealed things about themselves 鈥?their persona, desires, "
         "preferences, or personal details worth remembering?\n"
         "2. Has the user expressed expectations about how you should behave, their work "
         "style, or ways they want you to operate?\n\n"
@@ -2130,7 +2116,7 @@ class AIAgent:
 
     _COMBINED_REVIEW_PROMPT = (
         "Review the conversation above and consider two things:\n\n"
-        "**Memory**: Has the user revealed things about themselves — their persona, "
+        "**Memory**: Has the user revealed things about themselves 鈥?their persona, "
         "desires, preferences, or personal details? Has the user expressed expectations "
         "about how you should behave, their work style, or ways they want you to operate? "
         "If so, save using the memory tool.\n\n"
@@ -2219,26 +2205,31 @@ class AIAgent:
                         actions.append(f"{label} updated")
 
                 if actions:
-                    summary = " · ".join(dict.fromkeys(actions))
-                    self._safe_print(f"  💾 {summary}")
+                    summary = " 路 ".join(dict.fromkeys(actions))
+                    self._safe_print(f"  馃捑 {summary}")
                     _bg_cb = self.background_review_callback
                     if _bg_cb:
                         try:
-                            _bg_cb(f"💾 {summary}")
+                            _bg_cb(f"馃捑 {summary}")
                         except Exception:
                             pass
 
             except Exception as e:
                 logger.debug("Background memory/skill review failed: %s", e)
             finally:
-                # Close all resources (httpx client, subprocesses, etc.) so
-                # GC doesn't try to clean them up on a dead asyncio event
-                # loop (which produces "Event loop is closed" errors).
+                # Explicitly close the OpenAI/httpx client so GC doesn't
+                # try to clean it up on a dead asyncio event loop (which
+                # produces "Event loop is closed" errors in the terminal).
                 if review_agent is not None:
-                    try:
-                        review_agent.close()
-                    except Exception:
-                        pass
+                    client = getattr(review_agent, "client", None)
+                    if client is not None:
+                        try:
+                            review_agent._close_openai_client(
+                                client, reason="bg_review_done", shared=True
+                            )
+                            review_agent.client = None
+                        except Exception:
+                            pass
 
         t = threading.Thread(target=_run_review, daemon=True, name="bg-review")
         t.start()
@@ -2279,7 +2270,7 @@ class AIAgent:
 
         Uses _last_flushed_db_idx to track which messages have already been
         written, so repeated calls (from multiple exit paths) only write
-        truly new messages — preventing the duplicate-write bug (#860).
+        truly new messages 鈥?preventing the duplicate-write bug (#860).
         """
         if not self._session_db:
             return
@@ -2582,7 +2573,7 @@ class AIAgent:
             parts.append(title)
             if ray_id:
                 parts.append(f"Ray {ray_id}")
-            return " — ".join(parts)
+            return " 鈥?".join(parts)
 
         # JSON body errors from OpenAI/Anthropic SDKs
         body = getattr(error, "body", None)
@@ -2712,6 +2703,222 @@ class AIAgent:
         summary["total_tokens"] = cu.total_tokens
         return summary
 
+    @staticmethod
+    def _read_response_value(obj: Any, *path: str) -> Any:
+        current = obj
+        for part in path:
+            if current is None:
+                return None
+            if isinstance(current, dict):
+                current = current.get(part)
+                continue
+            current = getattr(current, part, None)
+        return current
+
+    @staticmethod
+    def _coerce_float(value: Any) -> Optional[float]:
+        if value in (None, ""):
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _is_nvidia_route(self) -> bool:
+        base_url = str(getattr(self, "base_url", "") or "").strip().lower()
+        provider = str(getattr(self, "provider", "") or "").strip().lower()
+        return (
+            provider == "nvidia"
+            or "integrate.api.nvidia.com" in base_url
+            or "api.nvcf.nvidia.com" in base_url
+        )
+
+    @staticmethod
+    def _headers_to_dict(headers: Any) -> Dict[str, str]:
+        if not headers:
+            return {}
+        try:
+            return {str(k).lower(): str(v) for k, v in dict(headers).items()}
+        except Exception:
+            try:
+                return {str(k).lower(): str(v) for k, v in headers.items()}
+            except Exception:
+                return {}
+
+    def _build_nvidia_status_poll_url(self, request_id: str) -> Optional[str]:
+        if not self._is_nvidia_route():
+            return None
+        normalized_request_id = str(request_id or "").strip()
+        if not normalized_request_id:
+            return None
+        base_url = str(getattr(self, "base_url", "") or "").strip().rstrip("/")
+        if not base_url:
+            base_url = "https://integrate.api.nvidia.com/v1"
+        return f"{base_url}/status/{normalized_request_id}"
+
+    @staticmethod
+    def _extract_async_request_id_from_payload(body: Any) -> Optional[str]:
+        if isinstance(body, dict):
+            for key in ("requestId", "request_id", "request-id"):
+                value = body.get(key)
+                if value:
+                    return str(value).strip()
+        return None
+
+    def _extract_provider_transport_metadata(
+        self,
+        response: Any = None,
+        *,
+        status_code: Any = None,
+        headers: Any = None,
+        body: Any = None,
+        source: str = "",
+    ) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {}
+
+        resolved_status_code = status_code
+        if resolved_status_code in (None, "") and response is not None:
+            resolved_status_code = getattr(response, "status_code", None)
+        if resolved_status_code not in (None, ""):
+            try:
+                payload["provider_http_status_code"] = int(resolved_status_code)
+            except (TypeError, ValueError):
+                pass
+
+        header_map = self._headers_to_dict(headers)
+        provider_request_id = (
+            getattr(response, "request_id", None)
+            or getattr(response, "_request_id", None)
+            or header_map.get("x-request-id")
+            or header_map.get("request-id")
+            or header_map.get("requestid")
+            or header_map.get("nvcf-request-id")
+        )
+        if provider_request_id:
+            payload["provider_request_id"] = str(provider_request_id).strip()
+
+        response_id = getattr(response, "id", None)
+        if response_id:
+            payload["response_id"] = str(response_id).strip()
+        response_model = getattr(response, "model", None)
+        if response_model:
+            payload["response_model"] = str(response_model).strip()
+        if source:
+            payload["provider_observed_via"] = str(source).strip()
+
+        if self._is_nvidia_route():
+            payload["provider_async_poll_capability_inferred"] = True
+            async_request_id = (
+                self._extract_async_request_id_from_payload(body)
+                or header_map.get("requestid")
+                or header_map.get("request-id")
+                or header_map.get("nvcf-request-id")
+            )
+            if async_request_id:
+                normalized_request_id = str(async_request_id).strip()
+                payload["provider_async_poll_supported"] = True
+                payload["provider_async_poll_observed"] = True
+                payload["provider_async_request_id"] = normalized_request_id
+                poll_url = self._build_nvidia_status_poll_url(normalized_request_id)
+                if poll_url:
+                    payload["provider_async_poll_url"] = poll_url
+                if payload.get("provider_http_status_code") == 202:
+                    payload["provider_async_pending"] = True
+            elif payload.get("provider_http_status_code") == 202:
+                payload["provider_async_poll_supported"] = True
+                payload["provider_async_poll_observed"] = True
+                payload["provider_async_pending"] = True
+
+        return payload
+
+    def _merge_provider_usage_metadata(self, extra: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        merged = dict(self._last_provider_usage_metadata or {})
+        if extra:
+            for key, value in extra.items():
+                if value in (None, "", {}, []):
+                    continue
+                merged[key] = value
+        self._last_provider_usage_metadata = merged
+        return merged
+
+    def _log_provider_async_candidate(self, metadata: Optional[Dict[str, Any]]) -> None:
+        meta = dict(metadata or {})
+        async_request_id = str(meta.get("provider_async_request_id") or "").strip()
+        if not async_request_id:
+            return
+        logger.info(
+            "Provider async candidate detected: provider=%s model=%s status_code=%s request_id=%s poll_url=%s observed_via=%s",
+            getattr(self, "provider", "") or "",
+            getattr(self, "model", "") or "",
+            meta.get("provider_http_status_code"),
+            async_request_id,
+            meta.get("provider_async_poll_url") or "",
+            meta.get("provider_observed_via") or "",
+        )
+
+    def _extract_openrouter_usage_metadata(self, response: Any) -> Optional[Dict[str, Any]]:
+        """Extract OpenRouter-specific observability fields from a response object.
+
+        These fields are useful for session-stickiness audits and cache/cost
+        analysis, but only some of them are officially documented today. We keep
+        undocumented fields as best-effort observability, never as control-plane
+        inputs.
+        """
+        if response is None:
+            return None
+        base_url = str(getattr(self, "base_url", "") or "").lower()
+        provider = str(getattr(self, "provider", "") or "").lower()
+        if provider != "openrouter" and "openrouter.ai" not in base_url:
+            return None
+
+        raw_usage = getattr(response, "usage", None)
+        prompt_tokens_details = self._read_response_value(raw_usage, "prompt_tokens_details")
+        cost_details = self._read_response_value(raw_usage, "cost_details")
+
+        payload: Dict[str, Any] = {
+            "generation_id": getattr(response, "id", None),
+            "response_model": getattr(response, "model", None),
+            "request_id": getattr(response, "request_id", None) or getattr(response, "_request_id", None),
+            "cost": self._coerce_float(self._read_response_value(raw_usage, "cost")),
+            "upstream_inference_cost": self._coerce_float(
+                self._read_response_value(raw_usage, "upstream_inference_cost")
+                or self._read_response_value(cost_details, "upstream_inference_cost")
+            ),
+            "cache_discount": self._coerce_float(
+                self._read_response_value(raw_usage, "cache_discount")
+                or self._read_response_value(cost_details, "cache_discount")
+            ),
+            "cached_tokens": self._read_response_value(prompt_tokens_details, "cached_tokens"),
+            "cache_write_tokens": self._read_response_value(prompt_tokens_details, "cache_write_tokens"),
+            "usage": self._coerce_float(self._read_response_value(raw_usage, "usage")),
+            "usage_upstream": self._coerce_float(
+                self._read_response_value(raw_usage, "usage_upstream")
+            ),
+        }
+
+        usage_data = self._read_response_value(raw_usage, "usage_data")
+        usage_cache = self._read_response_value(raw_usage, "usage_cache")
+        if usage_data is not None:
+            payload["usage_data"] = usage_data
+        if usage_cache is not None:
+            payload["usage_cache"] = usage_cache
+
+        if raw_usage:
+            canonical_usage = normalize_usage(
+                raw_usage,
+                provider=self.provider,
+                api_mode=self.api_mode,
+            )
+            payload["input_tokens"] = canonical_usage.input_tokens
+            payload["output_tokens"] = canonical_usage.output_tokens
+            payload["prompt_tokens"] = canonical_usage.prompt_tokens
+            payload["completion_tokens"] = canonical_usage.output_tokens
+            payload["total_tokens"] = canonical_usage.total_tokens
+            payload["reasoning_tokens"] = canonical_usage.reasoning_tokens
+
+        filtered = {key: value for key, value in payload.items() if value is not None}
+        return filtered or None
+
     def _dump_api_request_debug(
         self,
         api_kwargs: Dict[str, Any],
@@ -2783,7 +2990,7 @@ class AIAgent:
                 encoding="utf-8",
             )
 
-            self._vprint(f"{self.log_prefix}🧾 Request debug dump written to: {dump_file}")
+            self._vprint(f"{self.log_prefix}馃Ь Request debug dump written to: {dump_file}")
 
             if env_var_enabled("HERMES_DUMP_REQUEST_STDOUT"):
                 print(json.dumps(dump_payload, ensure_ascii=False, indent=2, default=str))
@@ -2831,7 +3038,7 @@ class AIAgent:
 
             # Guard: never overwrite a larger session log with fewer messages.
             # This protects against data loss when --resume loads a session whose
-            # messages weren't fully written to SQLite — the resumed agent starts
+            # messages weren't fully written to SQLite 鈥?the resumed agent starts
             # with partial history and would otherwise clobber the full JSON log.
             if self.session_log_file.exists():
                 try:
@@ -2844,7 +3051,7 @@ class AIAgent:
                         )
                         return
                 except Exception:
-                    pass  # corrupted existing file — allow the overwrite
+                    pass  # corrupted existing file 鈥?allow the overwrite
 
             entry = {
                 "session_id": self.session_id,
@@ -2896,10 +3103,8 @@ class AIAgent:
         """
         self._interrupt_requested = True
         self._interrupt_message = message
-        # Signal all tools to abort any in-flight operations immediately.
-        # Scope the interrupt to this agent's execution thread so other
-        # agents running in the same process (gateway) are not affected.
-        _set_interrupt(True, self._execution_thread_id)
+        # Signal all tools to abort any in-flight operations immediately
+        _set_interrupt(True)
         # Propagate interrupt to any running child agents (subagent delegation)
         with self._active_children_lock:
             children_copy = list(self._active_children)
@@ -2909,13 +3114,13 @@ class AIAgent:
             except Exception as e:
                 logger.debug("Failed to propagate interrupt to child agent: %s", e)
         if not self.quiet_mode:
-            print("\n⚡ Interrupt requested" + (f": '{message[:40]}...'" if message and len(message) > 40 else f": '{message}'" if message else ""))
+            print("\n鈿?Interrupt requested" + (f": '{message[:40]}...'" if message and len(message) > 40 else f": '{message}'" if message else ""))
     
     def clear_interrupt(self) -> None:
-        """Clear any pending interrupt request and the per-thread tool interrupt signal."""
+        """Clear any pending interrupt request and the global tool interrupt signal."""
         self._interrupt_requested = False
         self._interrupt_message = None
-        _set_interrupt(False, self._execution_thread_id)
+        _set_interrupt(False)
 
     def _touch_activity(self, desc: str) -> None:
         """Update the last-activity timestamp and description (thread-safe)."""
@@ -2964,11 +3169,10 @@ class AIAgent:
         }
 
     def shutdown_memory_provider(self, messages: list = None) -> None:
-        """Shut down the memory provider and context engine — call at actual session boundaries.
+        """Shut down the memory provider 鈥?call at actual session boundaries.
 
         This calls on_session_end() then shutdown_all() on the memory
-        manager, and on_session_end() on the context engine.
-        NOT called per-turn — only at CLI exit, /reset, gateway
+        manager. NOT called per-turn 鈥?only at CLI exit, /reset, gateway
         session expiry, etc.
         """
         if self._memory_manager:
@@ -2980,74 +3184,7 @@ class AIAgent:
                 self._memory_manager.shutdown_all()
             except Exception:
                 pass
-        # Notify context engine of session end (flush DAG, close DBs, etc.)
-        if hasattr(self, "context_compressor") and self.context_compressor:
-            try:
-                self.context_compressor.on_session_end(
-                    self.session_id or "",
-                    messages or [],
-                )
-            except Exception:
-                pass
     
-    def close(self) -> None:
-        """Release all resources held by this agent instance.
-
-        Cleans up subprocess resources that would otherwise become orphans:
-        - Background processes tracked in ProcessRegistry
-        - Terminal sandbox environments
-        - Browser daemon sessions
-        - Active child agents (subagent delegation)
-        - OpenAI/httpx client connections
-
-        Safe to call multiple times (idempotent).  Each cleanup step is
-        independently guarded so a failure in one does not prevent the rest.
-        """
-        task_id = getattr(self, "session_id", None) or ""
-
-        # 1. Kill background processes for this task
-        try:
-            from tools.process_registry import process_registry
-            process_registry.kill_all(task_id=task_id)
-        except Exception:
-            pass
-
-        # 2. Clean terminal sandbox environments
-        try:
-            from tools.terminal_tool import cleanup_vm
-            cleanup_vm(task_id)
-        except Exception:
-            pass
-
-        # 3. Clean browser daemon sessions
-        try:
-            from tools.browser_tool import cleanup_browser
-            cleanup_browser(task_id)
-        except Exception:
-            pass
-
-        # 4. Close active child agents
-        try:
-            with self._active_children_lock:
-                children = list(self._active_children)
-                self._active_children.clear()
-            for child in children:
-                try:
-                    child.close()
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-        # 5. Close the OpenAI/httpx client
-        try:
-            client = getattr(self, "client", None)
-            if client is not None:
-                self._close_openai_client(client, reason="agent_close", shared=True)
-                self.client = None
-        except Exception:
-            pass
-
     def _hydrate_todo_store(self, history: List[Dict[str, Any]]) -> None:
         """
         Recover todo state from conversation history.
@@ -3077,7 +3214,7 @@ class AIAgent:
             # Replay the items into the store (replace mode)
             self._todo_store.write(last_todo_response, merge=False)
             if not self.quiet_mode:
-                self._vprint(f"{self.log_prefix}📋 Restored {len(last_todo_response)} todo item(s) from history")
+                self._vprint(f"{self.log_prefix}馃搵 Restored {len(last_todo_response)} todo item(s) from history")
         _set_interrupt(False)
     
     @property
@@ -3103,11 +3240,11 @@ class AIAgent:
         is stable across all turns in a session, maximizing prefix cache hits.
         """
         # Layers (in order):
-        #   1. Agent identity — SOUL.md when available, else DEFAULT_AGENT_IDENTITY
+        #   1. Agent identity 鈥?SOUL.md when available, else DEFAULT_AGENT_IDENTITY
         #   2. User / gateway system prompt (if provided)
         #   3. Persistent memory (frozen snapshot)
         #   4. Skills guidance (if skills tools are loaded)
-        #   5. Context files (AGENTS.md, .cursorrules — SOUL.md excluded here when used as identity)
+        #   5. Context files (AGENTS.md, .cursorrules 鈥?SOUL.md excluded here when used as identity)
         #   6. Current date & time (frozen at build time)
         #   7. Platform-specific formatting hint
 
@@ -3140,10 +3277,10 @@ class AIAgent:
         # Tool-use enforcement: tells the model to actually call tools instead
         # of describing intended actions.  Controlled by config.yaml
         # agent.tool_use_enforcement:
-        #   "auto" (default) — matches TOOL_USE_ENFORCEMENT_MODELS
-        #   true  — always inject (all models)
-        #   false — never inject
-        #   list  — custom model-name substrings to match
+        #   "auto" (default) 鈥?matches TOOL_USE_ENFORCEMENT_MODELS
+        #   true  鈥?always inject (all models)
+        #   false 鈥?never inject
+        #   list  鈥?custom model-name substrings to match
         if self.valid_tool_names:
             _enforce = self._tool_use_enforcement
             _inject = False
@@ -3155,7 +3292,7 @@ class AIAgent:
                 model_lower = (self.model or "").lower()
                 _inject = any(p.lower() in model_lower for p in _enforce if isinstance(p, str))
             else:
-                # "auto" or any unrecognised value — use hardcoded defaults
+                # "auto" or any unrecognised value 鈥?use hardcoded defaults
                 model_lower = (self.model or "").lower()
                 _inject = any(p in model_lower for p in TOOL_USE_ENFORCEMENT_MODELS)
             if _inject:
@@ -3219,7 +3356,7 @@ class AIAgent:
             # Use TERMINAL_CWD for context file discovery when set (gateway
             # mode).  The gateway process runs from the hermes-agent install
             # dir, so os.getcwd() would pick up the repo's AGENTS.md and
-            # other dev files — inflating token usage by ~10k for no benefit.
+            # other dev files 鈥?inflating token usage by ~10k for no benefit.
             _context_cwd = os.getenv("TERMINAL_CWD") or None
             context_files_prompt = build_context_files_prompt(
                 cwd=_context_cwd, skip_soul=_soul_loaded)
@@ -3249,20 +3386,14 @@ class AIAgent:
                 f"not on any model name returned by the API."
             )
 
-        # Environment hints (WSL, Termux, etc.) — tell the agent about the
-        # execution environment so it can translate paths and adapt behavior.
-        _env_hints = build_environment_hints()
-        if _env_hints:
-            prompt_parts.append(_env_hints)
-
         platform_key = (self.platform or "").lower().strip()
         if platform_key in PLATFORM_HINTS:
             prompt_parts.append(PLATFORM_HINTS[platform_key])
 
-        return "\n\n".join(p.strip() for p in prompt_parts if p.strip())
+        return "\n\n".join(prompt_parts)
 
     # =========================================================================
-    # Pre/post-call guardrails (inspired by PR #1321 — @alireza78a)
+    # Pre/post-call guardrails (inspired by PR #1321 鈥?@alireza78a)
     # =========================================================================
 
     @staticmethod
@@ -3278,8 +3409,8 @@ class AIAgent:
     def _sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Fix orphaned tool_call / tool_result pairs before every LLM call.
 
-        Runs unconditionally — not gated on whether the context compressor
-        is present — so orphans from session loading or manual message
+        Runs unconditionally 鈥?not gated on whether the context compressor
+        is present 鈥?so orphans from session loading or manual message
         manipulation are always caught.
         """
         # --- Role allowlist: drop messages with roles the API won't accept ---
@@ -3334,7 +3465,7 @@ class AIAgent:
                         if cid in missing_results:
                             patched.append({
                                 "role": "tool",
-                                "content": "[Result unavailable — see context summary above]",
+                                "content": "[Result unavailable 鈥?see context summary above]",
                                 "tool_call_id": cid,
                             })
             messages = patched
@@ -3346,7 +3477,7 @@ class AIAgent:
 
     @staticmethod
     def _cap_delegate_task_calls(tool_calls: list) -> list:
-        """Truncate excess delegate_task calls to max_concurrent_children.
+        """Truncate excess delegate_task calls to MAX_CONCURRENT_CHILDREN.
 
         The delegate_tool caps the task list inside a single call, but the
         model can emit multiple separate delegate_task tool_calls in one
@@ -3354,24 +3485,23 @@ class AIAgent:
 
         Returns the original list if no truncation was needed.
         """
-        from tools.delegate_tool import _get_max_concurrent_children
-        max_children = _get_max_concurrent_children()
+        from tools.delegate_tool import MAX_CONCURRENT_CHILDREN
         delegate_count = sum(1 for tc in tool_calls if tc.function.name == "delegate_task")
-        if delegate_count <= max_children:
+        if delegate_count <= MAX_CONCURRENT_CHILDREN:
             return tool_calls
         kept_delegates = 0
         truncated = []
         for tc in tool_calls:
             if tc.function.name == "delegate_task":
-                if kept_delegates < max_children:
+                if kept_delegates < MAX_CONCURRENT_CHILDREN:
                     truncated.append(tc)
                     kept_delegates += 1
             else:
                 truncated.append(tc)
         logger.warning(
             "Truncated %d excess delegate_task call(s) to enforce "
-            "max_concurrent_children=%d limit",
-            delegate_count - max_children, max_children,
+            "MAX_CONCURRENT_CHILDREN=%d limit",
+            delegate_count - MAX_CONCURRENT_CHILDREN, MAX_CONCURRENT_CHILDREN,
         )
         return truncated
 
@@ -3404,20 +3534,56 @@ class AIAgent:
         """
         from difflib import get_close_matches
 
-        # 1. Lowercase
-        lowered = tool_name.lower()
-        if lowered in self.valid_tool_names:
-            return lowered
+        raw_name = str(tool_name or "").strip()
+        if not raw_name:
+            return None
 
-        # 2. Normalize
-        normalized = lowered.replace("-", "_").replace(" ", "_")
-        if normalized in self.valid_tool_names:
+        def _normalize_candidate(value: str) -> str:
+            normalized = str(value or "").strip().lower()
+            normalized = normalized.replace("-", "_").replace(" ", "_")
+            normalized = re.sub(r"_+", "_", normalized).strip("_")
             return normalized
 
-        # 3. Fuzzy match
-        matches = get_close_matches(lowered, self.valid_tool_names, n=1, cutoff=0.7)
-        if matches:
-            return matches[0]
+        raw_candidates: list[str] = [raw_name]
+        if "<|" in raw_name:
+            raw_candidates.append(raw_name.split("<|", 1)[0])
+        if "<" in raw_name and ">" in raw_name:
+            raw_candidates.append(re.sub(r"<\|[^>]+\|>", "", raw_name))
+
+        normalized_candidates: list[str] = []
+        seen_candidates: set[str] = set()
+        suffix_tokens = ("commentary", "analysis", "final", "summary")
+        for candidate in raw_candidates:
+            normalized = _normalize_candidate(candidate)
+            if not normalized:
+                continue
+            variants = [normalized]
+            trimmed = normalized
+            while True:
+                matched_suffix = next(
+                    (suffix for suffix in suffix_tokens if trimmed.endswith(f"_{suffix}")),
+                    None,
+                )
+                if not matched_suffix:
+                    break
+                trimmed = trimmed[: -(len(matched_suffix) + 1)].strip("_")
+                if trimmed:
+                    variants.append(trimmed)
+            for variant in variants:
+                if variant and variant not in seen_candidates:
+                    seen_candidates.add(variant)
+                    normalized_candidates.append(variant)
+
+        for candidate in normalized_candidates:
+            if candidate in self.valid_tool_names:
+                return candidate
+
+        # Fuzzy match against cleaned candidates first so streaming residue
+        # does not waste turns on near-miss tool names.
+        for candidate in normalized_candidates:
+            matches = get_close_matches(candidate, self.valid_tool_names, n=1, cutoff=0.7)
+            if matches:
+                return matches[0]
 
         return None
 
@@ -3458,7 +3624,7 @@ class AIAgent:
         """Generate a deterministic call_id from tool call content.
 
         Used as a fallback when the API doesn't provide a call_id.
-        Deterministic IDs prevent cache invalidation — random UUIDs would
+        Deterministic IDs prevent cache invalidation 鈥?random UUIDs would
         make every API call's prefix unique, breaking OpenAI's prompt cache.
         """
         import hashlib
@@ -3515,7 +3681,6 @@ class AIAgent:
     def _chat_messages_to_responses_input(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Convert internal chat-style messages to Responses input items."""
         items: List[Dict[str, Any]] = []
-        seen_item_ids: set = set()
 
         for msg in messages:
             if not isinstance(msg, dict):
@@ -3536,12 +3701,7 @@ class AIAgent:
                     if isinstance(codex_reasoning, list):
                         for ri in codex_reasoning:
                             if isinstance(ri, dict) and ri.get("encrypted_content"):
-                                item_id = ri.get("id")
-                                if item_id and item_id in seen_item_ids:
-                                    continue
                                 items.append(ri)
-                                if item_id:
-                                    seen_item_ids.add(item_id)
                                 has_codex_reasoning = True
 
                     if content_text.strip():
@@ -3621,7 +3781,6 @@ class AIAgent:
             raise ValueError("Codex Responses input must be a list of input items.")
 
         normalized: List[Dict[str, Any]] = []
-        seen_ids: set = set()
         for idx, item in enumerate(raw_items):
             if not isinstance(item, dict):
                 raise ValueError(f"Codex Responses input[{idx}] must be an object.")
@@ -3674,12 +3833,8 @@ class AIAgent:
             if item_type == "reasoning":
                 encrypted = item.get("encrypted_content")
                 if isinstance(encrypted, str) and encrypted:
-                    item_id = item.get("id")
-                    if isinstance(item_id, str) and item_id:
-                        if item_id in seen_ids:
-                            continue
-                        seen_ids.add(item_id)
                     reasoning_item = {"type": "reasoning", "encrypted_content": encrypted}
+                    item_id = item.get("id")
                     if isinstance(item_id, str) and item_id:
                         reasoning_item["id"] = item_id
                     summary = item.get("summary")
@@ -3781,7 +3936,7 @@ class AIAgent:
         allowed_keys = {
             "model", "instructions", "input", "tools", "store",
             "reasoning", "include", "max_output_tokens", "temperature",
-            "tool_choice", "parallel_tool_calls", "prompt_cache_key", "service_tier",
+            "tool_choice", "parallel_tool_calls", "prompt_cache_key",
         }
         normalized: Dict[str, Any] = {
             "model": model,
@@ -3799,9 +3954,6 @@ class AIAgent:
         include = api_kwargs.get("include")
         if isinstance(include, list):
             normalized["include"] = include
-        service_tier = api_kwargs.get("service_tier")
-        if isinstance(service_tier, str) and service_tier.strip():
-            normalized["service_tier"] = service_tier.strip()
 
         # Pass through max_output_tokens and temperature
         max_output_tokens = api_kwargs.get("max_output_tokens")
@@ -3945,7 +4097,7 @@ class AIAgent:
                     item_id = getattr(item, "id", None)
                     if isinstance(item_id, str) and item_id:
                         raw_item["id"] = item_id
-                    # Capture summary — required by the API when replaying reasoning items
+                    # Capture summary 鈥?required by the API when replaying reasoning items
                     summary = getattr(item, "summary", None)
                     if isinstance(summary, list):
                         raw_summary = []
@@ -4024,7 +4176,7 @@ class AIAgent:
             # no visible content or tool calls.  The model is still thinking and
             # needs another turn to produce the actual answer.  Marking this as
             # "stop" would send it into the empty-content retry loop which burns
-            # 3 retries then fails — treat it as incomplete instead so the Codex
+            # 3 retries then fails 鈥?treat it as incomplete instead so the Codex
             # continuation path handles it correctly.
             finish_reason = "incomplete"
         else:
@@ -4082,6 +4234,7 @@ class AIAgent:
         return False
 
     def _create_openai_client(self, client_kwargs: dict, *, reason: str, shared: bool) -> Any:
+        client_kwargs = dict(client_kwargs)
         if self.provider == "copilot-acp" or str(client_kwargs.get("base_url", "")).startswith("acp://copilot"):
             from agent.copilot_acp_client import CopilotACPClient
 
@@ -4093,6 +4246,18 @@ class AIAgent:
                 self._client_log_context(),
             )
             return client
+
+        # Local OpenAI-compatible endpoints should bypass shell/system proxy
+        # settings. Otherwise localhost traffic can be accidentally routed
+        # through HTTP_PROXY/HTTPS_PROXY and fail before the request ever
+        # reaches the local server, which breaks local-model and subagent
+        # smoke validation on proxied environments.
+        base_url = str(client_kwargs.get("base_url", "") or "")
+        if is_local_endpoint(base_url) and "http_client" not in client_kwargs:
+            import httpx as _httpx
+
+            client_kwargs["http_client"] = _httpx.Client(trust_env=False)
+
         client = OpenAI(**client_kwargs)
         logger.info(
             "OpenAI client created (%s, shared=%s) %s",
@@ -4269,7 +4434,7 @@ class AIAgent:
                     if data == b"":
                         dead_count += 1
                 except BlockingIOError:
-                    pass  # No data available — socket is healthy
+                    pass  # No data available 鈥?socket is healthy
                 except OSError:
                     dead_count += 1
                 finally:
@@ -4279,7 +4444,7 @@ class AIAgent:
                         pass
             if dead_count > 0:
                 logger.warning(
-                    "Found %d dead connection(s) in client pool — rebuilding client",
+                    "Found %d dead connection(s) in client pool 鈥?rebuilding client",
                     dead_count,
                 )
                 self._replace_primary_openai_client(reason="dead_connection_cleanup")
@@ -4309,6 +4474,7 @@ class AIAgent:
         max_stream_retries = 1
         has_tool_calls = False
         first_delta_fired = False
+        self._reasoning_deltas_fired = False
         # Accumulate streamed text so we can recover if get_final_response()
         # returns empty output (e.g. chatgpt.com backend-api sends
         # response.incomplete instead of response.completed).
@@ -4318,7 +4484,6 @@ class AIAgent:
             try:
                 with active_client.responses.stream(**api_kwargs) as stream:
                     for event in stream:
-                        self._touch_activity("receiving stream response")
                         if self._interrupt_requested:
                             break
                         event_type = getattr(event, "type", "")
@@ -4344,7 +4509,7 @@ class AIAgent:
                             reasoning_text = getattr(event, "delta", "")
                             if reasoning_text:
                                 self._fire_reasoning_delta(reasoning_text)
-                        # Collect completed output items — some backends
+                        # Collect completed output items 鈥?some backends
                         # (chatgpt.com/backend-api/codex) stream valid items
                         # via response.output_item.done but the SDK's
                         # get_final_response() returns an empty output list.
@@ -4443,7 +4608,6 @@ class AIAgent:
         collected_text_deltas: list = []
         try:
             for event in stream_or_response:
-                self._touch_activity("receiving stream response")
                 event_type = getattr(event, "type", None)
                 if not event_type and isinstance(event, dict):
                     event_type = event.get("type")
@@ -4600,7 +4764,7 @@ class AIAgent:
             return False
 
         self._anthropic_api_key = new_token
-        # Update OAuth flag — token type may have changed (API key ↔ OAuth)
+        # Update OAuth flag 鈥?token type may have changed (API key 鈫?OAuth)
         from agent.anthropic_adapter import _is_oauth_token
         self._is_anthropic_oauth = _is_oauth_token(new_token)
         return True
@@ -4616,7 +4780,7 @@ class AIAgent:
 
             self._client_kwargs["default_headers"] = copilot_default_headers()
         elif "api.kimi.com" in normalized:
-            self._client_kwargs["default_headers"] = {"User-Agent": "KimiCLI/1.30.0"}
+            self._client_kwargs["default_headers"] = {"User-Agent": "KimiCLI/1.3"}
         elif "portal.qwen.ai" in normalized:
             self._client_kwargs["default_headers"] = _qwen_portal_headers()
         else:
@@ -4637,7 +4801,7 @@ class AIAgent:
             self._anthropic_api_key = runtime_key
             self._anthropic_base_url = runtime_base
             self._anthropic_client = build_anthropic_client(runtime_key, runtime_base)
-            self._is_anthropic_oauth = _is_oauth_token(runtime_key)
+            self._is_anthropic_oauth = _is_oauth_token(runtime_key) if self.provider == "anthropic" else False
             self.api_key = runtime_key
             self.base_url = runtime_base
             return
@@ -4654,80 +4818,49 @@ class AIAgent:
         *,
         status_code: Optional[int],
         has_retried_429: bool,
-        classified_reason: Optional[FailoverReason] = None,
         error_context: Optional[Dict[str, Any]] = None,
     ) -> tuple[bool, bool]:
         """Attempt credential recovery via pool rotation.
 
         Returns (recovered, has_retried_429).
-        On rate limits: first occurrence retries same credential (sets flag True).
-                        second consecutive failure rotates to next credential.
-        On billing exhaustion: immediately rotates.
-        On auth failures: attempts token refresh before rotating.
-
-        `classified_reason` lets the recovery path honor the structured error
-        classifier instead of relying only on raw HTTP codes. This matters for
-        providers that surface billing/rate-limit/auth conditions under a
-        different status code, such as Anthropic returning HTTP 400 for
-        "out of extra usage".
+        On 429: first occurrence retries same credential (sets flag True).
+                second consecutive 429 rotates to next credential (resets flag).
+        On 402: immediately rotates (billing exhaustion won't resolve with retry).
+        On 401: attempts token refresh before rotating.
         """
         pool = self._credential_pool
-        if pool is None:
+        if pool is None or status_code is None:
             return False, has_retried_429
 
-        effective_reason = classified_reason
-        if effective_reason is None:
-            if status_code == 402:
-                effective_reason = FailoverReason.billing
-            elif status_code == 429:
-                effective_reason = FailoverReason.rate_limit
-            elif status_code == 401:
-                effective_reason = FailoverReason.auth
-
-        if effective_reason == FailoverReason.billing:
-            rotate_status = status_code if status_code is not None else 402
-            next_entry = pool.mark_exhausted_and_rotate(status_code=rotate_status, error_context=error_context)
+        if status_code == 402:
+            next_entry = pool.mark_exhausted_and_rotate(status_code=402, error_context=error_context)
             if next_entry is not None:
-                logger.info(
-                    "Credential %s (billing) — rotated to pool entry %s",
-                    rotate_status,
-                    getattr(next_entry, "id", "?"),
-                )
+                logger.info(f"Credential 402 (billing) 鈥?rotated to pool entry {getattr(next_entry, 'id', '?')}")
                 self._swap_credential(next_entry)
                 return True, False
             return False, has_retried_429
 
-        if effective_reason == FailoverReason.rate_limit:
+        if status_code == 429:
             if not has_retried_429:
                 return False, True
-            rotate_status = status_code if status_code is not None else 429
-            next_entry = pool.mark_exhausted_and_rotate(status_code=rotate_status, error_context=error_context)
+            next_entry = pool.mark_exhausted_and_rotate(status_code=429, error_context=error_context)
             if next_entry is not None:
-                logger.info(
-                    "Credential %s (rate limit) — rotated to pool entry %s",
-                    rotate_status,
-                    getattr(next_entry, "id", "?"),
-                )
+                logger.info(f"Credential 429 (rate limit) 鈥?rotated to pool entry {getattr(next_entry, 'id', '?')}")
                 self._swap_credential(next_entry)
                 return True, False
             return False, True
 
-        if effective_reason == FailoverReason.auth:
+        if status_code == 401:
             refreshed = pool.try_refresh_current()
             if refreshed is not None:
-                logger.info(f"Credential auth failure — refreshed pool entry {getattr(refreshed, 'id', '?')}")
+                logger.info(f"Credential 401 鈥?refreshed pool entry {getattr(refreshed, 'id', '?')}")
                 self._swap_credential(refreshed)
                 return True, has_retried_429
-            # Refresh failed — rotate to next credential instead of giving up.
+            # Refresh failed 鈥?rotate to next credential instead of giving up.
             # The failed entry is already marked exhausted by try_refresh_current().
-            rotate_status = status_code if status_code is not None else 401
-            next_entry = pool.mark_exhausted_and_rotate(status_code=rotate_status, error_context=error_context)
+            next_entry = pool.mark_exhausted_and_rotate(status_code=401, error_context=error_context)
             if next_entry is not None:
-                logger.info(
-                    "Credential %s (auth refresh failed) — rotated to pool entry %s",
-                    rotate_status,
-                    getattr(next_entry, "id", "?"),
-                )
+                logger.info(f"Credential 401 (refresh failed) 鈥?rotated to pool entry {getattr(next_entry, 'id', '?')}")
                 self._swap_credential(next_entry)
                 return True, False
 
@@ -4746,11 +4879,6 @@ class AIAgent:
         Each worker thread gets its own OpenAI client instance. Interrupts only
         close that worker-local client, so retries and other requests never
         inherit a closed transport.
-
-        Includes a stale-call detector: if no response arrives within the
-        configured timeout, the connection is killed and an error raised so
-        the main retry loop can try again with backoff / credential rotation /
-        provider fallback.
         """
         result = {"response": None, "error": None}
         request_client_holder = {"client": None}
@@ -4768,7 +4896,36 @@ class AIAgent:
                     result["response"] = self._anthropic_messages_create(api_kwargs)
                 else:
                     request_client_holder["client"] = self._create_request_openai_client(reason="chat_completion_request")
-                    result["response"] = request_client_holder["client"].chat.completions.create(**api_kwargs)
+                    _chat_api = request_client_holder["client"].chat.completions
+                    from unittest.mock import Mock
+                    _raw_create = getattr(getattr(_chat_api, "with_raw_response", None), "create", None)
+                    if not isinstance(request_client_holder["client"], Mock) and callable(_raw_create):
+                        raw_response = _raw_create(**api_kwargs)
+                        http_response = getattr(raw_response, "http_response", None)
+                        self._capture_rate_limits(http_response or raw_response)
+                        response_body = None
+                        if http_response is not None:
+                            try:
+                                response_body = http_response.json()
+                            except Exception:
+                                response_body = None
+                        provider_transport_meta = self._extract_provider_transport_metadata(
+                            status_code=getattr(http_response, "status_code", None) or getattr(raw_response, "status_code", None),
+                            headers=getattr(http_response, "headers", None) or getattr(raw_response, "headers", None),
+                            body=response_body,
+                            source="chat_completion_raw_response",
+                        )
+                        self._merge_provider_usage_metadata(provider_transport_meta)
+                        self._log_provider_async_candidate(provider_transport_meta)
+                        result["response"] = raw_response.parse()
+                    else:
+                        result["response"] = _chat_api.create(**api_kwargs)
+                        provider_transport_meta = self._extract_provider_transport_metadata(
+                            result["response"],
+                            source="chat_completion_response",
+                        )
+                        self._merge_provider_usage_metadata(provider_transport_meta)
+                        self._log_provider_async_candidate(provider_transport_meta)
             except Exception as e:
                 result["error"] = e
             finally:
@@ -4776,86 +4933,10 @@ class AIAgent:
                 if request_client is not None:
                     self._close_request_openai_client(request_client, reason="request_complete")
 
-        # ── Stale-call timeout (mirrors streaming stale detector) ────────
-        # Non-streaming calls return nothing until the full response is
-        # ready.  Without this, a hung provider can block for the full
-        # httpx timeout (default 1800s) with zero feedback.  The stale
-        # detector kills the connection early so the main retry loop can
-        # apply richer recovery (credential rotation, provider fallback).
-        _stale_base = float(os.getenv("HERMES_API_CALL_STALE_TIMEOUT", 300.0))
-        _base_url = getattr(self, "_base_url", None) or ""
-        if _stale_base == 300.0 and _base_url and is_local_endpoint(_base_url):
-            _stale_timeout = float("inf")
-        else:
-            _est_tokens = sum(len(str(v)) for v in api_kwargs.get("messages", [])) // 4
-            if _est_tokens > 100_000:
-                _stale_timeout = max(_stale_base, 600.0)
-            elif _est_tokens > 50_000:
-                _stale_timeout = max(_stale_base, 450.0)
-            else:
-                _stale_timeout = _stale_base
-
-        _call_start = time.time()
-        self._touch_activity("waiting for non-streaming API response")
-
         t = threading.Thread(target=_call, daemon=True)
         t.start()
-        _poll_count = 0
         while t.is_alive():
             t.join(timeout=0.3)
-            _poll_count += 1
-
-            # Touch activity every ~30s so the gateway's inactivity
-            # monitor knows we're alive while waiting for the response.
-            if _poll_count % 100 == 0:  # 100 × 0.3s = 30s
-                _elapsed = time.time() - _call_start
-                self._touch_activity(
-                    f"waiting for non-streaming response ({int(_elapsed)}s elapsed)"
-                )
-
-            # Stale-call detector: kill the connection if no response
-            # arrives within the configured timeout.
-            _elapsed = time.time() - _call_start
-            if _elapsed > _stale_timeout:
-                _est_ctx = sum(len(str(v)) for v in api_kwargs.get("messages", [])) // 4
-                logger.warning(
-                    "Non-streaming API call stale for %.0fs (threshold %.0fs). "
-                    "model=%s context=~%s tokens. Killing connection.",
-                    _elapsed, _stale_timeout,
-                    api_kwargs.get("model", "unknown"), f"{_est_ctx:,}",
-                )
-                self._emit_status(
-                    f"⚠️ No response from provider for {int(_elapsed)}s "
-                    f"(non-streaming, model: {api_kwargs.get('model', 'unknown')}). "
-                    f"Aborting call."
-                )
-                try:
-                    if self.api_mode == "anthropic_messages":
-                        from agent.anthropic_adapter import build_anthropic_client
-
-                        self._anthropic_client.close()
-                        self._anthropic_client = build_anthropic_client(
-                            self._anthropic_api_key,
-                            getattr(self, "_anthropic_base_url", None),
-                        )
-                    else:
-                        rc = request_client_holder.get("client")
-                        if rc is not None:
-                            self._close_request_openai_client(rc, reason="stale_call_kill")
-                except Exception:
-                    pass
-                self._touch_activity(
-                    f"stale non-streaming call killed after {int(_elapsed)}s"
-                )
-                # Wait briefly for the thread to notice the closed connection.
-                t.join(timeout=2.0)
-                if result["error"] is None and result["response"] is None:
-                    result["error"] = TimeoutError(
-                        f"Non-streaming API call timed out after {int(_elapsed)}s "
-                        f"with no response (threshold: {int(_stale_timeout)}s)"
-                    )
-                break
-
             if self._interrupt_requested:
                 # Force-close the in-flight worker-local HTTP connection to stop
                 # token generation without poisoning the shared client used to
@@ -4880,50 +4961,7 @@ class AIAgent:
             raise result["error"]
         return result["response"]
 
-    # ── Unified streaming API call ─────────────────────────────────────────
-
-    def _reset_stream_delivery_tracking(self) -> None:
-        """Reset tracking for text delivered during the current model response."""
-        self._current_streamed_assistant_text = ""
-
-    def _record_streamed_assistant_text(self, text: str) -> None:
-        """Accumulate visible assistant text emitted through stream callbacks."""
-        if isinstance(text, str) and text:
-            self._current_streamed_assistant_text = (
-                getattr(self, "_current_streamed_assistant_text", "") + text
-            )
-
-    @staticmethod
-    def _normalize_interim_visible_text(text: str) -> str:
-        if not isinstance(text, str):
-            return ""
-        return re.sub(r"\s+", " ", text).strip()
-
-    def _interim_content_was_streamed(self, content: str) -> bool:
-        visible_content = self._normalize_interim_visible_text(
-            self._strip_think_blocks(content or "")
-        )
-        if not visible_content:
-            return False
-        streamed = self._normalize_interim_visible_text(
-            self._strip_think_blocks(getattr(self, "_current_streamed_assistant_text", "") or "")
-        )
-        return bool(streamed) and streamed == visible_content
-
-    def _emit_interim_assistant_message(self, assistant_msg: Dict[str, Any]) -> None:
-        """Surface a real mid-turn assistant commentary message to the UI layer."""
-        cb = getattr(self, "interim_assistant_callback", None)
-        if cb is None or not isinstance(assistant_msg, dict):
-            return
-        content = assistant_msg.get("content")
-        visible = self._strip_think_blocks(content or "").strip()
-        if not visible or visible == "(empty)":
-            return
-        already_streamed = self._interim_content_was_streamed(visible)
-        try:
-            cb(visible, already_streamed=already_streamed)
-        except Exception:
-            logger.debug("interim_assistant_callback error", exc_info=True)
+    # 鈹€鈹€ Unified streaming API call 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
     def _fire_stream_delta(self, text: str) -> None:
         """Fire all registered stream delta callbacks (display + TTS)."""
@@ -4934,19 +4972,16 @@ class AIAgent:
         if getattr(self, "_stream_needs_break", False) and text and text.strip():
             self._stream_needs_break = False
             text = "\n\n" + text
-        callbacks = [cb for cb in (self.stream_delta_callback, self._stream_callback) if cb is not None]
-        delivered = False
-        for cb in callbacks:
-            try:
-                cb(text)
-                delivered = True
-            except Exception:
-                pass
-        if delivered:
-            self._record_streamed_assistant_text(text)
+        for cb in (self.stream_delta_callback, self._stream_callback):
+            if cb is not None:
+                try:
+                    cb(text)
+                except Exception:
+                    pass
 
     def _fire_reasoning_delta(self, text: str) -> None:
         """Fire reasoning callback if registered."""
+        self._reasoning_deltas_fired = True
         cb = self.reasoning_callback
         if cb is not None:
             try:
@@ -4987,7 +5022,7 @@ class AIAgent:
         - codex_responses: delegates to _run_codex_stream (already streaming)
 
         Fires stream_delta_callback and _stream_callback for each text token.
-        Tool-call turns suppress the callback — only text-only final responses
+        Tool-call turns suppress the callback 鈥?only text-only final responses
         stream to the consumer.  Returns a SimpleNamespace that mimics the
         non-streaming response shape so the rest of the agent loop is unchanged.
 
@@ -5025,18 +5060,8 @@ class AIAgent:
         def _call_chat_completions():
             """Stream a chat completions response."""
             import httpx as _httpx
-            _base_timeout = float(os.getenv("HERMES_API_TIMEOUT", 1800.0))
-            _stream_read_timeout = float(os.getenv("HERMES_STREAM_READ_TIMEOUT", 120.0))
-            # Local providers (Ollama, llama.cpp, vLLM) can take minutes for
-            # prefill on large contexts before producing the first token.
-            # Auto-increase the httpx read timeout unless the user explicitly
-            # overrode HERMES_STREAM_READ_TIMEOUT.
-            if _stream_read_timeout == 120.0 and self.base_url and is_local_endpoint(self.base_url):
-                _stream_read_timeout = _base_timeout
-                logger.debug(
-                    "Local provider detected (%s) — stream read timeout raised to %.0fs",
-                    self.base_url, _stream_read_timeout,
-                )
+            _base_timeout = self._request_api_timeout_seconds()
+            _stream_read_timeout = self._stream_read_timeout_seconds()
             stream_kwargs = {
                 **api_kwargs,
                 "stream": True,
@@ -5060,7 +5085,15 @@ class AIAgent:
             # Capture rate limit headers from the initial HTTP response.
             # The OpenAI SDK Stream object exposes the underlying httpx
             # response via .response before any chunks are consumed.
-            self._capture_rate_limits(getattr(stream, "response", None))
+            stream_response = getattr(stream, "response", None)
+            self._capture_rate_limits(stream_response)
+            provider_transport_meta = self._extract_provider_transport_metadata(
+                status_code=getattr(stream_response, "status_code", None),
+                headers=getattr(stream_response, "headers", None),
+                source="chat_completion_stream_response",
+            )
+            self._merge_provider_usage_metadata(provider_transport_meta)
+            self._log_provider_async_candidate(provider_transport_meta)
 
             content_parts: list = []
             tool_calls_acc: dict = {}
@@ -5076,9 +5109,16 @@ class AIAgent:
             role = "assistant"
             reasoning_parts: list = []
             usage_obj = None
+            # Reset per-call reasoning tracking so _build_assistant_message
+            # knows whether reasoning was already displayed during streaming.
+            self._reasoning_deltas_fired = False
+
+            _first_chunk_seen = False
             for chunk in stream:
                 last_chunk_time["t"] = time.time()
-                self._touch_activity("receiving stream response")
+                if not _first_chunk_seen:
+                    _first_chunk_seen = True
+                    self._touch_activity("receiving stream response")
 
                 if self._interrupt_requested:
                     break
@@ -5102,7 +5142,7 @@ class AIAgent:
                     _fire_first_delta()
                     self._fire_reasoning_delta(reasoning_text)
 
-                # Accumulate text content — fire callback only when no tool calls
+                # Accumulate text content 鈥?fire callback only when no tool calls
                 if delta and delta.content:
                     content_parts.append(delta.content)
                     if not tool_calls_acc:
@@ -5113,7 +5153,7 @@ class AIAgent:
                         # Tool calls suppress regular content streaming (avoids
                         # displaying chatty "I'll use the tool..." text alongside
                         # tool calls).  But reasoning tags embedded in suppressed
-                        # content should still reach the display — otherwise the
+                        # content should still reach the display 鈥?otherwise the
                         # reasoning box only appears as a post-response fallback,
                         # rendering it confusingly after the already-streamed
                         # response.  Route suppressed content through the stream
@@ -5124,14 +5164,23 @@ class AIAgent:
                         if self.stream_delta_callback:
                             try:
                                 self.stream_delta_callback(delta.content)
-                                self._record_streamed_assistant_text(delta.content)
                             except Exception:
                                 pass
 
-                # Accumulate tool call deltas — notify display on first name
+                # Accumulate tool call deltas 鈥?notify display on first name
                 if delta and delta.tool_calls:
                     for tc_delta in delta.tool_calls:
-                        raw_idx = tc_delta.index if tc_delta.index is not None else 0
+                        raw_idx_value = tc_delta.index
+                        if raw_idx_value is None:
+                            raw_idx = 0
+                        else:
+                            try:
+                                raw_idx = int(raw_idx_value)
+                            except (TypeError, ValueError):
+                                # Some providers may emit non-numeric index values.
+                                # Normalize to an integer slot to avoid mixed-type
+                                # comparisons in max()/sorted() when assembling tool calls.
+                                raw_idx = 0
                         delta_id = tc_delta.id or ""
 
                         # Ollama fix: detect a new tool call reusing the same
@@ -5188,30 +5237,19 @@ class AIAgent:
             # Build mock response matching non-streaming shape
             full_content = "".join(content_parts) or None
             mock_tool_calls = None
-            has_truncated_tool_args = False
             if tool_calls_acc:
                 mock_tool_calls = []
                 for idx in sorted(tool_calls_acc):
                     tc = tool_calls_acc[idx]
-                    arguments = tc["function"]["arguments"]
-                    if arguments and arguments.strip():
-                        try:
-                            json.loads(arguments)
-                        except json.JSONDecodeError:
-                            has_truncated_tool_args = True
                     mock_tool_calls.append(SimpleNamespace(
                         id=tc["id"],
                         type=tc["type"],
                         extra_content=tc.get("extra_content"),
                         function=SimpleNamespace(
                             name=tc["function"]["name"],
-                            arguments=arguments,
+                            arguments=tc["function"]["arguments"],
                         ),
                     ))
-
-            effective_finish_reason = finish_reason or "stop"
-            if has_truncated_tool_args:
-                effective_finish_reason = "length"
 
             full_reasoning = "".join(reasoning_parts) or None
             mock_message = SimpleNamespace(
@@ -5223,7 +5261,7 @@ class AIAgent:
             mock_choice = SimpleNamespace(
                 index=0,
                 message=mock_message,
-                finish_reason=effective_finish_reason,
+                finish_reason=finish_reason or "stop",
             )
             return SimpleNamespace(
                 id="stream-" + str(uuid.uuid4()),
@@ -5241,21 +5279,13 @@ class AIAgent:
             works unchanged.
             """
             has_tool_use = False
+            self._reasoning_deltas_fired = False
 
             # Reset stale-stream timer for this attempt
             last_chunk_time["t"] = time.time()
             # Use the Anthropic SDK's streaming context manager
             with self._anthropic_client.messages.stream(**api_kwargs) as stream:
                 for event in stream:
-                    # Update stale-stream timer on every event so the
-                    # outer poll loop knows data is flowing.  Without
-                    # this, the detector kills healthy long-running
-                    # Opus streams after 180 s even when events are
-                    # actively arriving (the chat_completions path
-                    # already does this at the top of its chunk loop).
-                    last_chunk_time["t"] = time.time()
-                    self._touch_activity("receiving stream response")
-
                     if self._interrupt_requested:
                         break
 
@@ -5279,7 +5309,6 @@ class AIAgent:
                                 if text and not has_tool_use:
                                     _fire_first_delta()
                                     self._fire_stream_delta(text)
-                                    deltas_were_sent["yes"] = True
                             elif delta_type == "thinking_delta":
                                 thinking_text = getattr(delta, "thinking", "")
                                 if thinking_text:
@@ -5306,7 +5335,7 @@ class AIAgent:
                     except Exception as e:
                         if deltas_were_sent["yes"]:
                             # Streaming failed AFTER some tokens were already
-                            # delivered.  Don't retry or fall back — partial
+                            # delivered.  Don't retry or fall back 鈥?partial
                             # content already reached the user.
                             logger.warning(
                                 "Streaming failed after partial delivery, not retrying: %s", e
@@ -5324,8 +5353,8 @@ class AIAgent:
                         # SSE error events from proxies (e.g. OpenRouter sends
                         # {"error":{"message":"Network connection lost."}}) are
                         # raised as APIError by the OpenAI SDK.  These are
-                        # semantically identical to httpx connection drops —
-                        # the upstream stream died — and should be retried with
+                        # semantically identical to httpx connection drops 鈥?
+                        # the upstream stream died 鈥?and should be retried with
                         # a fresh connection.  Distinguish from HTTP errors:
                         # APIError from SSE has no status_code, while
                         # APIStatusError (4xx/5xx) always has one.
@@ -5352,6 +5381,12 @@ class AIAgent:
                                 )
 
                         if _is_timeout or _is_conn_err or _is_sse_conn_err:
+                            self._note_model_registry_failure(
+                                error_text=str(e),
+                                failure_reason="transient_network",
+                                error_code=type(e).__name__,
+                                mirror_to_bitable=True,
+                            )
                             # Transient network / timeout error. Retry the
                             # streaming request with a fresh connection first.
                             if _stream_attempt < _max_stream_retries:
@@ -5364,13 +5399,9 @@ class AIAgent:
                                     e,
                                 )
                                 self._emit_status(
-                                    f"⚠️ Connection to provider dropped "
-                                    f"({type(e).__name__}). Reconnecting… "
+                                    f"鈿狅笍 Connection to provider dropped "
+                                    f"({type(e).__name__}). Reconnecting鈥?"
                                     f"(attempt {_stream_attempt + 2}/{_max_stream_retries + 1})"
-                                )
-                                self._touch_activity(
-                                    f"stream retry {_stream_attempt + 2}/{_max_stream_retries + 1} "
-                                    f"after {type(e).__name__}"
                                 )
                                 # Close the stale request client before retry
                                 stale = request_client_holder.get("client")
@@ -5389,13 +5420,17 @@ class AIAgent:
                                     pass
                                 continue
                             self._emit_status(
-                                "❌ Connection to provider failed after "
+                                "鉂?Connection to provider failed after "
                                 f"{_max_stream_retries + 1} attempts. "
-                                "The provider may be experiencing issues — "
+                                "The provider may be experiencing issues 鈥?"
                                 "try again in a moment."
                             )
+                            if self._should_fail_fast_provider_errors_for_request():
+                                result["error"] = e
+                                return
                             logger.warning(
-                                "Streaming exhausted %s retries on transient error: %s",
+                                "Streaming exhausted %s retries on transient error, "
+                                "falling back to non-streaming: %s",
                                 _max_stream_retries + 1,
                                 e,
                             )
@@ -5406,37 +5441,43 @@ class AIAgent:
                                 and "not supported" in _err_lower
                             )
                             if _is_stream_unsupported:
-                                self._disable_streaming = True
                                 self._safe_print(
-                                    "\n⚠  Streaming is not supported for this "
-                                    "model/provider. Switching to non-streaming.\n"
+                                    "\n鈿? Streaming is not supported for this "
+                                    "model/provider. Falling back to non-streaming.\n"
                                     "   To avoid this delay, set display.streaming: false "
                                     "in config.yaml\n"
                                 )
                             logger.info(
-                                "Streaming failed before delivery: %s",
+                                "Streaming failed before delivery, falling back to non-streaming: %s",
                                 e,
                             )
 
-                        # Propagate the error to the main retry loop instead of
-                        # falling back to non-streaming inline.  The main loop has
-                        # richer recovery: credential rotation, provider fallback,
-                        # backoff, and — for "stream not supported" — will switch
-                        # to non-streaming on the next attempt via _disable_streaming.
-                        result["error"] = e
+                        try:
+                            # Reset stale timer 鈥?the non-streaming fallback
+                            # uses its own client; prevent the stale detector
+                            # from firing on stale timestamps from failed streams.
+                            last_chunk_time["t"] = time.time()
+                            result["response"] = self._interruptible_api_call(api_kwargs)
+                        except Exception as fallback_err:
+                            result["error"] = fallback_err
                         return
             finally:
                 request_client = request_client_holder.get("client")
                 if request_client is not None:
                     self._close_request_openai_client(request_client, reason="stream_request_complete")
 
-        _stream_stale_timeout_base = float(os.getenv("HERMES_STREAM_STALE_TIMEOUT", 180.0))
+        _stream_stale_timeout_base = self._stream_stale_timeout_base_seconds()
         # Local providers (Ollama, oMLX, llama-cpp) can take 300+ seconds
         # for prefill on large contexts.  Disable the stale detector unless
         # the user explicitly set HERMES_STREAM_STALE_TIMEOUT.
-        if _stream_stale_timeout_base == 180.0 and self.base_url and is_local_endpoint(self.base_url):
+        if (
+            _stream_stale_timeout_base == 180.0
+            and self.base_url
+            and is_local_endpoint(self.base_url)
+            and not self._is_cost_optimized_feishu_request()
+        ):
             _stream_stale_timeout = float("inf")
-            logger.debug("Local provider detected (%s) — stale stream timeout disabled", self.base_url)
+            logger.debug("Local provider detected (%s) 鈥?stale stream timeout disabled", self.base_url)
         else:
             # Scale the stale timeout for large contexts: slow models (like Opus)
             # can legitimately think for minutes before producing the first token
@@ -5463,13 +5504,13 @@ class AIAgent:
             if _stale_elapsed > _stream_stale_timeout:
                 _est_ctx = sum(len(str(v)) for v in api_kwargs.get("messages", [])) // 4
                 logger.warning(
-                    "Stream stale for %.0fs (threshold %.0fs) — no chunks received. "
+                    "Stream stale for %.0fs (threshold %.0fs) 鈥?no chunks received. "
                     "model=%s context=~%s tokens. Killing connection.",
                     _stale_elapsed, _stream_stale_timeout,
                     api_kwargs.get("model", "unknown"), f"{_est_ctx:,}",
                 )
                 self._emit_status(
-                    f"⚠️ No response from provider for {int(_stale_elapsed)}s "
+                    f"鈿狅笍 No response from provider for {int(_stale_elapsed)}s "
                     f"(model: {api_kwargs.get('model', 'unknown')}, "
                     f"context: ~{_est_ctx:,} tokens). "
                     f"Reconnecting..."
@@ -5480,7 +5521,7 @@ class AIAgent:
                         self._close_request_openai_client(rc, reason="stale_stream_kill")
                 except Exception:
                     pass
-                # Rebuild the primary client too — its connection pool
+                # Rebuild the primary client too 鈥?its connection pool
                 # may hold dead sockets from the same provider outage.
                 try:
                     self._replace_primary_openai_client(reason="stale_stream_pool_cleanup")
@@ -5489,9 +5530,6 @@ class AIAgent:
                 # Reset the timer so we don't kill repeatedly while
                 # the inner thread processes the closure.
                 last_chunk_time["t"] = time.time()
-                self._touch_activity(
-                    f"stale stream detected after {int(_stale_elapsed)}s, reconnecting"
-                )
 
             if self._interrupt_requested:
                 try:
@@ -5517,22 +5555,13 @@ class AIAgent:
                 # a new API call, creating a duplicate message.  Return a
                 # partial "stop" response instead so the outer loop treats this
                 # turn as complete (no retry, no fallback).
-                # Recover whatever content was already streamed to the user.
-                # _current_streamed_assistant_text accumulates text fired
-                # through _fire_stream_delta, so it has exactly what the
-                # user saw before the connection died.
-                _partial_text = (
-                    getattr(self, "_current_streamed_assistant_text", "") or ""
-                ).strip() or None
                 logger.warning(
                     "Partial stream delivered before error; returning stub "
-                    "response with %s chars of recovered content to prevent "
-                    "duplicate messages: %s",
-                    len(_partial_text or ""),
+                    "response to prevent duplicate messages: %s",
                     result["error"],
                 )
                 _stub_msg = SimpleNamespace(
-                    role="assistant", content=_partial_text, tool_calls=None,
+                    role="assistant", content=None, tool_calls=None,
                     reasoning_content=None,
                 )
                 return SimpleNamespace(
@@ -5546,7 +5575,97 @@ class AIAgent:
             raise result["error"]
         return result["response"]
 
-    # ── Provider fallback ──────────────────────────────────────────────────
+    # 鈹€鈹€ Provider fallback 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+
+    def _is_cost_optimized_feishu_request(self) -> bool:
+        return str(self.platform or "").strip().lower() == "feishu"
+
+    def _request_api_timeout_seconds(self) -> float:
+        env_name = "HERMES_FEISHU_API_TIMEOUT" if self._is_cost_optimized_feishu_request() else "HERMES_API_TIMEOUT"
+        default = 45.0 if self._is_cost_optimized_feishu_request() else 1800.0
+        try:
+            return max(1.0, float(os.getenv(env_name, str(default))))
+        except (TypeError, ValueError):
+            return default
+
+    def _stream_read_timeout_seconds(self) -> float:
+        env_name = "HERMES_FEISHU_STREAM_READ_TIMEOUT" if self._is_cost_optimized_feishu_request() else "HERMES_STREAM_READ_TIMEOUT"
+        default = 20.0 if self._is_cost_optimized_feishu_request() else 60.0
+        try:
+            return max(1.0, float(os.getenv(env_name, str(default))))
+        except (TypeError, ValueError):
+            return default
+
+    def _stream_stale_timeout_base_seconds(self) -> float:
+        env_name = "HERMES_FEISHU_STREAM_STALE_TIMEOUT" if self._is_cost_optimized_feishu_request() else "HERMES_STREAM_STALE_TIMEOUT"
+        default = 25.0 if self._is_cost_optimized_feishu_request() else 180.0
+        try:
+            return max(1.0, float(os.getenv(env_name, str(default))))
+        except (TypeError, ValueError):
+            return default
+
+    def _should_fail_fast_provider_errors_for_request(self) -> bool:
+        if not self._is_cost_optimized_feishu_request():
+            return False
+        raw = str(os.getenv("HERMES_FEISHU_FAIL_FAST_PROVIDER_ERRORS", "true") or "").strip().lower()
+        return raw not in {"0", "false", "no", "off"}
+
+    def _max_retry_attempts_for_request(self) -> int:
+        if self._is_cost_optimized_feishu_request():
+            raw = os.getenv("HERMES_FEISHU_PROVIDER_MAX_RETRIES", "2")
+            try:
+                return max(1, int(raw))
+            except (TypeError, ValueError):
+                return 2
+        return 3
+
+    def _max_fallback_activations_for_request(self) -> int:
+        if self._is_cost_optimized_feishu_request():
+            raw = os.getenv("HERMES_FEISHU_PROVIDER_MAX_FALLBACKS", "1")
+            try:
+                return max(0, int(raw))
+            except (TypeError, ValueError):
+                return 1
+        return max(len(self._fallback_chain), 0)
+
+    def _cap_retry_wait_for_request(self, wait_time: float) -> float:
+        if not self._is_cost_optimized_feishu_request():
+            return wait_time
+        raw = os.getenv("HERMES_FEISHU_PROVIDER_FAST_RETRY_WAIT_SECONDS", "1.5")
+        try:
+            cap = max(0.0, float(raw))
+        except (TypeError, ValueError):
+            cap = 1.5
+        if cap <= 0:
+            return 0.0
+        return min(wait_time, cap)
+
+    def _cloudflare_gateway_delegates_failover(self) -> bool:
+        if not self._is_cloudflare_ai_gateway_url():
+            return False
+        raw = str(os.getenv("CLOUDFLARE_AI_GATEWAY_DELEGATE_FAILOVER", "true") or "true").strip().lower()
+        return raw not in {"0", "false", "off", "no"}
+
+    def _attempt_local_fallback(
+        self,
+        *,
+        fallback_status: str | None = None,
+        delegated_status: str | None = None,
+    ) -> bool:
+        if self._cloudflare_gateway_delegates_failover():
+            if delegated_status:
+                self._emit_status(delegated_status)
+            logging.info(
+                "Cloudflare AI Gateway manages provider failover; skipping local fallback. "
+                "provider=%s model=%s base_url=%s",
+                self.provider or "",
+                self.model or "",
+                self.base_url or "",
+            )
+            return False
+        if fallback_status:
+            self._emit_status(fallback_status)
+        return self._try_activate_fallback()
 
     def _try_activate_fallback(self) -> bool:
         """Switch to the next fallback model/provider in the chain.
@@ -5557,10 +5676,16 @@ class AIAgent:
         each call; returns False when exhausted.
 
         Uses the centralized provider router (resolve_provider_client) for
-        auth resolution and client construction — no duplicated provider→key
+        auth resolution and client construction 鈥?no duplicated provider鈫択ey
         mappings.
         """
+        if self._cloudflare_gateway_delegates_failover():
+            return False
+
         if self._fallback_index >= len(self._fallback_chain):
+            return False
+
+        if self._turn_fallback_activations >= self._max_fallback_activations_for_request():
             return False
 
         fb = self._fallback_chain[self._fallback_index]
@@ -5584,7 +5709,7 @@ class AIAgent:
             # when no explicit key is in the fallback config.
             if fb_base_url_hint and "ollama.com" in fb_base_url_hint.lower() and not fb_api_key_hint:
                 fb_api_key_hint = os.getenv("OLLAMA_API_KEY") or None
-            fb_client, _resolved_fb_model = resolve_provider_client(
+            fb_client, _ = resolve_provider_client(
                 fb_provider, model=fb_model, raw_codex=True,
                 explicit_base_url=fb_base_url_hint,
                 explicit_api_key=fb_api_key_hint)
@@ -5593,14 +5718,8 @@ class AIAgent:
                     "Fallback to %s failed: provider not configured",
                     fb_provider)
                 return self._try_activate_fallback()  # try next in chain
-            try:
-                from hermes_cli.model_normalize import normalize_model_for_provider
 
-                fb_model = normalize_model_for_provider(fb_model, fb_provider)
-            except Exception:
-                pass
-
-            # Determine api_mode from provider / base URL / model
+            # Determine api_mode from provider / base URL
             fb_api_mode = "chat_completions"
             fb_base_url = str(fb_client.base_url)
             if fb_provider == "openai-codex":
@@ -5608,10 +5727,6 @@ class AIAgent:
             elif fb_provider == "anthropic" or fb_base_url.rstrip("/").lower().endswith("/anthropic"):
                 fb_api_mode = "anthropic_messages"
             elif self._is_direct_openai_url(fb_base_url):
-                fb_api_mode = "codex_responses"
-            elif self._model_requires_responses_api(fb_model):
-                # GPT-5.x models need Responses API on every provider
-                # (OpenRouter, Copilot, direct OpenAI, etc.)
                 fb_api_mode = "codex_responses"
 
             old_model = self.model
@@ -5636,25 +5751,13 @@ class AIAgent:
                 # Swap OpenAI client and config in-place
                 self.api_key = fb_client.api_key
                 self.client = fb_client
-                # Preserve provider-specific headers that
-                # resolve_provider_client() may have baked into
-                # fb_client via the default_headers kwarg.  The OpenAI
-                # SDK stores these in _custom_headers.  Without this,
-                # subsequent request-client rebuilds (via
-                # _create_request_openai_client) drop the headers,
-                # causing 403s from providers like Kimi Coding that
-                # require a User-Agent sentinel.
-                fb_headers = getattr(fb_client, "_custom_headers", None)
-                if not fb_headers:
-                    fb_headers = getattr(fb_client, "default_headers", None)
                 self._client_kwargs = {
                     "api_key": fb_client.api_key,
                     "base_url": fb_base_url,
-                    **({"default_headers": dict(fb_headers)} if fb_headers else {}),
                 }
 
             # Re-evaluate prompt caching for the new provider/model
-            is_native_anthropic = fb_api_mode == "anthropic_messages" and fb_provider == "anthropic"
+            is_native_anthropic = fb_api_mode == "anthropic_messages"
             self._use_prompt_caching = (
                 ("openrouter" in fb_base_url.lower() and "claude" in fb_model.lower())
                 or is_native_anthropic
@@ -5670,28 +5773,41 @@ class AIAgent:
                     self.model, base_url=self.base_url,
                     api_key=self.api_key, provider=self.provider,
                 )
-                self.context_compressor.update_model(
-                    model=self.model,
-                    context_length=fb_context_length,
-                    base_url=self.base_url,
-                    api_key=getattr(self, "api_key", ""),
-                    provider=self.provider,
+                self.context_compressor.model = self.model
+                self.context_compressor.base_url = self.base_url
+                self.context_compressor.api_key = self.api_key
+                self.context_compressor.provider = self.provider
+                self.context_compressor.context_length = fb_context_length
+                self.context_compressor.threshold_tokens = int(
+                    fb_context_length * self.context_compressor.threshold_percent
                 )
 
             self._emit_status(
-                f"🔄 Primary model failed — switching to fallback: "
+                f"馃攧 Primary model failed 鈥?switching to fallback: "
                 f"{fb_model} via {fb_provider}"
             )
+            try:
+                from tools.model_registry_refresh import schedule_model_registry_refresh
+
+                schedule_model_registry_refresh(
+                    reason=f"fallback_activated:{old_model}->{fb_model}:{fb_provider}",
+                    force_refresh=True,
+                    mirror_to_bitable=True,
+                    min_interval_seconds=30,
+                )
+            except Exception:
+                pass
             logging.info(
-                "Fallback activated: %s → %s (%s)",
+                "Fallback activated: %s 鈫?%s (%s)",
                 old_model, fb_model, fb_provider,
             )
+            self._turn_fallback_activations += 1
             return True
         except Exception as e:
             logging.error("Failed to activate fallback %s: %s", fb_model, e)
             return self._try_activate_fallback()  # try next in chain
 
-    # ── Per-turn primary restoration ─────────────────────────────────────
+    # 鈹€鈹€ Per-turn primary restoration 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
     def _restore_primary_runtime(self) -> bool:
         """Restore the primary runtime at the start of a new turn.
@@ -5701,15 +5817,15 @@ class AIAgent:
         to the fallback provider for every subsequent turn.  Calling this at
         the top of ``run_conversation()`` makes fallback turn-scoped.
 
-        The gateway caches agents across messages (``_agent_cache`` in
-        ``gateway/run.py``), so this restoration IS needed there too.
+        The gateway creates a fresh agent per message so this is a no-op
+        there (``_fallback_activated`` is always False at turn start).
         """
         if not self._fallback_activated:
             return False
 
         rt = self._primary_runtime
         try:
-            # ── Core runtime state ──
+            # 鈹€鈹€ Core runtime state 鈹€鈹€
             self.model = rt["model"]
             self.provider = rt["provider"]
             self.base_url = rt["base_url"]           # setter updates _base_url_lower
@@ -5718,7 +5834,7 @@ class AIAgent:
             self._client_kwargs = dict(rt["client_kwargs"])
             self._use_prompt_caching = rt["use_prompt_caching"]
 
-            # ── Rebuild client for the primary provider ──
+            # 鈹€鈹€ Rebuild client for the primary provider 鈹€鈹€
             if self.api_mode == "anthropic_messages":
                 from agent.anthropic_adapter import build_anthropic_client
                 self._anthropic_api_key = rt["anthropic_api_key"]
@@ -5735,17 +5851,16 @@ class AIAgent:
                     shared=True,
                 )
 
-            # ── Restore context engine state ──
+            # 鈹€鈹€ Restore context compressor state 鈹€鈹€
             cc = self.context_compressor
-            cc.update_model(
-                model=rt["compressor_model"],
-                context_length=rt["compressor_context_length"],
-                base_url=rt["compressor_base_url"],
-                api_key=rt["compressor_api_key"],
-                provider=rt["compressor_provider"],
-            )
+            cc.model = rt["compressor_model"]
+            cc.base_url = rt["compressor_base_url"]
+            cc.api_key = rt["compressor_api_key"]
+            cc.provider = rt["compressor_provider"]
+            cc.context_length = rt["compressor_context_length"]
+            cc.threshold_tokens = rt["compressor_threshold_tokens"]
 
-            # ── Reset fallback chain for the new turn ──
+            # 鈹€鈹€ Reset fallback chain for the new turn 鈹€鈹€
             self._fallback_activated = False
             self._fallback_index = 0
 
@@ -5763,7 +5878,6 @@ class AIAgent:
     _TRANSIENT_TRANSPORT_ERRORS = frozenset({
         "ReadTimeout", "ConnectTimeout", "PoolTimeout",
         "ConnectError", "RemoteProtocolError",
-        "APIConnectionError", "APITimeoutError",
     })
 
     def _try_recover_primary_transport(
@@ -5778,7 +5892,7 @@ class AIAgent:
         mean the provider is down.
 
         Skipped for proxy/aggregator providers (OpenRouter, Nous) which
-        already manage connection pools and retries server-side — if our
+        already manage connection pools and retries server-side 鈥?if our
         retries through them are exhausted, one more rebuilt client won't help.
         """
         if self._fallback_activated:
@@ -5789,7 +5903,7 @@ class AIAgent:
         if error_type not in self._TRANSIENT_TRANSPORT_ERRORS:
             return False
 
-        # Skip for aggregator providers — they manage their own retry infra
+        # Skip for aggregator providers 鈥?they manage their own retry infra
         if self._is_openrouter_url():
             return False
         provider_lower = (self.provider or "").strip().lower()
@@ -5833,7 +5947,7 @@ class AIAgent:
 
             wait_time = min(3 + retry_count, 8)
             self._vprint(
-                f"{self.log_prefix}🔁 Transient {error_type} on {self.provider} — "
+                f"{self.log_prefix}馃攣 Transient {error_type} on {self.provider} 鈥?"
                 f"rebuilt client, waiting {wait_time}s before one last primary attempt.",
                 force=True,
             )
@@ -5843,7 +5957,7 @@ class AIAgent:
             logging.warning("Primary transport recovery failed: %s", e)
             return False
 
-    # ── End provider fallback ──────────────────────────────────────────────
+    # 鈹€鈹€ End provider fallback 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
     @staticmethod
     def _content_has_image_parts(content: Any) -> bool:
@@ -5990,13 +6104,11 @@ class AIAgent:
     def _anthropic_preserve_dots(self) -> bool:
         """True when using an anthropic-compatible endpoint that preserves dots in model names.
         Alibaba/DashScope keeps dots (e.g. qwen3.5-plus).
-        MiniMax keeps dots (e.g. MiniMax-M2.7).
-        OpenCode Go/Zen keeps dots for non-Claude models (e.g. minimax-m2.5-free).
-        ZAI/Zhipu keeps dots (e.g. glm-4.7, glm-5.1)."""
-        if (getattr(self, "provider", "") or "").lower() in {"alibaba", "minimax", "minimax-cn", "opencode-go", "opencode-zen", "zai"}:
+        OpenCode Go keeps dots (e.g. minimax-m2.7)."""
+        if (getattr(self, "provider", "") or "").lower() in {"alibaba", "opencode-go"}:
             return True
         base = (getattr(self, "base_url", "") or "").lower()
-        return "dashscope" in base or "aliyuncs" in base or "minimax" in base or "opencode.ai/zen/" in base or "bigmodel.cn" in base
+        return "dashscope" in base or "aliyuncs" in base or "opencode.ai/zen/go" in base
 
     def _is_qwen_portal(self) -> bool:
         """Return True when the base URL targets Qwen Portal."""
@@ -6036,7 +6148,7 @@ class AIAgent:
         return prepared
 
     def _qwen_prepare_chat_messages_inplace(self, messages: list) -> None:
-        """In-place variant — mutates an already-copied message list."""
+        """In-place variant 鈥?mutates an already-copied message list."""
         if not messages:
             return
 
@@ -6068,28 +6180,20 @@ class AIAgent:
         if self.api_mode == "anthropic_messages":
             from agent.anthropic_adapter import build_anthropic_kwargs
             anthropic_messages = self._prepare_anthropic_messages_for_api(api_messages)
-            # Pass context_length (total input+output window) so the adapter can
-            # clamp max_tokens (output cap) when the user configured a smaller
-            # context window than the model's native output limit.
+            # Pass context_length so the adapter can clamp max_tokens if the
+            # user configured a smaller context window than the model's output limit.
             ctx_len = getattr(self, "context_compressor", None)
             ctx_len = ctx_len.context_length if ctx_len else None
-            # _ephemeral_max_output_tokens is set for one call when the API
-            # returns "max_tokens too large given prompt" — it caps output to
-            # the available window space without touching context_length.
-            ephemeral_out = getattr(self, "_ephemeral_max_output_tokens", None)
-            if ephemeral_out is not None:
-                self._ephemeral_max_output_tokens = None  # consume immediately
             return build_anthropic_kwargs(
                 model=self.model,
                 messages=anthropic_messages,
                 tools=self.tools,
-                max_tokens=ephemeral_out if ephemeral_out is not None else self.max_tokens,
+                max_tokens=self.max_tokens,
                 reasoning_config=self.reasoning_config,
                 is_oauth=self._is_anthropic_oauth,
                 preserve_dots=self._anthropic_preserve_dots(),
                 context_length=ctx_len,
                 base_url=getattr(self, "_anthropic_base_url", None),
-                fast_mode=(self.request_overrides or {}).get("speed") == "fast",
             )
 
         if self.api_mode == "codex_responses":
@@ -6104,10 +6208,6 @@ class AIAgent:
             is_github_responses = (
                 "models.github.ai" in self.base_url.lower()
                 or "api.githubcopilot.com" in self.base_url.lower()
-            )
-            is_codex_backend = (
-                self.provider == "openai-codex"
-                or "chatgpt.com/backend-api/codex" in self.base_url.lower()
             )
 
             # Resolve reasoning effort: config > default (medium)
@@ -6146,10 +6246,7 @@ class AIAgent:
             elif not is_github_responses:
                 kwargs["include"] = []
 
-            if self.request_overrides:
-                kwargs.update(self.request_overrides)
-
-            if self.max_tokens is not None and not is_codex_backend:
+            if self.max_tokens is not None:
                 kwargs["max_output_tokens"] = self.max_tokens
 
             return kwargs
@@ -6195,10 +6292,10 @@ class AIAgent:
         # If sanitization already deepcopied, reuse that copy (in-place).
         if self._is_qwen_portal():
             if sanitized_messages is api_messages:
-                # No sanitization was done — we need our own copy.
+                # No sanitization was done 鈥?we need our own copy.
                 sanitized_messages = self._qwen_prepare_chat_messages(sanitized_messages)
             else:
-                # Already a deepcopy — transform in place to avoid a second deepcopy.
+                # Already a deepcopy 鈥?transform in place to avoid a second deepcopy.
                 self._qwen_prepare_chat_messages_inplace(sanitized_messages)
 
         # GPT-5 and Codex models respond better to 'developer' than 'system'
@@ -6210,7 +6307,7 @@ class AIAgent:
             and sanitized_messages[0].get("role") == "system"
             and any(p in _model_lower for p in DEVELOPER_ROLE_MODELS)
         ):
-            # Shallow-copy the list + first message only — rest stays shared.
+            # Shallow-copy the list + first message only 鈥?rest stays shared.
             sanitized_messages = list(sanitized_messages)
             sanitized_messages[0] = {**sanitized_messages[0], "role": "developer"}
 
@@ -6228,10 +6325,16 @@ class AIAgent:
         if self.provider_data_collection:
             provider_preferences["data_collection"] = self.provider_data_collection
 
+        requested_model = str(self.model or "").strip()
+        selected_model = requested_model
+        cloudflare_dynamic_model, cloudflare_task_kind = self._select_cloudflare_gateway_model(sanitized_messages)
+        if cloudflare_dynamic_model:
+            selected_model = cloudflare_dynamic_model
+
         api_kwargs = {
-            "model": self.model,
+            "model": selected_model,
             "messages": sanitized_messages,
-            "timeout": float(os.getenv("HERMES_API_TIMEOUT", 1800.0)),
+            "timeout": self._request_api_timeout_seconds(),
         }
         if self._is_qwen_portal():
             api_kwargs["metadata"] = {
@@ -6242,32 +6345,31 @@ class AIAgent:
             api_kwargs["tools"] = self.tools
 
         if self.max_tokens is not None:
-            api_kwargs.update(self._max_tokens_param(self.max_tokens))
-        elif self._is_qwen_portal():
-            # Qwen Portal defaults to a very low max_tokens when omitted.
-            # Reasoning models (qwen3-coder-plus) exhaust that budget on
-            # thinking tokens alone, causing the portal to return
-            # finish_reason="stop" with truncated output — the agent sees
-            # this as an intentional stop and exits the loop.  Send 65536
-            # (the documented max output for qwen3-coder models) so the
-            # model has adequate output budget for tool calls.
-            api_kwargs.update(self._max_tokens_param(65536))
-        elif (self._is_openrouter_url() or "nousresearch" in self._base_url_lower) and "claude" in (self.model or "").lower():
-            # OpenRouter and Nous Portal translate requests to Anthropic's
-            # Messages API, which requires max_tokens as a mandatory field.
-            # When we omit it, the proxy picks a default that can be too
-            # low — the model spends its output budget on thinking and has
-            # almost nothing left for the actual response (especially large
-            # tool calls like write_file).  Sending the model's real output
-            # limit ensures full capacity.
+            if not self._is_qwen_portal():
+                api_kwargs.update(self._max_tokens_param(self.max_tokens))
+        elif self._is_openrouter_url() and "claude" in (self.model or "").lower():
+            # OpenRouter translates requests to Anthropic's Messages API,
+            # which requires max_tokens as a mandatory field.  When we omit
+            # it, OpenRouter picks a default that can be too low 鈥?the model
+            # spends its output budget on thinking and has almost nothing
+            # left for the actual response (especially large tool calls like
+            # write_file).  Sending the model's real output limit ensures
+            # full capacity.  Other providers handle the default fine.
             try:
                 from agent.anthropic_adapter import _get_anthropic_max_output
                 _model_output_limit = _get_anthropic_max_output(self.model)
                 api_kwargs["max_tokens"] = _model_output_limit
             except Exception:
-                pass  # fail open — let the proxy pick its default
+                pass  # fail open 鈥?let OpenRouter pick its default
 
         extra_body = {}
+        broadcast_payload = self._build_openrouter_broadcast_payload()
+        if broadcast_payload.get("user"):
+            api_kwargs["user"] = broadcast_payload["user"]
+        if broadcast_payload.get("session_id"):
+            extra_body["session_id"] = broadcast_payload["session_id"]
+        if broadcast_payload.get("trace"):
+            extra_body["trace"] = broadcast_payload["trace"]
 
         _is_openrouter = self._is_openrouter_url()
         _is_github_models = (
@@ -6277,7 +6379,7 @@ class AIAgent:
 
         # Provider preferences (only, ignore, order, sort) are OpenRouter-
         # specific.  Only send to OpenRouter-compatible endpoints.
-        # TODO: Nous Portal will add transparent proxy support — re-enable
+        # TODO: Nous Portal will add transparent proxy support 鈥?re-enable
         # for _is_nous when their backend is updated.
         if provider_preferences and _is_openrouter:
             extra_body["provider"] = provider_preferences
@@ -6289,9 +6391,10 @@ class AIAgent:
                 if github_reasoning is not None:
                     extra_body["reasoning"] = github_reasoning
             else:
-                if self.reasoning_config is not None:
-                    rc = dict(self.reasoning_config)
-                    # Nous Portal requires reasoning enabled — don't send
+                resolved_reasoning_config = self._resolved_reasoning_config_for_request()
+                if resolved_reasoning_config is not None:
+                    rc = resolved_reasoning_config
+                    # Nous Portal requires reasoning enabled 鈥?don't send
                     # enabled=false to it (would cause 400).
                     if _is_nous and rc.get("enabled") is False:
                         pass  # omit reasoning entirely for Nous when disabled
@@ -6309,7 +6412,7 @@ class AIAgent:
 
         # Ollama num_ctx: override the 2048 default so the model actually
         # uses the context window it was trained for.  Passed via the OpenAI
-        # SDK's extra_body → options.num_ctx, which Ollama's OpenAI-compat
+        # SDK's extra_body 鈫?options.num_ctx, which Ollama's OpenAI-compat
         # endpoint forwards to the runner as --ctx-size.
         if self._ollama_num_ctx:
             options = extra_body.get("options", {})
@@ -6325,15 +6428,72 @@ class AIAgent:
         # xAI prompt caching: send x-grok-conv-id header to route requests
         # to the same server, maximizing automatic cache hits.
         # https://docs.x.ai/developers/advanced-api-usage/prompt-caching
+        extra_headers = dict(api_kwargs.get("extra_headers") or {})
         if "x.ai" in self._base_url_lower and hasattr(self, "session_id") and self.session_id:
-            api_kwargs["extra_headers"] = {"x-grok-conv-id": self.session_id}
-
-        # Priority Processing / generic request overrides (e.g. service_tier).
-        # Applied last so overrides win over any defaults set above.
-        if self.request_overrides:
-            api_kwargs.update(self.request_overrides)
+            extra_headers["x-grok-conv-id"] = self.session_id
+        if self._is_cloudflare_ai_gateway_url():
+            extra_headers.update(
+                self._build_cloudflare_gateway_headers(
+                    api_messages=sanitized_messages,
+                    selected_model=selected_model,
+                    requested_model=requested_model,
+                    task_kind=cloudflare_task_kind,
+                )
+            )
+        if extra_headers:
+            api_kwargs["extra_headers"] = extra_headers
 
         return api_kwargs
+
+    @staticmethod
+    def _env_flag(name: str, default: bool = False) -> bool:
+        value = os.getenv(name)
+        if value is None or value == "":
+            return default
+        return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+    @staticmethod
+    def _hash_trace_identifier(value: str) -> str:
+        return hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
+
+    def _build_openrouter_broadcast_payload(self) -> dict[str, Any]:
+        if not self._is_openrouter_url():
+            return {}
+        if not self._env_flag("OPENROUTER_BROADCAST_ENABLED", default=False):
+            return {}
+
+        trace_session_key = self._trace_session_key or ""
+        payload: dict[str, Any] = {}
+        if self.platform and self._user_id:
+            payload["user"] = f"{self.platform}:{self._hash_trace_identifier(str(self._user_id))}"
+        if trace_session_key:
+            payload["session_id"] = trace_session_key
+
+        trace_payload: dict[str, Any] = {}
+        if self.platform:
+            trace_payload["platform"] = self.platform
+        if trace_session_key:
+            trace_payload["session_key"] = trace_session_key
+        if self.provider:
+            trace_payload["route_provider"] = self.provider
+        if self.model:
+            trace_payload["route_model"] = self.model
+        derived_correlation_id = self._derive_trace_correlation_id()
+        if derived_correlation_id:
+            trace_payload["correlation_id"] = derived_correlation_id
+
+        privacy_mode = self._env_flag("OPENROUTER_BROADCAST_PRIVACY_MODE", default=True)
+        for key, value in (self._trace_metadata or {}).items():
+            if value is None:
+                continue
+            if privacy_mode and key in {"chat_id", "user_id", "file_path", "open_id", "raw_user_id"}:
+                continue
+            if isinstance(value, (str, int, float, bool)):
+                trace_payload[key] = value
+
+        if trace_payload:
+            payload["trace"] = trace_payload
+        return payload
 
     def _supports_reasoning_extra_body(self) -> bool:
         """Return True when reasoning extra_body is safe to send for this route/model.
@@ -6368,6 +6528,31 @@ class AIAgent:
             "qwen/qwen3",
         )
         return any(model.startswith(prefix) for prefix in reasoning_model_prefixes)
+
+    def _requires_enabled_reasoning(self) -> bool:
+        """Return True when the route/model rejects `reasoning.enabled=false`."""
+        if "openrouter" not in self._base_url_lower:
+            return False
+        model = (self.model or "").strip().lower()
+        mandatory_reasoning_prefixes = (
+            "openai/gpt-oss",
+        )
+        return any(model.startswith(prefix) for prefix in mandatory_reasoning_prefixes)
+
+    def _resolved_reasoning_config_for_request(self) -> dict | None:
+        """Resolve reasoning config after applying provider/model safety guards."""
+        if self.reasoning_config is None:
+            return None
+        rc = dict(self.reasoning_config) if isinstance(self.reasoning_config, dict) else None
+        if not rc:
+            return None
+        if rc.get("enabled") is False and self._requires_enabled_reasoning():
+            logger.info(
+                "Reasoning disable override omitted for provider-required reasoning model: %s",
+                self.model,
+            )
+            return None
+        return rc
 
     def _github_models_reasoning_extra_body(self) -> dict | None:
         """Format reasoning payload for GitHub Models/OpenAI-compatible routes."""
@@ -6424,7 +6609,7 @@ class AIAgent:
             logging.debug(f"Captured reasoning ({len(reasoning_text)} chars): {reasoning_text}")
 
         if reasoning_text and self.reasoning_callback:
-            # Skip callback when streaming is active — reasoning was already
+            # Skip callback when streaming is active 鈥?reasoning was already
             # displayed during the stream via one of two paths:
             #   (a) _fire_reasoning_delta (structured reasoning_content deltas)
             #   (b) _stream_delta tag extraction (<think>/<REASONING_SCRATCHPAD>)
@@ -6526,7 +6711,7 @@ class AIAgent:
         Providers like Mistral, Fireworks, and other strict OpenAI-compatible APIs
         validate the Chat Completions schema and reject unknown fields (call_id,
         response_item_id) with 400 or 422 errors. These fields are preserved in
-        the internal message history — this method only modifies the outgoing
+        the internal message history 鈥?this method only modifies the outgoing
         API copy.
 
         Creates new tool_call dicts rather than mutating in-place, so the
@@ -6589,7 +6774,7 @@ class AIAgent:
 
         flush_content = (
             "[System: The session is being compressed. "
-            "Save anything worth remembering — prioritize user preferences, "
+            "Save anything worth remembering 鈥?prioritize user preferences, "
             "corrections, and recurring patterns over task-specific details.]"
         )
         _sentinel = f"__flush_{id(self)}_{time.monotonic()}"
@@ -6654,7 +6839,7 @@ class AIAgent:
                     codex_kwargs["max_output_tokens"] = 5120
                 response = self._run_codex_stream(codex_kwargs)
             elif not _aux_available and self.api_mode == "anthropic_messages":
-                # Native Anthropic — use the Anthropic client directly
+                # Native Anthropic 鈥?use the Anthropic client directly
                 from agent.anthropic_adapter import build_anthropic_kwargs as _build_ant_kwargs
                 ant_kwargs = _build_ant_kwargs(
                     model=self.model, messages=api_messages,
@@ -6706,7 +6891,7 @@ class AIAgent:
                             store=self._memory_store,
                         )
                         if not self.quiet_mode:
-                            print(f"  🧠 Memory flush: saved to {args.get('target', 'memory')}")
+                            print(f"  馃 Memory flush: saved to {args.get('target', 'memory')}")
                     except Exception as e:
                         logger.debug("Memory flush tool call failed: %s", e)
         except Exception as e:
@@ -6721,23 +6906,17 @@ class AIAgent:
             if messages and messages[-1].get("_flush_sentinel") == _sentinel:
                 messages.pop()
 
-    def _compress_context(self, messages: list, system_message: str, *, approx_tokens: int = None, task_id: str = "default", focus_topic: str = None) -> tuple:
+    def _compress_context(self, messages: list, system_message: str, *, approx_tokens: int = None, task_id: str = "default") -> tuple:
         """Compress conversation context and split the session in SQLite.
-
-        Args:
-            focus_topic: Optional focus string for guided compression — the
-                summariser will prioritise preserving information related to
-                this topic.  Inspired by Claude Code's ``/compact <focus>``.
 
         Returns:
             (compressed_messages, new_system_prompt) tuple
         """
         _pre_msg_count = len(messages)
         logger.info(
-            "context compression started: session=%s messages=%d tokens=~%s model=%s focus=%r",
+            "context compression started: session=%s messages=%d tokens=~%s model=%s",
             self.session_id or "none", _pre_msg_count,
             f"{approx_tokens:,}" if approx_tokens else "unknown", self.model,
-            focus_topic,
         )
         # Pre-compression memory flush: let the model save memories before they're lost
         self.flush_memories(messages, min_turns=0)
@@ -6749,7 +6928,7 @@ class AIAgent:
             except Exception:
                 pass
 
-        compressed = self.context_compressor.compress(messages, current_tokens=approx_tokens, focus_topic=focus_topic)
+        compressed = self.context_compressor.compress(messages, current_tokens=approx_tokens)
 
         todo_snapshot = self._todo_store.format_for_injection()
         if todo_snapshot:
@@ -6782,16 +6961,16 @@ class AIAgent:
                     except (ValueError, Exception) as e:
                         logger.debug("Could not propagate title on compression: %s", e)
                 self._session_db.update_system_prompt(self.session_id, new_system_prompt)
-                # Reset flush cursor — new session starts with no messages written
+                # Reset flush cursor 鈥?new session starts with no messages written
                 self._last_flushed_db_idx = 0
             except Exception as e:
-                logger.warning("Session DB compression split failed — new session will NOT be indexed: %s", e)
+                logger.warning("Session DB compression split failed 鈥?new session will NOT be indexed: %s", e)
 
         # Warn on repeated compressions (quality degrades with each pass)
         _cc = self.context_compressor.compression_count
         if _cc >= 2:
             self._vprint(
-                f"{self.log_prefix}⚠️  Session compressed {_cc} times — "
+                f"{self.log_prefix}鈿狅笍  Session compressed {_cc} times 鈥?"
                 f"accuracy may degrade. Consider /new to start fresh.",
                 force=True,
             )
@@ -6820,7 +6999,7 @@ class AIAgent:
                 AIAgent._context_pressure_last_warned.pop(_sid, None)
 
         # Clear the file-read dedup cache.  After compression the original
-        # read content is summarised away — if the model re-reads the same
+        # read content is summarised away 鈥?if the model re-reads the same
         # file it needs the full content, not a "file unchanged" stub.
         try:
             from tools.file_tools import reset_file_dedup
@@ -6941,18 +7120,18 @@ class AIAgent:
         tool_calls = assistant_message.tool_calls
         num_tools = len(tool_calls)
 
-        # ── Pre-flight: interrupt check ──────────────────────────────────
+        # 鈹€鈹€ Pre-flight: interrupt check 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
         if self._interrupt_requested:
-            print(f"{self.log_prefix}⚡ Interrupt: skipping {num_tools} tool call(s)")
+            print(f"{self.log_prefix}鈿?Interrupt: skipping {num_tools} tool call(s)")
             for tc in tool_calls:
                 messages.append({
                     "role": "tool",
-                    "content": f"[Tool execution cancelled — {tc.function.name} was skipped due to user interrupt]",
+                    "content": f"[Tool execution cancelled 鈥?{tc.function.name} was skipped due to user interrupt]",
                     "tool_call_id": tc.id,
                 })
             return
 
-        # ── Parse args + pre-execution bookkeeping ───────────────────────
+        # 鈹€鈹€ Parse args + pre-execution bookkeeping 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
         parsed_calls = []  # list of (tool_call, function_name, function_args)
         for tool_call in tool_calls:
             function_name = tool_call.function.name
@@ -6994,18 +7173,18 @@ class AIAgent:
 
             parsed_calls.append((tool_call, function_name, function_args))
 
-        # ── Logging / callbacks ──────────────────────────────────────────
-        tool_names_str = ", ".join(name for _, name, _ in parsed_calls)
+        # 鈹€鈹€ Logging / callbacks 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+        tool_names_str = ", ".join(str(name) for _, name, _ in parsed_calls)
         if not self.quiet_mode:
-            print(f"  ⚡ Concurrent: {num_tools} tool calls — {tool_names_str}")
+            print(f"  鈿?Concurrent: {num_tools} tool calls 鈥?{tool_names_str}")
             for i, (tc, name, args) in enumerate(parsed_calls, 1):
                 args_str = json.dumps(args, ensure_ascii=False)
                 if self.verbose_logging:
-                    print(f"  📞 Tool {i}: {name}({list(args.keys())})")
+                    print(f"  馃摓 Tool {i}: {name}({list(args.keys())})")
                     print(f"     Args: {args_str}")
                 else:
                     args_preview = args_str[:self.log_prefix_chars] + "..." if len(args_str) > self.log_prefix_chars else args_str
-                    print(f"  📞 Tool {i}: {name}({list(args.keys())}) - {args_preview}")
+                    print(f"  馃摓 Tool {i}: {name}({list(args.keys())}) - {args_preview}")
 
         for tc, name, args in parsed_calls:
             if self.tool_progress_callback:
@@ -7022,7 +7201,7 @@ class AIAgent:
                 except Exception as cb_err:
                     logging.debug(f"Tool start callback error: {cb_err}")
 
-        # ── Concurrent execution ─────────────────────────────────────────
+        # 鈹€鈹€ Concurrent execution 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
         # Each slot holds (function_name, function_args, function_result, duration, error_flag)
         results = [None] * num_tools
 
@@ -7044,9 +7223,9 @@ class AIAgent:
 
         # Start spinner for CLI mode (skip when TUI handles tool progress)
         spinner = None
-        if self._should_emit_quiet_tool_messages() and self._should_start_quiet_spinner():
+        if self.quiet_mode and not self.tool_progress_callback and self._should_start_quiet_spinner():
             face = random.choice(KawaiiSpinner.KAWAII_WAITING)
-            spinner = KawaiiSpinner(f"{face} ⚡ running {num_tools} tools concurrently", spinner_type='dots', print_fn=self._print_fn)
+            spinner = KawaiiSpinner(f"{face} 鈿?running {num_tools} tools concurrently", spinner_type='dots', print_fn=self._print_fn)
             spinner.start()
 
         try:
@@ -7064,9 +7243,9 @@ class AIAgent:
                 # Build a summary message for the spinner stop
                 completed = sum(1 for r in results if r is not None)
                 total_dur = sum(r[3] for r in results if r is not None)
-                spinner.stop(f"⚡ {completed}/{num_tools} tools completed in {total_dur:.1f}s total")
+                spinner.stop(f"鈿?{completed}/{num_tools} tools completed in {total_dur:.1f}s total")
 
-        # ── Post-execution: display per-tool results ─────────────────────
+        # 鈹€鈹€ Post-execution: display per-tool results 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
         for i, (tc, name, args) in enumerate(parsed_calls):
             r = results[i]
             if r is None:
@@ -7094,16 +7273,16 @@ class AIAgent:
                     logging.debug(f"Tool result ({len(function_result)} chars): {function_result}")
 
             # Print cute message per tool
-            if self._should_emit_quiet_tool_messages():
+            if self.quiet_mode:
                 cute_msg = _get_cute_tool_message_impl(name, args, tool_duration, result=function_result)
                 self._safe_print(f"  {cute_msg}")
             elif not self.quiet_mode:
                 if self.verbose_logging:
-                    print(f"  ✅ Tool {i+1} completed in {tool_duration:.2f}s")
+                    print(f"  鉁?Tool {i+1} completed in {tool_duration:.2f}s")
                     print(f"     Result: {function_result}")
                 else:
                     response_preview = function_result[:self.log_prefix_chars] + "..." if len(function_result) > self.log_prefix_chars else function_result
-                    print(f"  ✅ Tool {i+1} completed in {tool_duration:.2f}s - {response_preview}")
+                    print(f"  鉁?Tool {i+1} completed in {tool_duration:.2f}s - {response_preview}")
 
             self._current_tool = None
             self._touch_activity(f"tool completed: {name} ({tool_duration:.1f}s)")
@@ -7132,11 +7311,29 @@ class AIAgent:
             }
             messages.append(tool_msg)
 
-        # ── Per-turn aggregate budget enforcement ─────────────────────────
+        # 鈹€鈹€ Per-turn aggregate budget enforcement 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
         num_tools = len(parsed_calls)
         if num_tools > 0:
             turn_tool_msgs = messages[-num_tools:]
             enforce_turn_budget(turn_tool_msgs, env=get_active_env(effective_task_id))
+
+        # 鈹€鈹€ Budget pressure injection 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+        budget_warning = self._get_budget_warning(api_call_count)
+        if budget_warning and messages and messages[-1].get("role") == "tool":
+            last_content = messages[-1]["content"]
+            try:
+                parsed = json.loads(last_content)
+                if isinstance(parsed, dict):
+                    parsed["_budget_warning"] = budget_warning
+                    messages[-1]["content"] = json.dumps(parsed, ensure_ascii=False)
+                else:
+                    messages[-1]["content"] = last_content + f"\n\n{budget_warning}"
+            except (json.JSONDecodeError, TypeError):
+                messages[-1]["content"] = last_content + f"\n\n{budget_warning}"
+            if not self.quiet_mode:
+                remaining = self.max_iterations - api_call_count
+                tier = "鈿狅笍  WARNING" if remaining <= self.max_iterations * 0.1 else "馃挕 CAUTION"
+                print(f"{self.log_prefix}{tier}: {remaining} iterations remaining")
 
     def _execute_tool_calls_sequential(self, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:
         """Execute tool calls sequentially (original behavior). Used for single calls or interactive tools."""
@@ -7147,12 +7344,12 @@ class AIAgent:
             if self._interrupt_requested:
                 remaining_calls = assistant_message.tool_calls[i-1:]
                 if remaining_calls:
-                    self._vprint(f"{self.log_prefix}⚡ Interrupt: skipping {len(remaining_calls)} tool call(s)", force=True)
+                    self._vprint(f"{self.log_prefix}鈿?Interrupt: skipping {len(remaining_calls)} tool call(s)", force=True)
                 for skipped_tc in remaining_calls:
                     skipped_name = skipped_tc.function.name
                     skip_msg = {
                         "role": "tool",
-                        "content": f"[Tool execution cancelled — {skipped_name} was skipped due to user interrupt]",
+                        "content": f"[Tool execution cancelled 鈥?{skipped_name} was skipped due to user interrupt]",
                         "tool_call_id": skipped_tc.id,
                     }
                     messages.append(skip_msg)
@@ -7177,23 +7374,14 @@ class AIAgent:
             if not self.quiet_mode:
                 args_str = json.dumps(function_args, ensure_ascii=False)
                 if self.verbose_logging:
-                    print(f"  📞 Tool {i}: {function_name}({list(function_args.keys())})")
+                    print(f"  馃摓 Tool {i}: {function_name}({list(function_args.keys())})")
                     print(f"     Args: {args_str}")
                 else:
                     args_preview = args_str[:self.log_prefix_chars] + "..." if len(args_str) > self.log_prefix_chars else args_str
-                    print(f"  📞 Tool {i}: {function_name}({list(function_args.keys())}) - {args_preview}")
+                    print(f"  馃摓 Tool {i}: {function_name}({list(function_args.keys())}) - {args_preview}")
 
             self._current_tool = function_name
             self._touch_activity(f"executing tool: {function_name}")
-
-            # Set activity callback for long-running tool execution (terminal
-            # commands, etc.) so the gateway's inactivity monitor doesn't kill
-            # the agent while a command is running.
-            try:
-                from tools.environments.base import set_activity_callback
-                set_activity_callback(self._touch_activity)
-            except Exception:
-                pass
 
             if self.tool_progress_callback:
                 try:
@@ -7242,7 +7430,7 @@ class AIAgent:
                     store=self._todo_store,
                 )
                 tool_duration = time.time() - tool_start_time
-                if self._should_emit_quiet_tool_messages():
+                if self.quiet_mode:
                     self._vprint(f"  {_get_cute_tool_message_impl('todo', function_args, tool_duration, result=function_result)}")
             elif function_name == "session_search":
                 if not self._session_db:
@@ -7257,7 +7445,7 @@ class AIAgent:
                         current_session_id=self.session_id,
                     )
                 tool_duration = time.time() - tool_start_time
-                if self._should_emit_quiet_tool_messages():
+                if self.quiet_mode:
                     self._vprint(f"  {_get_cute_tool_message_impl('session_search', function_args, tool_duration, result=function_result)}")
             elif function_name == "memory":
                 target = function_args.get("target", "memory")
@@ -7270,7 +7458,7 @@ class AIAgent:
                     store=self._memory_store,
                 )
                 tool_duration = time.time() - tool_start_time
-                if self._should_emit_quiet_tool_messages():
+                if self.quiet_mode:
                     self._vprint(f"  {_get_cute_tool_message_impl('memory', function_args, tool_duration, result=function_result)}")
             elif function_name == "clarify":
                 from tools.clarify_tool import clarify_tool as _clarify_tool
@@ -7280,18 +7468,18 @@ class AIAgent:
                     callback=self.clarify_callback,
                 )
                 tool_duration = time.time() - tool_start_time
-                if self._should_emit_quiet_tool_messages():
+                if self.quiet_mode:
                     self._vprint(f"  {_get_cute_tool_message_impl('clarify', function_args, tool_duration, result=function_result)}")
             elif function_name == "delegate_task":
                 from tools.delegate_tool import delegate_task as _delegate_task
                 tasks_arg = function_args.get("tasks")
                 if tasks_arg and isinstance(tasks_arg, list):
-                    spinner_label = f"🔀 delegating {len(tasks_arg)} tasks"
+                    spinner_label = f"馃攢 delegating {len(tasks_arg)} tasks"
                 else:
                     goal_preview = (function_args.get("goal") or "")[:30]
-                    spinner_label = f"🔀 {goal_preview}" if goal_preview else "🔀 delegating"
+                    spinner_label = f"馃攢 {goal_preview}" if goal_preview else "馃攢 delegating"
                 spinner = None
-                if self._should_emit_quiet_tool_messages() and self._should_start_quiet_spinner():
+                if self.quiet_mode and not self.tool_progress_callback and self._should_start_quiet_spinner():
                     face = random.choice(KawaiiSpinner.KAWAII_WAITING)
                     spinner = KawaiiSpinner(f"{face} {spinner_label}", spinner_type='dots', print_fn=self._print_fn)
                     spinner.start()
@@ -7313,36 +7501,13 @@ class AIAgent:
                     cute_msg = _get_cute_tool_message_impl('delegate_task', function_args, tool_duration, result=_delegate_result)
                     if spinner:
                         spinner.stop(cute_msg)
-                    elif self._should_emit_quiet_tool_messages():
-                        self._vprint(f"  {cute_msg}")
-            elif self._context_engine_tool_names and function_name in self._context_engine_tool_names:
-                # Context engine tools (lcm_grep, lcm_describe, lcm_expand, etc.)
-                spinner = None
-                if self.quiet_mode and not self.tool_progress_callback:
-                    face = random.choice(KawaiiSpinner.KAWAII_WAITING)
-                    emoji = _get_tool_emoji(function_name)
-                    preview = _build_tool_preview(function_name, function_args) or function_name
-                    spinner = KawaiiSpinner(f"{face} {emoji} {preview}", spinner_type='dots', print_fn=self._print_fn)
-                    spinner.start()
-                _ce_result = None
-                try:
-                    function_result = self.context_compressor.handle_tool_call(function_name, function_args, messages=messages)
-                    _ce_result = function_result
-                except Exception as tool_error:
-                    function_result = json.dumps({"error": f"Context engine tool '{function_name}' failed: {tool_error}"})
-                    logger.error("context_engine.handle_tool_call raised for %s: %s", function_name, tool_error, exc_info=True)
-                finally:
-                    tool_duration = time.time() - tool_start_time
-                    cute_msg = _get_cute_tool_message_impl(function_name, function_args, tool_duration, result=_ce_result)
-                    if spinner:
-                        spinner.stop(cute_msg)
                     elif self.quiet_mode:
                         self._vprint(f"  {cute_msg}")
             elif self._memory_manager and self._memory_manager.has_tool(function_name):
                 # Memory provider tools (hindsight_retain, honcho_search, etc.)
-                # These are not in the tool registry — route through MemoryManager.
+                # These are not in the tool registry 鈥?route through MemoryManager.
                 spinner = None
-                if self._should_emit_quiet_tool_messages() and self._should_start_quiet_spinner():
+                if self.quiet_mode and not self.tool_progress_callback:
                     face = random.choice(KawaiiSpinner.KAWAII_WAITING)
                     emoji = _get_tool_emoji(function_name)
                     preview = _build_tool_preview(function_name, function_args) or function_name
@@ -7360,11 +7525,11 @@ class AIAgent:
                     cute_msg = _get_cute_tool_message_impl(function_name, function_args, tool_duration, result=_mem_result)
                     if spinner:
                         spinner.stop(cute_msg)
-                    elif self._should_emit_quiet_tool_messages():
+                    elif self.quiet_mode:
                         self._vprint(f"  {cute_msg}")
             elif self.quiet_mode:
                 spinner = None
-                if self._should_emit_quiet_tool_messages() and self._should_start_quiet_spinner():
+                if not self.tool_progress_callback:
                     face = random.choice(KawaiiSpinner.KAWAII_WAITING)
                     emoji = _get_tool_emoji(function_name)
                     preview = _build_tool_preview(function_name, function_args) or function_name
@@ -7387,7 +7552,7 @@ class AIAgent:
                     cute_msg = _get_cute_tool_message_impl(function_name, function_args, tool_duration, result=_spinner_result)
                     if spinner:
                         spinner.stop(cute_msg)
-                    elif self._should_emit_quiet_tool_messages():
+                    else:
                         self._vprint(f"  {cute_msg}")
             else:
                 try:
@@ -7457,20 +7622,20 @@ class AIAgent:
 
             if not self.quiet_mode:
                 if self.verbose_logging:
-                    print(f"  ✅ Tool {i} completed in {tool_duration:.2f}s")
+                    print(f"  鉁?Tool {i} completed in {tool_duration:.2f}s")
                     print(f"     Result: {function_result}")
                 else:
                     response_preview = function_result[:self.log_prefix_chars] + "..." if len(function_result) > self.log_prefix_chars else function_result
-                    print(f"  ✅ Tool {i} completed in {tool_duration:.2f}s - {response_preview}")
+                    print(f"  鉁?Tool {i} completed in {tool_duration:.2f}s - {response_preview}")
 
             if self._interrupt_requested and i < len(assistant_message.tool_calls):
                 remaining = len(assistant_message.tool_calls) - i
-                self._vprint(f"{self.log_prefix}⚡ Interrupt: skipping {remaining} remaining tool call(s)", force=True)
+                self._vprint(f"{self.log_prefix}鈿?Interrupt: skipping {remaining} remaining tool call(s)", force=True)
                 for skipped_tc in assistant_message.tool_calls[i:]:
                     skipped_name = skipped_tc.function.name
                     skip_msg = {
                         "role": "tool",
-                        "content": f"[Tool execution skipped — {skipped_name} was not started. User sent a new message]",
+                        "content": f"[Tool execution skipped 鈥?{skipped_name} was not started. User sent a new message]",
                         "tool_call_id": skipped_tc.id
                     }
                     messages.append(skip_msg)
@@ -7479,21 +7644,64 @@ class AIAgent:
             if self.tool_delay > 0 and i < len(assistant_message.tool_calls):
                 time.sleep(self.tool_delay)
 
-        # ── Per-turn aggregate budget enforcement ─────────────────────────
+        # 鈹€鈹€ Per-turn aggregate budget enforcement 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
         num_tools_seq = len(assistant_message.tool_calls)
         if num_tools_seq > 0:
             enforce_turn_budget(messages[-num_tools_seq:], env=get_active_env(effective_task_id))
 
+        # 鈹€鈹€ Budget pressure injection 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+        # After all tool calls in this turn are processed, check if we're
+        # approaching max_iterations. If so, inject a warning into the LAST
+        # tool result's JSON so the LLM sees it naturally when reading results.
+        budget_warning = self._get_budget_warning(api_call_count)
+        if budget_warning and messages and messages[-1].get("role") == "tool":
+            last_content = messages[-1]["content"]
+            try:
+                parsed = json.loads(last_content)
+                if isinstance(parsed, dict):
+                    parsed["_budget_warning"] = budget_warning
+                    messages[-1]["content"] = json.dumps(parsed, ensure_ascii=False)
+                else:
+                    messages[-1]["content"] = last_content + f"\n\n{budget_warning}"
+            except (json.JSONDecodeError, TypeError):
+                messages[-1]["content"] = last_content + f"\n\n{budget_warning}"
+            if not self.quiet_mode:
+                remaining = self.max_iterations - api_call_count
+                tier = "鈿狅笍  WARNING" if remaining <= self.max_iterations * 0.1 else "馃挕 CAUTION"
+                print(f"{self.log_prefix}{tier}: {remaining} iterations remaining")
 
+    def _get_budget_warning(self, api_call_count: int) -> Optional[str]:
+        """Return a budget pressure string, or None if not yet needed.
+
+        Two-tier system:
+          - Caution (70%): nudge to consolidate work
+          - Warning (90%): urgent, must respond now
+        """
+        if not self._budget_pressure_enabled or self.max_iterations <= 0:
+            return None
+        progress = api_call_count / self.max_iterations
+        remaining = self.max_iterations - api_call_count
+        if progress >= self._budget_warning_threshold:
+            return (
+                f"[BUDGET WARNING: Iteration {api_call_count}/{self.max_iterations}. "
+                f"Only {remaining} iteration(s) left. "
+                "Provide your final response NOW. No more tool calls unless absolutely critical.]"
+            )
+        if progress >= self._budget_caution_threshold:
+            return (
+                f"[BUDGET: Iteration {api_call_count}/{self.max_iterations}. "
+                f"{remaining} iterations left. Start consolidating your work.]"
+            )
+        return None
 
     def _emit_context_pressure(self, compaction_progress: float, compressor) -> None:
         """Notify the user that context is approaching the compaction threshold.
 
         Args:
-            compaction_progress: How close to compaction (0.0–1.0, where 1.0 = fires).
+            compaction_progress: How close to compaction (0.0鈥?.0, where 1.0 = fires).
             compressor: The ContextCompressor instance (for threshold/context info).
 
-        Purely user-facing — does NOT modify the message stream.
+        Purely user-facing 鈥?does NOT modify the message stream.
         For CLI: prints a formatted line with a progress bar.
         For gateway: fires status_callback so the platform can send a chat message.
         """
@@ -7501,7 +7709,7 @@ class AIAgent:
 
         threshold_pct = compressor.threshold_tokens / compressor.context_length if compressor.context_length else 0.5
 
-        # CLI output — always shown (these are user-facing status notifications,
+        # CLI output 鈥?always shown (these are user-facing status notifications,
         # not verbose debug output, so they bypass quiet_mode).
         # Gateway users also get the callback below.
         if self.platform in (None, "cli"):
@@ -7527,7 +7735,7 @@ class AIAgent:
 
     def _handle_max_iterations(self, messages: list, api_call_count: int) -> str:
         """Request a summary when max iterations are reached. Returns the final response text."""
-        print(f"⚠️  Reached maximum iterations ({self.max_iterations}). Requesting summary...")
+        print(f"鈿狅笍  Reached maximum iterations ({self.max_iterations}). Requesting summary...")
 
         summary_request = (
             "You've reached the maximum number of tool-calling iterations allowed. "
@@ -7708,11 +7916,6 @@ class AIAgent:
         # Installed once, transparent when streams are healthy, prevents crash on write.
         _install_safe_stdio()
 
-        # Tag all log records on this thread with the session ID so
-        # ``hermes logs --session <id>`` can filter a single conversation.
-        from hermes_logging import set_session_context
-        set_session_context(self.session_id)
-
         # If the previous turn activated fallback, restore the primary
         # runtime so this turn gets a fresh attempt with the preferred model.
         # No-op when _fallback_activated is False (gateway, first turn, etc.).
@@ -7743,7 +7946,8 @@ class AIAgent:
         self._thinking_prefill_retries = 0
         self._last_content_with_tools = None
         self._mute_post_response = False
-        self._unicode_sanitization_passes = 0
+        self._surrogate_sanitized = False
+        self._turn_fallback_activations = 0
 
         # Pre-turn connection health check: detect and clean up dead TCP
         # connections left over from provider outages or dropped streams.
@@ -7752,18 +7956,12 @@ class AIAgent:
             try:
                 if self._cleanup_dead_connections():
                     self._emit_status(
-                        "🔌 Detected stale connections from a previous provider "
-                        "issue — cleaned up automatically. Proceeding with fresh "
+                        "馃攲 Detected stale connections from a previous provider "
+                        "issue 鈥?cleaned up automatically. Proceeding with fresh "
                         "connection."
                     )
             except Exception:
                 pass
-        # Replay compression warning through status_callback for gateway
-        # platforms (the callback was not wired during __init__).
-        if self._compression_warning:
-            self._replay_compression_warning()
-            self._compression_warning = None  # send once
-
         # NOTE: _turns_since_memory and _iters_since_skill are NOT reset here.
         # They are initialized in __init__ and must persist across run_conversation
         # calls so that nudge logic accumulates correctly in CLI mode.
@@ -7782,6 +7980,14 @@ class AIAgent:
         # Initialize conversation (copy to avoid mutating the caller's list)
         messages = list(conversation_history) if conversation_history else []
 
+        # Strip budget pressure warnings from previous turns.  These are
+        # turn-scoped signals injected by _get_budget_warning() into tool
+        # result content.  If left in the replayed history, models (especially
+        # GPT-family) interpret them as still-active instructions and avoid
+        # making tool calls in ALL subsequent turns.
+        if messages:
+            _strip_budget_warnings_from_history(messages)
+        
         # Hydrate todo store from conversation history (gateway creates a fresh
         # AIAgent per message, so the in-memory store is empty -- we need to
         # recover the todo state from the most recent todo tool response in history)
@@ -7818,9 +8024,9 @@ class AIAgent:
         self._persist_user_message_idx = current_turn_user_idx
         
         if not self.quiet_mode:
-            self._safe_print(f"💬 Starting conversation: '{user_message[:60]}{'...' if len(user_message) > 60 else ''}'")
+            self._safe_print(f"馃挰 Starting conversation: '{user_message[:60]}{'...' if len(user_message) > 60 else ''}'")
         
-        # ── System prompt (cached per session for prefix caching) ──
+        # 鈹€鈹€ System prompt (cached per session for prefix caching) 鈹€鈹€
         # Built once on first call, reused for all subsequent calls.
         # Only rebuilt after context compression events (which invalidate
         # the cache and reload memory from disk).
@@ -7842,11 +8048,11 @@ class AIAgent:
                     pass  # Fall through to build fresh
 
             if stored_prompt:
-                # Continuing session — reuse the exact system prompt from
+                # Continuing session 鈥?reuse the exact system prompt from
                 # the previous turn so the Anthropic cache prefix matches.
                 self._cached_system_prompt = stored_prompt
             else:
-                # First turn of a new session — build from scratch.
+                # First turn of a new session 鈥?build from scratch.
                 self._cached_system_prompt = self._build_system_prompt(system_message)
                 # Plugin hook: on_session_start
                 # Fired once when a brand-new session is created (not on
@@ -7872,11 +8078,11 @@ class AIAgent:
 
         active_system_prompt = self._cached_system_prompt
 
-        # ── Preflight context compression ──
+        # 鈹€鈹€ Preflight context compression 鈹€鈹€
         # Before entering the main loop, check if the loaded conversation
         # history already exceeds the model's context threshold.  This handles
         # cases where a user switches to a model with a smaller context window
-        # while having a large existing session — compress proactively rather
+        # while having a large existing session 鈥?compress proactively rather
         # than waiting for an API error (which might be caught as a non-retryable
         # 4xx and abort the request entirely).
         if (
@@ -7884,7 +8090,7 @@ class AIAgent:
             and len(messages) > self.context_compressor.protect_first_n
                                 + self.context_compressor.protect_last_n + 1
         ):
-            # Include tool schema tokens — with many tools these can add
+            # Include tool schema tokens 鈥?with many tools these can add
             # 20-30K+ tokens that the old sys+msg estimate missed entirely.
             _preflight_tokens = estimate_request_tokens_rough(
                 messages,
@@ -7902,7 +8108,7 @@ class AIAgent:
                 )
                 if not self.quiet_mode:
                     self._safe_print(
-                        f"📦 Preflight compression: ~{_preflight_tokens:,} tokens "
+                        f"馃摝 Preflight compression: ~{_preflight_tokens:,} tokens "
                         f">= {self.context_compressor.threshold_tokens:,} threshold"
                     )
                 # May need multiple passes for very large sessions with small
@@ -7915,7 +8121,7 @@ class AIAgent:
                     )
                     if len(messages) >= _orig_len:
                         break  # Cannot compress further
-                    # Compression created a new session — clear the history
+                    # Compression created a new session 鈥?clear the history
                     # reference so _flush_messages_to_session_db writes ALL
                     # compressed messages to the new session's SQLite, not
                     # skipping them because conversation_history is still the
@@ -7936,7 +8142,7 @@ class AIAgent:
         # value is appended to the current turn's user message.
         #
         # Context is ALWAYS injected into the user message, never the
-        # system prompt.  This preserves the prompt cache prefix — the
+        # system prompt.  This preserves the prompt cache prefix 鈥?the
         # system prompt stays identical across turns so cached tokens
         # are reused.  The system prompt is Hermes's territory; plugins
         # contribute context alongside the user's input.
@@ -7953,7 +8159,6 @@ class AIAgent:
                 is_first_turn=(not bool(conversation_history)),
                 model=self.model,
                 platform=getattr(self, "platform", None) or "",
-                sender_id=getattr(self, "_user_id", None) or "",
             )
             _ctx_parts: list[str] = []
             for r in _pre_results:
@@ -7972,23 +8177,17 @@ class AIAgent:
         interrupted = False
         codex_ack_continuations = 0
         length_continue_retries = 0
-        truncated_tool_call_retries = 0
         truncated_response_prefix = ""
         compression_attempts = 0
         _turn_exit_reason = "unknown"  # Diagnostic: why the loop ended
         
-        # Record the execution thread so interrupt()/clear_interrupt() can
-        # scope the tool-level interrupt signal to THIS agent's thread only.
-        # Must be set before clear_interrupt() which uses it.
-        self._execution_thread_id = threading.current_thread().ident
-
         # Clear any stale interrupt state at start
         self.clear_interrupt()
 
         # External memory provider: prefetch once before the tool loop.
         # Reuse the cached result on every iteration to avoid re-calling
         # prefetch_all() on each tool call (10 tool calls = 10x latency + cost).
-        # Use original_user_message (clean input) — user_message may contain
+        # Use original_user_message (clean input) 鈥?user_message may contain
         # injected skill content that bloats / breaks provider queries.
         _ext_prefetch_cache = ""
         if self._memory_manager:
@@ -7998,7 +8197,7 @@ class AIAgent:
             except Exception:
                 pass
 
-        while (api_call_count < self.max_iterations and self.iteration_budget.remaining > 0) or self._budget_grace_call:
+        while api_call_count < self.max_iterations and self.iteration_budget.remaining > 0:
             # Reset per-turn checkpoint dedup so each iteration can take one snapshot
             self._checkpoint_mgr.new_turn()
 
@@ -8007,22 +8206,16 @@ class AIAgent:
                 interrupted = True
                 _turn_exit_reason = "interrupted_by_user"
                 if not self.quiet_mode:
-                    self._safe_print("\n⚡ Breaking out of tool loop due to interrupt...")
+                    self._safe_print("\n鈿?Breaking out of tool loop due to interrupt...")
                 break
             
             api_call_count += 1
             self._api_call_count = api_call_count
             self._touch_activity(f"starting API call #{api_call_count}")
-
-            # Grace call: the budget is exhausted but we gave the model one
-            # more chance.  Consume the grace flag so the loop exits after
-            # this iteration regardless of outcome.
-            if self._budget_grace_call:
-                self._budget_grace_call = False
-            elif not self.iteration_budget.consume():
+            if not self.iteration_budget.consume():
                 _turn_exit_reason = "budget_exhausted"
                 if not self.quiet_mode:
-                    self._safe_print(f"\n⚠️  Iteration budget exhausted ({self.iteration_budget.used}/{self.iteration_budget.max_total} iterations used)")
+                    self._safe_print(f"\n鈿狅笍  Iteration budget exhausted ({self.iteration_budget.used}/{self.iteration_budget.max_total} iterations used)")
                 break
 
             # Fire step_callback for gateway hooks (agent:step event)
@@ -8070,7 +8263,7 @@ class AIAgent:
                 # Inject ephemeral context into the current turn's user message.
                 # Sources: memory manager prefetch + plugin pre_llm_call hooks
                 # with target="user_message" (the default).  Both are
-                # API-call-time only — the original message in `messages` is
+                # API-call-time only 鈥?the original message in `messages` is
                 # never mutated, so nothing leaks into session persistence.
                 if idx == current_turn_user_idx and msg.get("role") == "user":
                     _injections = []
@@ -8121,7 +8314,7 @@ class AIAgent:
                 effective_system = (effective_system + "\n\n" + self.ephemeral_system_prompt).strip()
             # NOTE: Plugin context from pre_llm_call hooks is injected into the
             # user message (see injection block above), NOT the system prompt.
-            # This is intentional — system prompt modifications break the prompt
+            # This is intentional 鈥?system prompt modifications break the prompt
             # cache prefix.  The system prompt is reserved for Hermes internals.
             if effective_system:
                 api_messages = [{"role": "system", "content": effective_system}] + api_messages
@@ -8141,52 +8334,22 @@ class AIAgent:
                 api_messages = apply_anthropic_cache_control(api_messages, cache_ttl=self._cache_ttl, native_anthropic=(self.api_mode == 'anthropic_messages'))
 
             # Safety net: strip orphaned tool results / add stubs for missing
-            # results before sending to the API.  Runs unconditionally — not
-            # gated on context_compressor — so orphans from session loading or
+            # results before sending to the API.  Runs unconditionally 鈥?not
+            # gated on context_compressor 鈥?so orphans from session loading or
             # manual message manipulation are always caught.
             api_messages = self._sanitize_api_messages(api_messages)
 
-            # Normalize message whitespace and tool-call JSON for consistent
-            # prefix matching.  Ensures bit-perfect prefixes across turns,
-            # which enables KV cache reuse on local inference servers
-            # (llama.cpp, vLLM, Ollama) and improves cache hit rates for
-            # cloud providers.  Operates on api_messages (the API copy) so
-            # the original conversation history in `messages` is untouched.
-            for am in api_messages:
-                if isinstance(am.get("content"), str):
-                    am["content"] = am["content"].strip()
-            for am in api_messages:
-                tcs = am.get("tool_calls")
-                if not tcs:
-                    continue
-                new_tcs = []
-                for tc in tcs:
-                    if isinstance(tc, dict) and "function" in tc:
-                        try:
-                            args_obj = json.loads(tc["function"]["arguments"])
-                            tc = {**tc, "function": {
-                                **tc["function"],
-                                "arguments": json.dumps(
-                                    args_obj, separators=(",", ":"),
-                                    sort_keys=True,
-                                ),
-                            }}
-                        except Exception:
-                            pass
-                    new_tcs.append(tc)
-                am["tool_calls"] = new_tcs
-
             # Calculate approximate request size for logging
             total_chars = sum(len(str(msg)) for msg in api_messages)
-            approx_tokens = estimate_messages_tokens_rough(api_messages)
+            approx_tokens = total_chars // 4  # Rough estimate: 4 chars per token
             
             # Thinking spinner for quiet mode (animated during API call)
             thinking_spinner = None
             
             if not self.quiet_mode:
-                self._vprint(f"\n{self.log_prefix}🔄 Making API call #{api_call_count}/{self.max_iterations}...")
-                self._vprint(f"{self.log_prefix}   📊 Request size: {len(api_messages)} messages, ~{approx_tokens:,} tokens (~{total_chars:,} chars)")
-                self._vprint(f"{self.log_prefix}   🔧 Available tools: {len(self.tools) if self.tools else 0}")
+                self._vprint(f"\n{self.log_prefix}馃攧 Making API call #{api_call_count}/{self.max_iterations}...")
+                self._vprint(f"{self.log_prefix}   馃搳 Request size: {len(api_messages)} messages, ~{approx_tokens:,} tokens (~{total_chars:,} chars)")
+                self._vprint(f"{self.log_prefix}   馃敡 Available tools: {len(self.tools) if self.tools else 0}")
             else:
                 # Animated thinking spinner in quiet mode
                 face = random.choice(KawaiiSpinner.KAWAII_THINKING)
@@ -8210,7 +8373,7 @@ class AIAgent:
             
             api_start_time = time.time()
             retry_count = 0
-            max_retries = 3
+            max_retries = self._max_retry_attempts_for_request()
             primary_recovery_attempted = False
             max_compression_attempts = 3
             codex_auth_retry_attempted=False
@@ -8223,14 +8386,10 @@ class AIAgent:
 
             finish_reason = "stop"
             response = None  # Guard against UnboundLocalError if all retries fail
-            api_kwargs = None  # Guard against UnboundLocalError in except handler
 
             while retry_count < max_retries:
                 try:
-                    self._reset_stream_delivery_tracking()
                     api_kwargs = self._build_api_kwargs(api_messages)
-                    if self._force_ascii_payload:
-                        _sanitize_structure_non_ascii(api_kwargs)
                     if self.api_mode == "codex_responses":
                         api_kwargs = self._preflight_codex_api_kwargs(api_kwargs, allow_stream=False)
 
@@ -8258,7 +8417,7 @@ class AIAgent:
                     if env_var_enabled("HERMES_DUMP_REQUESTS"):
                         self._dump_api_request_debug(api_kwargs, reason="preflight")
 
-                    # Always prefer the streaming path — even without stream
+                    # Always prefer the streaming path 鈥?even without stream
                     # consumers.  Streaming gives us fine-grained health
                     # checking (90s stale-stream detection, 60s read timeout)
                     # that the non-streaming path lacks.  Without this,
@@ -8278,12 +8437,7 @@ class AIAgent:
                             self.thinking_callback("")
 
                     _use_streaming = True
-                    # Provider signaled "stream not supported" on a previous
-                    # attempt — switch to non-streaming for the rest of this
-                    # session instead of re-failing every retry.
-                    if getattr(self, "_disable_streaming", False):
-                        _use_streaming = False
-                    elif not self._has_stream_consumers():
+                    if not self._has_stream_consumers():
                         # No display/TTS consumer. Still prefer streaming for
                         # health checking, but skip for Mock clients in tests
                         # (mocks return SimpleNamespace, not stream iterators).
@@ -8309,7 +8463,7 @@ class AIAgent:
                         self.thinking_callback("")
                     
                     if not self.quiet_mode:
-                        self._vprint(f"{self.log_prefix}⏱️  API call completed in {api_duration:.2f}s")
+                        self._vprint(f"{self.log_prefix}鈴憋笍  API call completed in {api_duration:.2f}s")
                     
                     if self.verbose_logging:
                         # Log response with provider info if available
@@ -8378,24 +8532,22 @@ class AIAgent:
                     if response_invalid:
                         # Stop spinner before printing error messages
                         if thinking_spinner:
-                            thinking_spinner.stop("(´;ω;`) oops, retrying...")
+                            thinking_spinner.stop("(麓;蠅;`) oops, retrying...")
                             thinking_spinner = None
                         if self.thinking_callback:
                             self.thinking_callback("")
                         
-                        # Invalid response — could be rate limiting, provider timeout,
-                        # upstream server error, or malformed response.
+                        # This is often rate limiting or provider returning malformed response
                         retry_count += 1
                         
                         # Eager fallback: empty/malformed responses are a common
                         # rate-limit symptom.  Switch to fallback immediately
                         # rather than retrying with extended backoff.
-                        if self._fallback_index < len(self._fallback_chain):
-                            self._emit_status("⚠️ Empty/malformed response — switching to fallback...")
-                        if self._try_activate_fallback():
+                        if self._attempt_local_fallback(
+                            fallback_status="鈿狅笍 Empty/malformed response 鈥?switching to fallback...",
+                            delegated_status="鈿狅笍 Empty/malformed response 鈥?Cloudflare AI Gateway is handling provider failover.",
+                        ):
                             retry_count = 0
-                            compression_attempts = 0
-                            primary_recovery_attempted = False
                             continue
 
                         # Check for error field in response (some providers include this)
@@ -8420,93 +8572,53 @@ class AIAgent:
                             if self.verbose_logging:
                                 logging.debug(f"Response attributes for invalid response: {resp_attrs}")
                         
-                        # Extract error code from response for contextual diagnostics
-                        _resp_error_code = None
-                        if response and hasattr(response, 'error') and response.error:
-                            _code_raw = getattr(response.error, 'code', None)
-                            if _code_raw is None and isinstance(response.error, dict):
-                                _code_raw = response.error.get('code')
-                            if _code_raw is not None:
-                                try:
-                                    _resp_error_code = int(_code_raw)
-                                except (TypeError, ValueError):
-                                    pass
-
-                        # Build a human-readable failure hint from the error code
-                        # and response time, instead of always assuming rate limiting.
-                        if _resp_error_code == 524:
-                            _failure_hint = f"upstream provider timed out (Cloudflare 524, {api_duration:.0f}s)"
-                        elif _resp_error_code == 504:
-                            _failure_hint = f"upstream gateway timeout (504, {api_duration:.0f}s)"
-                        elif _resp_error_code == 429:
-                            _failure_hint = f"rate limited by upstream provider (429)"
-                        elif _resp_error_code in (500, 502):
-                            _failure_hint = f"upstream server error ({_resp_error_code}, {api_duration:.0f}s)"
-                        elif _resp_error_code in (503, 529):
-                            _failure_hint = f"upstream provider overloaded ({_resp_error_code})"
-                        elif _resp_error_code is not None:
-                            _failure_hint = f"upstream error (code {_resp_error_code}, {api_duration:.0f}s)"
-                        elif api_duration < 10:
-                            _failure_hint = f"fast response ({api_duration:.1f}s) — likely rate limited"
-                        elif api_duration > 60:
-                            _failure_hint = f"slow response ({api_duration:.0f}s) — likely upstream timeout"
-                        else:
-                            _failure_hint = f"response time {api_duration:.1f}s"
-
-                        self._vprint(f"{self.log_prefix}⚠️  Invalid API response (attempt {retry_count}/{max_retries}): {', '.join(error_details)}", force=True)
-                        self._vprint(f"{self.log_prefix}   🏢 Provider: {provider_name}", force=True)
+                        self._vprint(f"{self.log_prefix}鈿狅笍  Invalid API response (attempt {retry_count}/{max_retries}): {', '.join(error_details)}", force=True)
+                        self._vprint(f"{self.log_prefix}   馃彚 Provider: {provider_name}", force=True)
                         cleaned_provider_error = self._clean_error_message(error_msg)
-                        self._vprint(f"{self.log_prefix}   📝 Provider message: {cleaned_provider_error}", force=True)
-                        self._vprint(f"{self.log_prefix}   ⏱️  {_failure_hint}", force=True)
+                        self._vprint(f"{self.log_prefix}   馃摑 Provider message: {cleaned_provider_error}", force=True)
+                        self._vprint(f"{self.log_prefix}   鈴憋笍  Response time: {api_duration:.2f}s (fast response often indicates rate limiting)", force=True)
                         
                         if retry_count >= max_retries:
                             # Try fallback before giving up
-                            self._emit_status(f"⚠️ Max retries ({max_retries}) for invalid responses — trying fallback...")
-                            if self._try_activate_fallback():
+                            if self._attempt_local_fallback(
+                                fallback_status=f"鈿狅笍 Max retries ({max_retries}) for invalid responses 鈥?trying fallback...",
+                                delegated_status=f"鈿狅笍 Max retries ({max_retries}) for invalid responses 鈥?Cloudflare AI Gateway is handling provider failover.",
+                            ):
                                 retry_count = 0
-                                compression_attempts = 0
-                                primary_recovery_attempted = False
                                 continue
-                            self._emit_status(f"❌ Max retries ({max_retries}) exceeded for invalid responses. Giving up.")
+                            self._emit_status(f"鉂?Max retries ({max_retries}) exceeded for invalid responses. Giving up.")
                             logging.error(f"{self.log_prefix}Invalid API response after {max_retries} retries.")
                             self._persist_session(messages, conversation_history)
                             return {
                                 "messages": messages,
                                 "completed": False,
                                 "api_calls": api_call_count,
-                                "error": f"Invalid API response after {max_retries} retries: {_failure_hint}",
+                                "error": "Invalid API response shape. Likely rate limited or malformed provider response.",
                                 "failed": True  # Mark as failure for filtering
                             }
                         
-                        # Backoff before retry — jittered exponential: 5s base, 120s cap
+                        # Longer backoff for rate limiting (likely cause of None choices)
+                        # Jittered exponential: 5s base, 120s cap + random jitter
                         wait_time = jittered_backoff(retry_count, base_delay=5.0, max_delay=120.0)
-                        self._vprint(f"{self.log_prefix}⏳ Retrying in {wait_time:.1f}s ({_failure_hint})...", force=True)
+                        wait_time = self._cap_retry_wait_for_request(wait_time)
+                        self._vprint(f"{self.log_prefix}鈴?Retrying in {wait_time}s (extended backoff for possible rate limit)...", force=True)
                         logging.warning(f"Invalid API response (retry {retry_count}/{max_retries}): {', '.join(error_details)} | Provider: {provider_name}")
                         
                         # Sleep in small increments to stay responsive to interrupts
                         sleep_end = time.time() + wait_time
-                        _backoff_touch_counter = 0
                         while time.time() < sleep_end:
                             if self._interrupt_requested:
-                                self._vprint(f"{self.log_prefix}⚡ Interrupt detected during retry wait, aborting.", force=True)
+                                self._vprint(f"{self.log_prefix}鈿?Interrupt detected during retry wait, aborting.", force=True)
                                 self._persist_session(messages, conversation_history)
                                 self.clear_interrupt()
                                 return {
-                                    "final_response": f"Operation interrupted during retry ({_failure_hint}, attempt {retry_count}/{max_retries}).",
+                                    "final_response": f"Operation interrupted: retrying API call after rate limit (retry {retry_count}/{max_retries}).",
                                     "messages": messages,
                                     "api_calls": api_call_count,
                                     "completed": False,
                                     "interrupted": True,
                                 }
                             time.sleep(0.2)
-                            # Touch activity every ~30s so the gateway's inactivity
-                            # monitor knows we're alive during backoff waits.
-                            _backoff_touch_counter += 1
-                            if _backoff_touch_counter % 150 == 0:  # 150 × 0.2s = 30s
-                                self._touch_activity(
-                                    f"retry backoff ({retry_count}/{max_retries}), "
-                                    f"{int(sleep_end - time.time())}s remaining"
-                                )
                         continue  # Retry the API call
 
                     # Check finish_reason before proceeding
@@ -8529,19 +8641,17 @@ class AIAgent:
                         finish_reason = response.choices[0].finish_reason
 
                     if finish_reason == "length":
-                        self._vprint(f"{self.log_prefix}⚠️  Response truncated (finish_reason='length') - model hit max output tokens", force=True)
+                        self._vprint(f"{self.log_prefix}鈿狅笍  Response truncated (finish_reason='length') - model hit max output tokens", force=True)
 
-                        # ── Detect thinking-budget exhaustion ──────────────
+                        # 鈹€鈹€ Detect thinking-budget exhaustion 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
                         # When the model spends ALL output tokens on reasoning
                         # and has none left for the response, continuation
                         # retries are pointless.  Detect this early and give a
                         # targeted error instead of wasting 3 API calls.
                         _trunc_content = None
-                        _trunc_has_tool_calls = False
                         if self.api_mode == "chat_completions":
                             _trunc_msg = response.choices[0].message if (hasattr(response, "choices") and response.choices) else None
                             _trunc_content = getattr(_trunc_msg, "content", None) if _trunc_msg else None
-                            _trunc_has_tool_calls = bool(getattr(_trunc_msg, "tool_calls", None)) if _trunc_msg else False
                         elif self.api_mode == "anthropic_messages":
                             # Anthropic response.content is a list of blocks
                             _text_parts = []
@@ -8550,28 +8660,10 @@ class AIAgent:
                                     _text_parts.append(getattr(_blk, "text", ""))
                             _trunc_content = "\n".join(_text_parts) if _text_parts else None
 
-                        # A response is "thinking exhausted" only when the model
-                        # actually produced reasoning blocks but no visible text after
-                        # them.  Models that do not use <think> tags (e.g. GLM-4.7 on
-                        # NVIDIA Build, minimax) may return content=None or an empty
-                        # string for unrelated reasons — treat those as normal
-                        # truncations that deserve continuation retries, not as
-                        # thinking-budget exhaustion.
-                        _has_think_tags = bool(
-                            _trunc_content and re.search(
-                                r'<(?:think|thinking|reasoning|REASONING_SCRATCHPAD)[^>]*>',
-                                _trunc_content,
-                                re.IGNORECASE,
-                            )
-                        )
                         _thinking_exhausted = (
-                            not _trunc_has_tool_calls
-                            and _has_think_tags
-                            and (
-                                (_trunc_content is not None and not self._has_content_after_think_block(_trunc_content))
-                                or _trunc_content is None
-                            )
-                        )
+                            _trunc_content is not None
+                            and not self._has_content_after_think_block(_trunc_content)
+                        ) or _trunc_content is None
 
                         if _thinking_exhausted:
                             _exhaust_error = (
@@ -8580,7 +8672,7 @@ class AIAgent:
                                 "increasing max_tokens."
                             )
                             self._vprint(
-                                f"{self.log_prefix}💭 Reasoning exhausted the output token budget — "
+                                f"{self.log_prefix}馃挱 Reasoning exhausted the output token budget 鈥?"
                                 f"no visible response was produced.",
                                 force=True,
                             )
@@ -8588,12 +8680,12 @@ class AIAgent:
                             # CLI (response box) and gateway (chat message) both
                             # display it naturally instead of a suppressed error.
                             _exhaust_response = (
-                                "⚠️ **Thinking Budget Exhausted**\n\n"
+                                "鈿狅笍 **Thinking Budget Exhausted**\n\n"
                                 "The model used all its output tokens on reasoning "
                                 "and had none left for the actual response.\n\n"
                                 "To fix this:\n"
-                                "→ Lower reasoning effort: `/thinkon low` or `/thinkon minimal`\n"
-                                "→ Increase the output token limit: "
+                                "鈫?Lower reasoning effort: `/thinkon low` or `/thinkon minimal`\n"
+                                "鈫?Increase the output token limit: "
                                 "set `model.max_tokens` in config.yaml"
                             )
                             self._cleanup_task_resources(effective_task_id)
@@ -8618,7 +8710,7 @@ class AIAgent:
 
                                 if length_continue_retries < 3:
                                     self._vprint(
-                                        f"{self.log_prefix}↻ Requesting continuation "
+                                        f"{self.log_prefix}鈫?Requesting continuation "
                                         f"({length_continue_retries}/3)..."
                                     )
                                     continue_msg = {
@@ -8647,37 +8739,9 @@ class AIAgent:
                                     "error": "Response remained truncated after 3 continuation attempts",
                                 }
 
-                        if self.api_mode == "chat_completions":
-                            assistant_message = response.choices[0].message
-                            if assistant_message.tool_calls:
-                                if truncated_tool_call_retries < 1:
-                                    truncated_tool_call_retries += 1
-                                    self._vprint(
-                                        f"{self.log_prefix}⚠️  Truncated tool call detected — retrying API call...",
-                                        force=True,
-                                    )
-                                    # Don't append the broken response to messages;
-                                    # just re-run the same API call from the current
-                                    # message state, giving the model another chance.
-                                    continue
-                                self._vprint(
-                                    f"{self.log_prefix}⚠️  Truncated tool call response detected again — refusing to execute incomplete tool arguments.",
-                                    force=True,
-                                )
-                                self._cleanup_task_resources(effective_task_id)
-                                self._persist_session(messages, conversation_history)
-                                return {
-                                    "final_response": None,
-                                    "messages": messages,
-                                    "api_calls": api_call_count,
-                                    "completed": False,
-                                    "partial": True,
-                                    "error": "Response truncated due to output length limit",
-                                }
-
                         # If we have prior messages, roll back to last complete state
                         if len(messages) > 1:
-                            self._vprint(f"{self.log_prefix}   ⏪ Rolling back to last complete assistant turn")
+                            self._vprint(f"{self.log_prefix}   鈴?Rolling back to last complete assistant turn")
                             rolled_back_messages = self._get_messages_up_to_last_assistant(messages)
 
                             self._cleanup_task_resources(effective_task_id)
@@ -8693,7 +8757,7 @@ class AIAgent:
                             }
                         else:
                             # First message was truncated - mark as failed
-                            self._vprint(f"{self.log_prefix}❌ First response truncated - cannot recover", force=True)
+                            self._vprint(f"{self.log_prefix}鉂?First response truncated - cannot recover", force=True)
                             self._persist_session(messages, conversation_history)
                             return {
                                 "final_response": None,
@@ -8724,11 +8788,11 @@ class AIAgent:
                         # Cache discovered context length after successful call.
                         # Only persist limits confirmed by the provider (parsed
                         # from the error message), not guessed probe tiers.
-                        if getattr(self.context_compressor, "_context_probed", False):
+                        if self.context_compressor._context_probed:
                             ctx = self.context_compressor.context_length
                             if getattr(self.context_compressor, "_context_probe_persistable", False):
                                 save_context_length(self.model, self.base_url, ctx)
-                                self._safe_print(f"{self.log_prefix}💾 Cached context length: {ctx:,} tokens for {self.model}")
+                                self._safe_print(f"{self.log_prefix}馃捑 Cached context length: {ctx:,} tokens for {self.model}")
                             self.context_compressor._context_probed = False
                             self.context_compressor._context_probe_persistable = False
 
@@ -8811,7 +8875,41 @@ class AIAgent:
                             prompt = usage_dict["prompt_tokens"]
                             hit_pct = (cached / prompt * 100) if prompt > 0 else 0
                             if not self.quiet_mode:
-                                self._vprint(f"{self.log_prefix}   💾 Cache: {cached:,}/{prompt:,} tokens ({hit_pct:.0f}% hit, {written:,} written)")
+                                self._vprint(f"{self.log_prefix}   馃捑 Cache: {cached:,}/{prompt:,} tokens ({hit_pct:.0f}% hit, {written:,} written)")
+
+                    provider_usage = self._extract_provider_transport_metadata(
+                        response,
+                        source="chat_completion_result",
+                    )
+                    openrouter_usage = self._extract_openrouter_usage_metadata(response)
+                    if openrouter_usage:
+                        provider_usage.update(openrouter_usage)
+                    self._merge_provider_usage_metadata(provider_usage)
+                    provider_usage = dict(self._last_provider_usage_metadata or {})
+                    if provider_usage:
+                        billed_cost = self._coerce_float(provider_usage.get("cost"))
+                        if billed_cost is not None:
+                            self.session_billed_cost_usd += billed_cost
+                        upstream_cost = self._coerce_float(provider_usage.get("upstream_inference_cost"))
+                        if upstream_cost is not None:
+                            self.session_upstream_inference_cost_usd += upstream_cost
+                        cache_discount = self._coerce_float(provider_usage.get("cache_discount"))
+                        if cache_discount is not None:
+                            self.session_cache_discount_usd += cache_discount
+                        logger.info(
+                            "Provider usage: provider=%s model=%s generation_id=%s request_id=%s status_code=%s async_request_id=%s cost=%s upstream_inference_cost=%s cache_discount=%s cached_tokens=%s cache_write_tokens=%s",
+                            getattr(self, "provider", "") or "",
+                            provider_usage.get("response_model", "") or getattr(self, "model", "") or "",
+                            provider_usage.get("generation_id", ""),
+                            provider_usage.get("provider_request_id", "") or provider_usage.get("request_id", ""),
+                            provider_usage.get("provider_http_status_code", ""),
+                            provider_usage.get("provider_async_request_id", ""),
+                            provider_usage.get("cost", ""),
+                            provider_usage.get("upstream_inference_cost", ""),
+                            provider_usage.get("cache_discount", ""),
+                            provider_usage.get("cached_tokens", ""),
+                            provider_usage.get("cache_write_tokens", ""),
+                        )
                     
                     has_retried_429 = False  # Reset on success
                     self._touch_activity(f"API call #{api_call_count} completed")
@@ -8824,7 +8922,7 @@ class AIAgent:
                     if self.thinking_callback:
                         self.thinking_callback("")
                     api_elapsed = time.time() - api_start_time
-                    self._vprint(f"{self.log_prefix}⚡ Interrupted during API call.", force=True)
+                    self._vprint(f"{self.log_prefix}鈿?Interrupted during API call.", force=True)
                     self._persist_session(messages, conversation_history)
                     interrupted = True
                     final_response = f"Operation interrupted: waiting for model response ({api_elapsed:.1f}s elapsed)."
@@ -8833,89 +8931,44 @@ class AIAgent:
                 except Exception as api_error:
                     # Stop spinner before printing error messages
                     if thinking_spinner:
-                        thinking_spinner.stop("(╥_╥) error, retrying...")
+                        thinking_spinner.stop("(鈺鈺? error, retrying...")
                         thinking_spinner = None
                     if self.thinking_callback:
                         self.thinking_callback("")
 
                     # -----------------------------------------------------------
-                    # UnicodeEncodeError recovery.  Two common causes:
-                    #   1. Lone surrogates (U+D800..U+DFFF) from clipboard paste
-                    #      (Google Docs, rich-text editors) — sanitize and retry.
-                    #   2. ASCII codec on systems with LANG=C or non-UTF-8 locale
-                    #      (e.g. Chromebooks) — any non-ASCII character fails.
-                    #      Detect via the error message mentioning 'ascii' codec.
-                    # We sanitize messages in-place and may retry twice:
-                    # first to strip surrogates, then once more for pure
-                    # ASCII-only locale sanitization if needed.
+                    # Surrogate character recovery.  UnicodeEncodeError happens
+                    # when the messages contain lone surrogates (U+D800..U+DFFF)
+                    # that are invalid UTF-8.  Common source: clipboard paste
+                    # from Google Docs or similar rich-text editors.  We sanitize
+                    # the entire messages list in-place and retry once.
                     # -----------------------------------------------------------
-                    if isinstance(api_error, UnicodeEncodeError) and getattr(self, '_unicode_sanitization_passes', 0) < 2:
-                        _err_str = str(api_error).lower()
-                        _is_ascii_codec = "'ascii'" in _err_str or "ascii" in _err_str
-                        _surrogates_found = _sanitize_messages_surrogates(messages)
-                        if _surrogates_found:
-                            self._unicode_sanitization_passes += 1
+                    if isinstance(api_error, UnicodeEncodeError) and not getattr(self, '_surrogate_sanitized', False):
+                        self._surrogate_sanitized = True
+                        if _sanitize_messages_surrogates(messages):
                             self._vprint(
-                                f"{self.log_prefix}⚠️  Stripped invalid surrogate characters from messages. Retrying...",
+                                f"{self.log_prefix}鈿狅笍  Stripped invalid surrogate characters from messages. Retrying...",
                                 force=True,
                             )
                             continue
-                        if _is_ascii_codec:
-                            self._force_ascii_payload = True
-                            # ASCII codec: the system encoding can't handle
-                            # non-ASCII characters at all. Sanitize all
-                            # non-ASCII content from messages/tool schemas and retry.
-                            _messages_sanitized = _sanitize_messages_non_ascii(messages)
-                            _prefill_sanitized = False
-                            if isinstance(getattr(self, "prefill_messages", None), list):
-                                _prefill_sanitized = _sanitize_messages_non_ascii(self.prefill_messages)
-
-                            _tools_sanitized = False
-                            if isinstance(getattr(self, "tools", None), list):
-                                _tools_sanitized = _sanitize_tools_non_ascii(self.tools)
-
-                            _system_sanitized = False
-                            if isinstance(active_system_prompt, str):
-                                _sanitized_system = _strip_non_ascii(active_system_prompt)
-                                if _sanitized_system != active_system_prompt:
-                                    active_system_prompt = _sanitized_system
-                                    self._cached_system_prompt = _sanitized_system
-                                    _system_sanitized = True
-                            if isinstance(getattr(self, "ephemeral_system_prompt", None), str):
-                                _sanitized_ephemeral = _strip_non_ascii(self.ephemeral_system_prompt)
-                                if _sanitized_ephemeral != self.ephemeral_system_prompt:
-                                    self.ephemeral_system_prompt = _sanitized_ephemeral
-                                    _system_sanitized = True
-
-                            _headers_sanitized = False
-                            _default_headers = (
-                                self._client_kwargs.get("default_headers")
-                                if isinstance(getattr(self, "_client_kwargs", None), dict)
-                                else None
-                            )
-                            if isinstance(_default_headers, dict):
-                                _headers_sanitized = _sanitize_structure_non_ascii(_default_headers)
-
-                            if (
-                                _messages_sanitized
-                                or _prefill_sanitized
-                                or _tools_sanitized
-                                or _system_sanitized
-                                or _headers_sanitized
-                            ):
-                                self._unicode_sanitization_passes += 1
-                                self._vprint(
-                                    f"{self.log_prefix}⚠️  System encoding is ASCII — stripped non-ASCII characters from request payload. Retrying...",
-                                    force=True,
-                                )
-                                continue
-                        # Nothing to sanitize in any payload component.
-                        # Fall through to normal error path.
+                        # Surrogates weren't in messages 鈥?might be in system
+                        # prompt or prefill.  Fall through to normal error path.
 
                     status_code = getattr(api_error, "status_code", None)
                     error_context = self._extract_api_error_context(api_error)
+                    provider_error_meta = self._extract_provider_transport_metadata(
+                        status_code=status_code or getattr(getattr(api_error, "response", None), "status_code", None),
+                        headers=getattr(getattr(api_error, "response", None), "headers", None),
+                        body=getattr(api_error, "body", None),
+                        source="chat_completion_error",
+                    )
+                    if provider_error_meta:
+                        self._merge_provider_usage_metadata(provider_error_meta)
+                        self._log_provider_async_candidate(provider_error_meta)
+                        if status_code in (None, ""):
+                            status_code = provider_error_meta.get("provider_http_status_code")
 
-                    # ── Classify the error for structured recovery decisions ──
+                    # 鈹€鈹€ Classify the error for structured recovery decisions 鈹€鈹€
                     _compressor = getattr(self, "context_compressor", None)
                     _ctx_len = getattr(_compressor, "context_length", 200000) if _compressor else 200000
                     classified = classify_api_error(
@@ -8936,7 +8989,6 @@ class AIAgent:
                     recovered_with_pool, has_retried_429 = self._recover_with_credential_pool(
                         status_code=status_code,
                         has_retried_429=has_retried_429,
-                        classified_reason=classified.reason,
                         error_context=error_context,
                     )
                     if recovered_with_pool:
@@ -8949,7 +9001,7 @@ class AIAgent:
                     ):
                         codex_auth_retry_attempted = True
                         if self._try_refresh_codex_client_credentials(force=True):
-                            self._vprint(f"{self.log_prefix}🔐 Codex auth refreshed after 401. Retrying request...")
+                            self._vprint(f"{self.log_prefix}馃攼 Codex auth refreshed after 401. Retrying request...")
                             continue
                     if (
                         self.api_mode == "chat_completions"
@@ -8959,7 +9011,7 @@ class AIAgent:
                     ):
                         nous_auth_retry_attempted = True
                         if self._try_refresh_nous_client_credentials(force=True):
-                            print(f"{self.log_prefix}🔐 Nous agent key refreshed after 401. Retrying request...")
+                            print(f"{self.log_prefix}馃攼 Nous agent key refreshed after 401. Retrying request...")
                             continue
                     if (
                         self.api_mode == "anthropic_messages"
@@ -8970,31 +9022,31 @@ class AIAgent:
                         anthropic_auth_retry_attempted = True
                         from agent.anthropic_adapter import _is_oauth_token
                         if self._try_refresh_anthropic_client_credentials():
-                            print(f"{self.log_prefix}🔐 Anthropic credentials refreshed after 401. Retrying request...")
+                            print(f"{self.log_prefix}馃攼 Anthropic credentials refreshed after 401. Retrying request...")
                             continue
-                        # Credential refresh didn't help — show diagnostic info
+                        # Credential refresh didn't help 鈥?show diagnostic info
                         key = self._anthropic_api_key
                         auth_method = "Bearer (OAuth/setup-token)" if _is_oauth_token(key) else "x-api-key (API key)"
-                        print(f"{self.log_prefix}🔐 Anthropic 401 — authentication failed.")
+                        print(f"{self.log_prefix}馃攼 Anthropic 401 鈥?authentication failed.")
                         print(f"{self.log_prefix}   Auth method: {auth_method}")
                         print(f"{self.log_prefix}   Token prefix: {key[:12]}..." if key and len(key) > 12 else f"{self.log_prefix}   Token: (empty or short)")
                         print(f"{self.log_prefix}   Troubleshooting:")
                         from hermes_constants import display_hermes_home as _dhh_fn
                         _dhh = _dhh_fn()
-                        print(f"{self.log_prefix}     • Check ANTHROPIC_TOKEN in {_dhh}/.env for Hermes-managed OAuth/setup tokens")
-                        print(f"{self.log_prefix}     • Check ANTHROPIC_API_KEY in {_dhh}/.env for API keys or legacy token values")
-                        print(f"{self.log_prefix}     • For API keys: verify at https://console.anthropic.com/settings/keys")
-                        print(f"{self.log_prefix}     • For Claude Code: run 'claude /login' to refresh, then retry")
-                        print(f"{self.log_prefix}     • Legacy cleanup: hermes config set ANTHROPIC_TOKEN \"\"")
-                        print(f"{self.log_prefix}     • Clear stale keys: hermes config set ANTHROPIC_API_KEY \"\"")
+                        print(f"{self.log_prefix}     鈥?Check ANTHROPIC_TOKEN in {_dhh}/.env for Hermes-managed OAuth/setup tokens")
+                        print(f"{self.log_prefix}     鈥?Check ANTHROPIC_API_KEY in {_dhh}/.env for API keys or legacy token values")
+                        print(f"{self.log_prefix}     鈥?For API keys: verify at https://console.anthropic.com/settings/keys")
+                        print(f"{self.log_prefix}     鈥?For Claude Code: run 'claude /login' to refresh, then retry")
+                        print(f"{self.log_prefix}     鈥?Legacy cleanup: hermes config set ANTHROPIC_TOKEN \"\"")
+                        print(f"{self.log_prefix}     鈥?Clear stale keys: hermes config set ANTHROPIC_API_KEY \"\"")
 
-                    # ── Thinking block signature recovery ─────────────────
+                    # 鈹€鈹€ Thinking block signature recovery 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
                     # Anthropic signs thinking blocks against the full turn
                     # content.  Any upstream mutation (context compression,
                     # session truncation, message merging) invalidates the
-                    # signature → HTTP 400.  Recovery: strip reasoning_details
+                    # signature 鈫?HTTP 400.  Recovery: strip reasoning_details
                     # from all messages so the next retry sends no thinking
-                    # blocks at all.  One-shot — don't retry infinitely.
+                    # blocks at all.  One-shot 鈥?don't retry infinitely.
                     if (
                         classified.reason == FailoverReason.thinking_signature
                         and not thinking_sig_retry_attempted
@@ -9004,7 +9056,7 @@ class AIAgent:
                             if isinstance(_m, dict):
                                 _m.pop("reasoning_details", None)
                         self._vprint(
-                            f"{self.log_prefix}⚠️  Thinking block signature invalid — "
+                            f"{self.log_prefix}鈿狅笍  Thinking block signature invalid 鈥?"
                             f"stripped all thinking blocks, retrying...",
                             force=True,
                         )
@@ -9017,9 +9069,6 @@ class AIAgent:
 
                     retry_count += 1
                     elapsed_time = time.time() - api_start_time
-                    self._touch_activity(
-                        f"API error recovery (attempt {retry_count}/{max_retries})"
-                    )
                     
                     error_type = type(api_error).__name__
                     error_msg = str(api_error).lower()
@@ -9037,46 +9086,20 @@ class AIAgent:
                     _base = getattr(self, "base_url", "unknown")
                     _model = getattr(self, "model", "unknown")
                     _status_code_str = f" [HTTP {status_code}]" if status_code else ""
-                    self._vprint(f"{self.log_prefix}⚠️  API call failed (attempt {retry_count}/{max_retries}): {error_type}{_status_code_str}", force=True)
-                    self._vprint(f"{self.log_prefix}   🔌 Provider: {_provider}  Model: {_model}", force=True)
-                    self._vprint(f"{self.log_prefix}   🌐 Endpoint: {_base}", force=True)
-                    self._vprint(f"{self.log_prefix}   📝 Error: {_error_summary}", force=True)
+                    self._vprint(f"{self.log_prefix}鈿狅笍  API call failed (attempt {retry_count}/{max_retries}): {error_type}{_status_code_str}", force=True)
+                    self._vprint(f"{self.log_prefix}   馃攲 Provider: {_provider}  Model: {_model}", force=True)
+                    self._vprint(f"{self.log_prefix}   馃寪 Endpoint: {_base}", force=True)
+                    self._vprint(f"{self.log_prefix}   馃摑 Error: {_error_summary}", force=True)
                     if status_code and status_code < 500:
                         _err_body = getattr(api_error, "body", None)
                         _err_body_str = str(_err_body)[:300] if _err_body else None
                         if _err_body_str:
-                            self._vprint(f"{self.log_prefix}   📋 Details: {_err_body_str}", force=True)
-                    self._vprint(f"{self.log_prefix}   ⏱️  Elapsed: {elapsed_time:.2f}s  Context: {len(api_messages)} msgs, ~{approx_tokens:,} tokens")
-
-                    # Actionable hint for OpenRouter "no tool endpoints" error.
-                    # This fires regardless of whether fallback succeeds — the
-                    # user needs to know WHY their model failed so they can fix
-                    # their provider routing, not just silently fall back.
-                    if (
-                        self._is_openrouter_url()
-                        and "support tool use" in error_msg
-                    ):
-                        self._vprint(
-                            f"{self.log_prefix}   💡 No OpenRouter providers for {_model} support tool calling with your current settings.",
-                            force=True,
-                        )
-                        if self.providers_allowed:
-                            self._vprint(
-                                f"{self.log_prefix}      Your provider_routing.only restriction is filtering out tool-capable providers.",
-                                force=True,
-                            )
-                            self._vprint(
-                                f"{self.log_prefix}      Try removing the restriction or adding providers that support tools for this model.",
-                                force=True,
-                            )
-                        self._vprint(
-                            f"{self.log_prefix}      Check which providers support tools: https://openrouter.ai/models/{_model}",
-                            force=True,
-                        )
-
+                            self._vprint(f"{self.log_prefix}   馃搵 Details: {_err_body_str}", force=True)
+                    self._vprint(f"{self.log_prefix}   鈴憋笍  Elapsed: {elapsed_time:.2f}s  Context: {len(api_messages)} msgs, ~{approx_tokens:,} tokens")
+                    
                     # Check for interrupt before deciding to retry
                     if self._interrupt_requested:
-                        self._vprint(f"{self.log_prefix}⚡ Interrupt detected during error handling, aborting retries.", force=True)
+                        self._vprint(f"{self.log_prefix}鈿?Interrupt detected during error handling, aborting retries.", force=True)
                         self._persist_session(messages, conversation_history)
                         self.clear_interrupt()
                         return {
@@ -9088,15 +9111,15 @@ class AIAgent:
                         }
                     
                     # Check for 413 payload-too-large BEFORE generic 4xx handler.
-                    # A 413 is a payload-size error — the correct response is to
+                    # A 413 is a payload-size error 鈥?the correct response is to
                     # compress history and retry, not abort immediately.
                     status_code = getattr(api_error, "status_code", None)
 
-                    # ── Anthropic Sonnet long-context tier gate ───────────
+                    # 鈹€鈹€ Anthropic Sonnet long-context tier gate 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
                     # Anthropic returns HTTP 429 "Extra usage is required for
                     # long context requests" when a Claude Max (or similar)
                     # subscription doesn't include the 1M-context tier.  This
-                    # is NOT a transient rate limit — retrying or switching
+                    # is NOT a transient rate limit 鈥?retrying or switching
                     # credentials won't help.  Reduce context to 200k (the
                     # standard tier) and compress.
                     if classified.reason == FailoverReason.long_context_tier:
@@ -9104,26 +9127,20 @@ class AIAgent:
                         compressor = self.context_compressor
                         old_ctx = compressor.context_length
                         if old_ctx > _reduced_ctx:
-                            compressor.update_model(
-                                model=self.model,
-                                context_length=_reduced_ctx,
-                                base_url=self.base_url,
-                                api_key=getattr(self, "api_key", ""),
-                                provider=self.provider,
+                            compressor.context_length = _reduced_ctx
+                            compressor.threshold_tokens = int(
+                                _reduced_ctx * compressor.threshold_percent
                             )
-                            # Context probing flags — only set on built-in
-                            # compressor (plugin engines manage their own).
-                            if hasattr(compressor, "_context_probed"):
-                                compressor._context_probed = True
-                                # Don't persist — this is a subscription-tier
-                                # limitation, not a model capability.  If the
-                                # user later enables extra usage the 1M limit
-                                # should come back automatically.
-                                compressor._context_probe_persistable = False
+                            compressor._context_probed = True
+                            # Don't persist 鈥?this is a subscription-tier
+                            # limitation, not a model capability.  If the user
+                            # later enables extra usage the 1M limit should
+                            # come back automatically.
+                            compressor._context_probe_persistable = False
                             self._vprint(
-                                f"{self.log_prefix}⚠️  Anthropic long-context tier "
-                                f"requires extra usage — reducing context: "
-                                f"{old_ctx:,} → {_reduced_ctx:,} tokens",
+                                f"{self.log_prefix}鈿狅笍  Anthropic long-context tier "
+                                f"requires extra usage 鈥?reducing context: "
+                                f"{old_ctx:,} 鈫?{_reduced_ctx:,} tokens",
                                 force=True,
                             )
 
@@ -9135,13 +9152,9 @@ class AIAgent:
                                 approx_tokens=approx_tokens,
                                 task_id=effective_task_id,
                             )
-                            # Compression created a new session — clear history
-                            # so _flush_messages_to_session_db writes compressed
-                            # messages to the new session, not skipping them.
-                            conversation_history = None
                             if len(messages) < original_len or old_ctx > _reduced_ctx:
                                 self._emit_status(
-                                    f"🗜️ Context reduced to {_reduced_ctx:,} tokens "
+                                    f"馃棞锔?Context reduced to {_reduced_ctx:,} tokens "
                                     f"(was {old_ctx:,}), retrying..."
                                 )
                                 time.sleep(2)
@@ -9161,16 +9174,16 @@ class AIAgent:
                     if is_rate_limited and self._fallback_index < len(self._fallback_chain):
                         # Don't eagerly fallback if credential pool rotation may
                         # still recover.  The pool's retry-then-rotate cycle needs
-                        # at least one more attempt to fire — jumping to a fallback
+                        # at least one more attempt to fire 鈥?jumping to a fallback
                         # provider here short-circuits it.
                         pool = self._credential_pool
                         pool_may_recover = pool is not None and pool.has_available()
                         if not pool_may_recover:
-                            self._emit_status("⚠️ Rate limited — switching to fallback provider...")
-                            if self._try_activate_fallback():
+                            if self._attempt_local_fallback(
+                                fallback_status="鈿狅笍 Rate limited 鈥?switching to fallback provider...",
+                                delegated_status="鈿狅笍 Rate limited 鈥?Cloudflare AI Gateway is handling provider failover.",
+                            ):
                                 retry_count = 0
-                                compression_attempts = 0
-                                primary_recovery_attempted = False
                                 continue
 
                     is_payload_too_large = (
@@ -9180,8 +9193,8 @@ class AIAgent:
                     if is_payload_too_large:
                         compression_attempts += 1
                         if compression_attempts > max_compression_attempts:
-                            self._vprint(f"{self.log_prefix}❌ Max compression attempts ({max_compression_attempts}) reached for payload-too-large error.", force=True)
-                            self._vprint(f"{self.log_prefix}   💡 Try /new to start a fresh conversation, or /compress to retry compression.", force=True)
+                            self._vprint(f"{self.log_prefix}鉂?Max compression attempts ({max_compression_attempts}) reached for payload-too-large error.", force=True)
+                            self._vprint(f"{self.log_prefix}   馃挕 Try /new to start a fresh conversation, or /compress to retry compression.", force=True)
                             logging.error(f"{self.log_prefix}413 compression failed after {max_compression_attempts} attempts.")
                             self._persist_session(messages, conversation_history)
                             return {
@@ -9191,26 +9204,22 @@ class AIAgent:
                                 "error": f"Request payload too large: max compression attempts ({max_compression_attempts}) reached.",
                                 "partial": True
                             }
-                        self._emit_status(f"⚠️  Request payload too large (413) — compression attempt {compression_attempts}/{max_compression_attempts}...")
+                        self._emit_status(f"鈿狅笍  Request payload too large (413) 鈥?compression attempt {compression_attempts}/{max_compression_attempts}...")
 
                         original_len = len(messages)
                         messages, active_system_prompt = self._compress_context(
                             messages, system_message, approx_tokens=approx_tokens,
                             task_id=effective_task_id,
                         )
-                        # Compression created a new session — clear history
-                        # so _flush_messages_to_session_db writes compressed
-                        # messages to the new session, not skipping them.
-                        conversation_history = None
 
                         if len(messages) < original_len:
-                            self._emit_status(f"🗜️ Compressed {original_len} → {len(messages)} messages, retrying...")
+                            self._emit_status(f"馃棞锔?Compressed {original_len} 鈫?{len(messages)} messages, retrying...")
                             time.sleep(2)  # Brief pause between compression retries
                             restart_with_compressed_messages = True
                             break
                         else:
-                            self._vprint(f"{self.log_prefix}❌ Payload too large and cannot compress further.", force=True)
-                            self._vprint(f"{self.log_prefix}   💡 Try /new to start a fresh conversation, or /compress to retry compression.", force=True)
+                            self._vprint(f"{self.log_prefix}鉂?Payload too large and cannot compress further.", force=True)
+                            self._vprint(f"{self.log_prefix}   馃挕 Try /new to start a fresh conversation, or /compress to retry compression.", force=True)
                             logging.error(f"{self.log_prefix}413 payload too large. Cannot compress further.")
                             self._persist_session(messages, conversation_history)
                             return {
@@ -9233,85 +9242,35 @@ class AIAgent:
                         compressor = self.context_compressor
                         old_ctx = compressor.context_length
 
-                        # ── Distinguish two very different errors ───────────
-                        # 1. "Prompt too long": the INPUT exceeds the context window.
-                        #    Fix: reduce context_length + compress history.
-                        # 2. "max_tokens too large": input is fine, but
-                        #    input_tokens + requested max_tokens > context_window.
-                        #    Fix: reduce max_tokens (the OUTPUT cap) for this call.
-                        #    Do NOT shrink context_length — the window is unchanged.
-                        #
-                        # Note: max_tokens = output token cap (one response).
-                        #       context_length = total window (input + output combined).
-                        available_out = parse_available_output_tokens_from_error(error_msg)
-                        if available_out is not None:
-                            # Error is purely about the output cap being too large.
-                            # Cap output to the available space and retry without
-                            # touching context_length or triggering compression.
-                            safe_out = max(1, available_out - 64)  # small safety margin
-                            self._ephemeral_max_output_tokens = safe_out
-                            self._vprint(
-                                f"{self.log_prefix}⚠️  Output cap too large for current prompt — "
-                                f"retrying with max_tokens={safe_out:,} "
-                                f"(available_tokens={available_out:,}; context_length unchanged at {old_ctx:,})",
-                                force=True,
-                            )
-                            # Still count against compression_attempts so we don't
-                            # loop forever if the error keeps recurring.
-                            compression_attempts += 1
-                            if compression_attempts > max_compression_attempts:
-                                self._vprint(f"{self.log_prefix}❌ Max compression attempts ({max_compression_attempts}) reached.", force=True)
-                                self._vprint(f"{self.log_prefix}   💡 Try /new to start a fresh conversation, or /compress to retry compression.", force=True)
-                                logging.error(f"{self.log_prefix}Context compression failed after {max_compression_attempts} attempts.")
-                                self._persist_session(messages, conversation_history)
-                                return {
-                                    "messages": messages,
-                                    "completed": False,
-                                    "api_calls": api_call_count,
-                                    "error": f"Context length exceeded: max compression attempts ({max_compression_attempts}) reached.",
-                                    "partial": True
-                                }
-                            restart_with_compressed_messages = True
-                            break
-
-                        # Error is about the INPUT being too large — reduce context_length.
                         # Try to parse the actual limit from the error message
                         parsed_limit = parse_context_limit_from_error(error_msg)
                         if parsed_limit and parsed_limit < old_ctx:
                             new_ctx = parsed_limit
-                            self._vprint(f"{self.log_prefix}⚠️  Context limit detected from API: {new_ctx:,} tokens (was {old_ctx:,})", force=True)
+                            self._vprint(f"{self.log_prefix}鈿狅笍  Context limit detected from API: {new_ctx:,} tokens (was {old_ctx:,})", force=True)
                         else:
                             # Step down to the next probe tier
                             new_ctx = get_next_probe_tier(old_ctx)
 
                         if new_ctx and new_ctx < old_ctx:
-                            compressor.update_model(
-                                model=self.model,
-                                context_length=new_ctx,
-                                base_url=self.base_url,
-                                api_key=getattr(self, "api_key", ""),
-                                provider=self.provider,
+                            compressor.context_length = new_ctx
+                            compressor.threshold_tokens = int(new_ctx * compressor.threshold_percent)
+                            compressor._context_probed = True
+                            # Only persist limits parsed from the provider's
+                            # error message (a real number).  Guessed fallback
+                            # tiers from get_next_probe_tier() should stay
+                            # in-memory only 鈥?persisting them pollutes the
+                            # cache with wrong values.
+                            compressor._context_probe_persistable = bool(
+                                parsed_limit and parsed_limit == new_ctx
                             )
-                            # Context probing flags — only set on built-in
-                            # compressor (plugin engines manage their own).
-                            if hasattr(compressor, "_context_probed"):
-                                compressor._context_probed = True
-                                # Only persist limits parsed from the provider's
-                                # error message (a real number).  Guessed fallback
-                                # tiers from get_next_probe_tier() should stay
-                                # in-memory only — persisting them pollutes the
-                                # cache with wrong values.
-                                compressor._context_probe_persistable = bool(
-                                    parsed_limit and parsed_limit == new_ctx
-                                )
-                            self._vprint(f"{self.log_prefix}⚠️  Context length exceeded — stepping down: {old_ctx:,} → {new_ctx:,} tokens", force=True)
+                            self._vprint(f"{self.log_prefix}鈿狅笍  Context length exceeded 鈥?stepping down: {old_ctx:,} 鈫?{new_ctx:,} tokens", force=True)
                         else:
-                            self._vprint(f"{self.log_prefix}⚠️  Context length exceeded at minimum tier — attempting compression...", force=True)
+                            self._vprint(f"{self.log_prefix}鈿狅笍  Context length exceeded at minimum tier 鈥?attempting compression...", force=True)
 
                         compression_attempts += 1
                         if compression_attempts > max_compression_attempts:
-                            self._vprint(f"{self.log_prefix}❌ Max compression attempts ({max_compression_attempts}) reached.", force=True)
-                            self._vprint(f"{self.log_prefix}   💡 Try /new to start a fresh conversation, or /compress to retry compression.", force=True)
+                            self._vprint(f"{self.log_prefix}鉂?Max compression attempts ({max_compression_attempts}) reached.", force=True)
+                            self._vprint(f"{self.log_prefix}   馃挕 Try /new to start a fresh conversation, or /compress to retry compression.", force=True)
                             logging.error(f"{self.log_prefix}Context compression failed after {max_compression_attempts} attempts.")
                             self._persist_session(messages, conversation_history)
                             return {
@@ -9321,28 +9280,24 @@ class AIAgent:
                                 "error": f"Context length exceeded: max compression attempts ({max_compression_attempts}) reached.",
                                 "partial": True
                             }
-                        self._emit_status(f"🗜️ Context too large (~{approx_tokens:,} tokens) — compressing ({compression_attempts}/{max_compression_attempts})...")
+                        self._emit_status(f"馃棞锔?Context too large (~{approx_tokens:,} tokens) 鈥?compressing ({compression_attempts}/{max_compression_attempts})...")
 
                         original_len = len(messages)
                         messages, active_system_prompt = self._compress_context(
                             messages, system_message, approx_tokens=approx_tokens,
                             task_id=effective_task_id,
                         )
-                        # Compression created a new session — clear history
-                        # so _flush_messages_to_session_db writes compressed
-                        # messages to the new session, not skipping them.
-                        conversation_history = None
 
                         if len(messages) < original_len or new_ctx and new_ctx < old_ctx:
                             if len(messages) < original_len:
-                                self._emit_status(f"🗜️ Compressed {original_len} → {len(messages)} messages, retrying...")
+                                self._emit_status(f"馃棞锔?Compressed {original_len} 鈫?{len(messages)} messages, retrying...")
                             time.sleep(2)  # Brief pause between compression retries
                             restart_with_compressed_messages = True
                             break
                         else:
                             # Can't compress further and already at minimum tier
-                            self._vprint(f"{self.log_prefix}❌ Context length exceeded and cannot compress further.", force=True)
-                            self._vprint(f"{self.log_prefix}   💡 The conversation has accumulated too much content. Try /new to start fresh, or /compress to manually trigger compression.", force=True)
+                            self._vprint(f"{self.log_prefix}鉂?Context length exceeded and cannot compress further.", force=True)
+                            self._vprint(f"{self.log_prefix}   馃挕 The conversation has accumulated too much content. Try /new to start fresh, or /compress to manually trigger compression.", force=True)
                             logging.error(f"{self.log_prefix}Context length exceeded: {approx_tokens:,} tokens. Cannot compress further.")
                             self._persist_session(messages, conversation_history)
                             return {
@@ -9379,40 +9334,64 @@ class AIAgent:
                     ) and not is_context_length_error
 
                     if is_client_error:
-                        # Try fallback before aborting — a different provider
-                        # may not have the same issue (rate limit, auth, etc.)
-                        self._emit_status(f"⚠️ Non-retryable error (HTTP {status_code}) — trying fallback...")
-                        if self._try_activate_fallback():
-                            retry_count = 0
-                            compression_attempts = 0
-                            primary_recovery_attempted = False
-                            continue
-                        if api_kwargs is not None:
-                            self._dump_api_request_debug(
-                                api_kwargs, reason="non_retryable_client_error", error=api_error,
+                        self._note_model_registry_failure(
+                            error_text=str(api_error),
+                            failure_reason=str(getattr(classified, "reason", "") or "client_error"),
+                            error_code=status_code,
+                            mirror_to_bitable=True,
+                        )
+                        try:
+                            from tools.model_registry_refresh import (
+                                schedule_model_registry_refresh,
+                                should_trigger_model_registry_refresh,
                             )
+
+                            if should_trigger_model_registry_refresh(
+                                status_code=status_code,
+                                error_text=str(api_error),
+                                failure_reason=str(getattr(classified, "reason", "") or ""),
+                            ):
+                                schedule_model_registry_refresh(
+                                    reason=f"agent_client_error:{_provider}:{_model}:http_{status_code}",
+                                    force_refresh=True,
+                                    mirror_to_bitable=True,
+                                    min_interval_seconds=30,
+                                )
+                        except Exception:
+                            pass
+                        # Try fallback before aborting 鈥?a different provider
+                        # may not have the same issue (rate limit, auth, etc.)
+                        if self._attempt_local_fallback(
+                            fallback_status=f"鈿狅笍 Non-retryable error (HTTP {status_code}) 鈥?trying fallback...",
+                            delegated_status=f"鈿狅笍 Non-retryable error (HTTP {status_code}) 鈥?Cloudflare AI Gateway is handling provider failover.",
+                        ):
+                            retry_count = 0
+                            continue
+                        self._dump_api_request_debug(
+                            api_kwargs, reason="non_retryable_client_error", error=api_error,
+                        )
                         self._emit_status(
-                            f"❌ Non-retryable error (HTTP {status_code}): "
+                            f"鉂?Non-retryable error (HTTP {status_code}): "
                             f"{self._summarize_api_error(api_error)}"
                         )
-                        self._vprint(f"{self.log_prefix}❌ Non-retryable client error (HTTP {status_code}). Aborting.", force=True)
-                        self._vprint(f"{self.log_prefix}   🔌 Provider: {_provider}  Model: {_model}", force=True)
-                        self._vprint(f"{self.log_prefix}   🌐 Endpoint: {_base}", force=True)
+                        self._vprint(f"{self.log_prefix}鉂?Non-retryable client error (HTTP {status_code}). Aborting.", force=True)
+                        self._vprint(f"{self.log_prefix}   馃攲 Provider: {_provider}  Model: {_model}", force=True)
+                        self._vprint(f"{self.log_prefix}   馃寪 Endpoint: {_base}", force=True)
                         # Actionable guidance for common auth errors
                         if classified.is_auth or classified.reason == FailoverReason.billing:
                             if _provider == "openai-codex" and status_code == 401:
-                                self._vprint(f"{self.log_prefix}   💡 Codex OAuth token was rejected (HTTP 401). Your token may have been", force=True)
+                                self._vprint(f"{self.log_prefix}   馃挕 Codex OAuth token was rejected (HTTP 401). Your token may have been", force=True)
                                 self._vprint(f"{self.log_prefix}      refreshed by another client (Codex CLI, VS Code). To fix:", force=True)
                                 self._vprint(f"{self.log_prefix}      1. Run `codex` in your terminal to generate fresh tokens.", force=True)
                                 self._vprint(f"{self.log_prefix}      2. Then run `hermes auth` to re-authenticate.", force=True)
                             else:
-                                self._vprint(f"{self.log_prefix}   💡 Your API key was rejected by the provider. Check:", force=True)
-                                self._vprint(f"{self.log_prefix}      • Is the key valid? Run: hermes setup", force=True)
-                                self._vprint(f"{self.log_prefix}      • Does your account have access to {_model}?", force=True)
+                                self._vprint(f"{self.log_prefix}   馃挕 Your API key was rejected by the provider. Check:", force=True)
+                                self._vprint(f"{self.log_prefix}      鈥?Is the key valid? Run: hermes setup", force=True)
+                                self._vprint(f"{self.log_prefix}      鈥?Does your account have access to {_model}?", force=True)
                                 if "openrouter" in str(_base).lower():
-                                    self._vprint(f"{self.log_prefix}      • Check credits: https://openrouter.ai/settings/credits", force=True)
+                                    self._vprint(f"{self.log_prefix}      鈥?Check credits: https://openrouter.ai/settings/credits", force=True)
                         else:
-                            self._vprint(f"{self.log_prefix}   💡 This type of error won't be fixed by retrying.", force=True)
+                            self._vprint(f"{self.log_prefix}   馃挕 This type of error won't be fixed by retrying.", force=True)
                         logging.error(f"{self.log_prefix}Non-retryable client error: {api_error}")
                         # Skip session persistence when the error is likely
                         # context-overflow related (status 400 + large session).
@@ -9421,7 +9400,7 @@ class AIAgent:
                         # next attempt. (#1630)
                         if status_code == 400 and (approx_tokens > 50000 or len(api_messages) > 80):
                             self._vprint(
-                                f"{self.log_prefix}⚠️  Skipping session persistence "
+                                f"{self.log_prefix}鈿狅笍  Skipping session persistence "
                                 f"for large failed session to prevent growth loop.",
                                 force=True,
                             )
@@ -9441,25 +9420,28 @@ class AIAgent:
                         # client once for transient transport errors (stale
                         # connection pool, TCP reset).  Only attempted once
                         # per API call block.
-                        if not primary_recovery_attempted and self._try_recover_primary_transport(
+                        if (
+                            not self._is_cost_optimized_feishu_request()
+                            and not primary_recovery_attempted
+                            and self._try_recover_primary_transport(
                             api_error, retry_count=retry_count, max_retries=max_retries,
-                        ):
+                        )):
                             primary_recovery_attempted = True
                             retry_count = 0
                             continue
                         # Try fallback before giving up entirely
-                        self._emit_status(f"⚠️ Max retries ({max_retries}) exhausted — trying fallback...")
-                        if self._try_activate_fallback():
+                        if self._attempt_local_fallback(
+                            fallback_status=f"鈿狅笍 Max retries ({max_retries}) exhausted 鈥?trying fallback...",
+                            delegated_status=f"鈿狅笍 Max retries ({max_retries}) exhausted 鈥?Cloudflare AI Gateway is handling provider failover.",
+                        ):
                             retry_count = 0
-                            compression_attempts = 0
-                            primary_recovery_attempted = False
                             continue
                         _final_summary = self._summarize_api_error(api_error)
                         if is_rate_limited:
-                            self._emit_status(f"❌ Rate limited after {max_retries} retries — {_final_summary}")
+                            self._emit_status(f"鉂?Rate limited after {max_retries} retries 鈥?{_final_summary}")
                         else:
-                            self._emit_status(f"❌ API failed after {max_retries} retries — {_final_summary}")
-                        self._vprint(f"{self.log_prefix}   💀 Final error: {_final_summary}", force=True)
+                            self._emit_status(f"鉂?API failed after {max_retries} retries 鈥?{_final_summary}")
+                        self._vprint(f"{self.log_prefix}   馃拃 Final error: {_final_summary}", force=True)
 
                         # Detect SSE stream-drop pattern (e.g. "Network
                         # connection lost") and surface actionable guidance.
@@ -9476,7 +9458,7 @@ class AIAgent:
                         )
                         if _is_stream_drop:
                             self._vprint(
-                                f"{self.log_prefix}   💡 The provider's stream "
+                                f"{self.log_prefix}   馃挕 The provider's stream "
                                 f"connection keeps dropping. This often happens "
                                 f"when the model tries to write a very large "
                                 f"file in a single tool call.",
@@ -9495,16 +9477,21 @@ class AIAgent:
                             self.log_prefix, max_retries, _final_summary,
                             _provider, _model, len(api_messages), f"{approx_tokens:,}",
                         )
-                        if api_kwargs is not None:
-                            self._dump_api_request_debug(
-                                api_kwargs, reason="max_retries_exhausted", error=api_error,
-                            )
+                        self._note_model_registry_failure(
+                            error_text=_final_summary,
+                            failure_reason="transient_network" if _is_stream_drop else str(getattr(classified, "reason", "") or "retry_exhausted"),
+                            error_code=getattr(api_error, "status_code", None) or type(api_error).__name__,
+                            mirror_to_bitable=True,
+                        )
+                        self._dump_api_request_debug(
+                            api_kwargs, reason="max_retries_exhausted", error=api_error,
+                        )
                         self._persist_session(messages, conversation_history)
                         _final_response = f"API call failed after {max_retries} retries: {_final_summary}"
                         if _is_stream_drop:
                             _final_response += (
                                 "\n\nThe provider's stream connection keeps "
-                                "dropping — this often happens when generating "
+                                "dropping 鈥?this often happens when generating "
                                 "very large tool call responses (e.g. write_file "
                                 "with long content). Try asking me to use "
                                 "execute_code with Python's open() for large "
@@ -9531,10 +9518,11 @@ class AIAgent:
                                 except (TypeError, ValueError):
                                     pass
                     wait_time = _retry_after if _retry_after else jittered_backoff(retry_count, base_delay=2.0, max_delay=60.0)
+                    wait_time = self._cap_retry_wait_for_request(wait_time)
                     if is_rate_limited:
-                        self._emit_status(f"⏱️ Rate limit reached. Waiting {wait_time}s before retry (attempt {retry_count + 1}/{max_retries})...")
+                        self._emit_status(f"鈴憋笍 Rate limit reached. Waiting {wait_time}s before retry (attempt {retry_count + 1}/{max_retries})...")
                     else:
-                        self._emit_status(f"⏳ Retrying in {wait_time}s (attempt {retry_count}/{max_retries})...")
+                        self._emit_status(f"鈴?Retrying in {wait_time}s (attempt {retry_count}/{max_retries})...")
                     logger.warning(
                         "Retrying API call in %ss (attempt %s/%s) %s error=%s",
                         wait_time,
@@ -9546,10 +9534,9 @@ class AIAgent:
                     # Sleep in small increments so we can respond to interrupts quickly
                     # instead of blocking the entire wait_time in one sleep() call
                     sleep_end = time.time() + wait_time
-                    _backoff_touch_counter = 0
                     while time.time() < sleep_end:
                         if self._interrupt_requested:
-                            self._vprint(f"{self.log_prefix}⚡ Interrupt detected during retry wait, aborting.", force=True)
+                            self._vprint(f"{self.log_prefix}鈿?Interrupt detected during retry wait, aborting.", force=True)
                             self._persist_session(messages, conversation_history)
                             self.clear_interrupt()
                             return {
@@ -9560,14 +9547,6 @@ class AIAgent:
                                 "interrupted": True,
                             }
                         time.sleep(0.2)  # Check interrupt every 200ms
-                        # Touch activity every ~30s so the gateway's inactivity
-                        # monitor knows we're alive during backoff waits.
-                        _backoff_touch_counter += 1
-                        if _backoff_touch_counter % 150 == 0:  # 150 × 0.2s = 30s
-                            self._touch_activity(
-                                f"error retry backoff ({retry_count}/{max_retries}), "
-                                f"{int(sleep_end - time.time())}s remaining"
-                            )
             
             # If the API call was interrupted, skip response processing
             if interrupted:
@@ -9592,7 +9571,7 @@ class AIAgent:
             # the `response` variable is still None. Break out cleanly.
             if response is None:
                 _turn_exit_reason = "all_retries_exhausted_no_response"
-                print(f"{self.log_prefix}❌ All API retries exhausted with no successful response.")
+                print(f"{self.log_prefix}鉂?All API retries exhausted with no successful response.")
                 self._persist_session(messages, conversation_history)
                 break
 
@@ -9607,7 +9586,7 @@ class AIAgent:
                 else:
                     assistant_message = response.choices[0].message
                 
-                # Normalize content to string — some OpenAI-compatible servers
+                # Normalize content to string 鈥?some OpenAI-compatible servers
                 # (llama-server, etc.) return content as a dict or list instead
                 # of a plain string, which crashes downstream .strip() calls.
                 if assistant_message.content is not None and not isinstance(assistant_message.content, str):
@@ -9615,7 +9594,7 @@ class AIAgent:
                     if isinstance(raw, dict):
                         assistant_message.content = raw.get("text", "") or raw.get("content", "") or json.dumps(raw)
                     elif isinstance(raw, list):
-                        # Multimodal content list — extract text parts
+                        # Multimodal content list 鈥?extract text parts
                         parts = []
                         for part in raw:
                             if isinstance(part, str):
@@ -9647,6 +9626,7 @@ class AIAgent:
                         message_count=len(api_messages),
                         response_model=getattr(response, "model", None),
                         usage=self._usage_summary_for_api_request_hook(response),
+                        provider_usage=self._extract_openrouter_usage_metadata(response),
                         assistant_content_chars=len(_assistant_text),
                         assistant_tool_call_count=len(_assistant_tool_calls),
                     )
@@ -9656,9 +9636,9 @@ class AIAgent:
                 # Handle assistant response
                 if assistant_message.content and not self.quiet_mode:
                     if self.verbose_logging:
-                        self._vprint(f"{self.log_prefix}🤖 Assistant: {assistant_message.content}")
+                        self._vprint(f"{self.log_prefix}馃 Assistant: {assistant_message.content}")
                     else:
-                        self._vprint(f"{self.log_prefix}🤖 Assistant: {assistant_message.content[:100]}{'...' if len(assistant_message.content) > 100 else ''}")
+                        self._vprint(f"{self.log_prefix}馃 Assistant: {assistant_message.content[:100]}{'...' if len(assistant_message.content) > 100 else ''}")
 
                 # Notify progress callback of model's thinking (used by subagent
                 # delegation to relay the child's reasoning to the parent display).
@@ -9683,19 +9663,21 @@ class AIAgent:
                             pass
                 
                 # Check for incomplete <REASONING_SCRATCHPAD> (opened but never closed)
-                # This means the model ran out of output tokens mid-reasoning — retry up to 2 times
+                # This means the model ran out of output tokens mid-reasoning 鈥?retry up to 2 times
                 if has_incomplete_scratchpad(assistant_message.content or ""):
+                    if not hasattr(self, '_incomplete_scratchpad_retries'):
+                        self._incomplete_scratchpad_retries = 0
                     self._incomplete_scratchpad_retries += 1
                     
-                    self._vprint(f"{self.log_prefix}⚠️  Incomplete <REASONING_SCRATCHPAD> detected (opened but never closed)")
+                    self._vprint(f"{self.log_prefix}鈿狅笍  Incomplete <REASONING_SCRATCHPAD> detected (opened but never closed)")
                     
                     if self._incomplete_scratchpad_retries <= 2:
-                        self._vprint(f"{self.log_prefix}🔄 Retrying API call ({self._incomplete_scratchpad_retries}/2)...")
+                        self._vprint(f"{self.log_prefix}馃攧 Retrying API call ({self._incomplete_scratchpad_retries}/2)...")
                         # Don't add the broken message, just retry
                         continue
                     else:
                         # Max retries - discard this turn and save as partial
-                        self._vprint(f"{self.log_prefix}❌ Max retries (2) for incomplete scratchpad. Saving as partial.", force=True)
+                        self._vprint(f"{self.log_prefix}鉂?Max retries (2) for incomplete scratchpad. Saving as partial.", force=True)
                         self._incomplete_scratchpad_retries = 0
                         
                         rolled_back_messages = self._get_messages_up_to_last_assistant(messages)
@@ -9712,9 +9694,12 @@ class AIAgent:
                         }
                 
                 # Reset incomplete scratchpad counter on clean response
-                self._incomplete_scratchpad_retries = 0
+                if hasattr(self, '_incomplete_scratchpad_retries'):
+                    self._incomplete_scratchpad_retries = 0
 
                 if self.api_mode == "codex_responses" and finish_reason == "incomplete":
+                    if not hasattr(self, "_codex_incomplete_retries"):
+                        self._codex_incomplete_retries = 0
                     self._codex_incomplete_retries += 1
 
                     interim_msg = self._build_assistant_message(assistant_message, finish_reason)
@@ -9741,11 +9726,10 @@ class AIAgent:
                         )
                         if not duplicate_interim:
                             messages.append(interim_msg)
-                            self._emit_interim_assistant_message(interim_msg)
 
                     if self._codex_incomplete_retries < 3:
                         if not self.quiet_mode:
-                            self._vprint(f"{self.log_prefix}↻ Codex response incomplete; continuing turn ({self._codex_incomplete_retries}/3)")
+                            self._vprint(f"{self.log_prefix}鈫?Codex response incomplete; continuing turn ({self._codex_incomplete_retries}/3)")
                         self._session_messages = messages
                         self._save_session_log(messages)
                         continue
@@ -9766,7 +9750,7 @@ class AIAgent:
                 # Check for tool calls
                 if assistant_message.tool_calls:
                     if not self.quiet_mode:
-                        self._vprint(f"{self.log_prefix}🔧 Processing {len(assistant_message.tool_calls)} tool call(s)...")
+                        self._vprint(f"{self.log_prefix}馃敡 Processing {len(assistant_message.tool_calls)} tool call(s)...")
                     
                     if self.verbose_logging:
                         for tc in assistant_message.tool_calls:
@@ -9778,7 +9762,7 @@ class AIAgent:
                         if tc.function.name not in self.valid_tool_names:
                             repaired = self._repair_tool_call(tc.function.name)
                             if repaired:
-                                print(f"{self.log_prefix}🔧 Auto-repaired tool name: '{tc.function.name}' -> '{repaired}'")
+                                print(f"{self.log_prefix}馃敡 Auto-repaired tool name: '{tc.function.name}' -> '{repaired}'")
                                 tc.function.name = repaired
                     invalid_tool_calls = [
                         tc.function.name for tc in assistant_message.tool_calls
@@ -9786,16 +9770,18 @@ class AIAgent:
                     ]
                     if invalid_tool_calls:
                         # Track retries for invalid tool calls
+                        if not hasattr(self, '_invalid_tool_retries'):
+                            self._invalid_tool_retries = 0
                         self._invalid_tool_retries += 1
 
-                        # Return helpful error to model — model can self-correct next turn
+                        # Return helpful error to model 鈥?model can self-correct next turn
                         available = ", ".join(sorted(self.valid_tool_names))
                         invalid_name = invalid_tool_calls[0]
                         invalid_preview = invalid_name[:80] + "..." if len(invalid_name) > 80 else invalid_name
-                        self._vprint(f"{self.log_prefix}⚠️  Unknown tool '{invalid_preview}' — sending error to model for self-correction ({self._invalid_tool_retries}/3)")
+                        self._vprint(f"{self.log_prefix}鈿狅笍  Unknown tool '{invalid_preview}' 鈥?sending error to model for self-correction ({self._invalid_tool_retries}/3)")
 
                         if self._invalid_tool_retries >= 3:
-                            self._vprint(f"{self.log_prefix}❌ Max retries (3) for invalid tool calls exceeded. Stopping as partial.", force=True)
+                            self._vprint(f"{self.log_prefix}鉂?Max retries (3) for invalid tool calls exceeded. Stopping as partial.", force=True)
                             self._invalid_tool_retries = 0
                             self._persist_session(messages, conversation_history)
                             return {
@@ -9821,7 +9807,8 @@ class AIAgent:
                             })
                         continue
                     # Reset retry counter on successful tool call validation
-                    self._invalid_tool_retries = 0
+                    if hasattr(self, '_invalid_tool_retries'):
+                        self._invalid_tool_retries = 0
                     
                     # Validate tool call arguments are valid JSON
                     # Handle empty strings as empty objects (common model quirk)
@@ -9844,49 +9831,20 @@ class AIAgent:
                             invalid_json_args.append((tc.function.name, str(e)))
                     
                     if invalid_json_args:
-                        # Check if the invalid JSON is due to truncation rather
-                        # than a model formatting mistake.  Routers sometimes
-                        # rewrite finish_reason from "length" to "tool_calls",
-                        # hiding the truncation from the length handler above.
-                        # Detect truncation: args that don't end with } or ]
-                        # (after stripping whitespace) are cut off mid-stream.
-                        _truncated = any(
-                            not (tc.function.arguments or "").rstrip().endswith(("}", "]"))
-                            for tc in assistant_message.tool_calls
-                            if tc.function.name in {n for n, _ in invalid_json_args}
-                        )
-                        if _truncated:
-                            self._vprint(
-                                f"{self.log_prefix}⚠️  Truncated tool call arguments detected "
-                                f"(finish_reason={finish_reason!r}) — refusing to execute.",
-                                force=True,
-                            )
-                            self._invalid_json_retries = 0
-                            self._cleanup_task_resources(effective_task_id)
-                            self._persist_session(messages, conversation_history)
-                            return {
-                                "final_response": None,
-                                "messages": messages,
-                                "api_calls": api_call_count,
-                                "completed": False,
-                                "partial": True,
-                                "error": "Response truncated due to output length limit",
-                            }
-
                         # Track retries for invalid JSON arguments
                         self._invalid_json_retries += 1
-
+                        
                         tool_name, error_msg = invalid_json_args[0]
-                        self._vprint(f"{self.log_prefix}⚠️  Invalid JSON in tool call arguments for '{tool_name}': {error_msg}")
-
+                        self._vprint(f"{self.log_prefix}鈿狅笍  Invalid JSON in tool call arguments for '{tool_name}': {error_msg}")
+                        
                         if self._invalid_json_retries < 3:
-                            self._vprint(f"{self.log_prefix}🔄 Retrying API call ({self._invalid_json_retries}/3)...")
+                            self._vprint(f"{self.log_prefix}馃攧 Retrying API call ({self._invalid_json_retries}/3)...")
                             # Don't add anything to messages, just retry the API call
                             continue
                         else:
                             # Instead of returning partial, inject tool error results so the model can recover.
                             # Using tool results (not user messages) preserves role alternation.
-                            self._vprint(f"{self.log_prefix}⚠️  Injecting recovery tool results for invalid JSON...")
+                            self._vprint(f"{self.log_prefix}鈿狅笍  Injecting recovery tool results for invalid JSON...")
                             self._invalid_json_retries = 0  # Reset for next attempt
                             
                             # Append the assistant message with its (broken) tool_calls
@@ -9915,7 +9873,7 @@ class AIAgent:
                     # Reset retry counter on successful JSON validation
                     self._invalid_json_retries = 0
 
-                    # ── Post-call guardrails ──────────────────────────
+                    # 鈹€鈹€ Post-call guardrails 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
                     assistant_message.tool_calls = self._cap_delegate_task_calls(
                         assistant_message.tool_calls
                     )
@@ -9949,38 +9907,24 @@ class AIAgent:
                         elif self.quiet_mode:
                             clean = self._strip_think_blocks(turn_content).strip()
                             if clean:
-                                self._vprint(f"  ┊ 💬 {clean}")
+                                self._vprint(f"  鈹?馃挰 {clean}")
                     
                     # Pop thinking-only prefill message(s) before appending
-                    # (tool-call path — same rationale as the final-response path).
-                    _had_prefill = False
+                    # (tool-call path 鈥?same rationale as the final-response path).
                     while (
                         messages
                         and isinstance(messages[-1], dict)
                         and messages[-1].get("_thinking_prefill")
                     ):
                         messages.pop()
-                        _had_prefill = True
-
-                    # Reset prefill counter when tool calls follow a prefill
-                    # recovery.  Without this, the counter accumulates across
-                    # the whole conversation — a model that intermittently
-                    # empties (empty → prefill → tools → empty → prefill →
-                    # tools) burns both prefill attempts and the third empty
-                    # gets zero recovery.  Resetting here treats each tool-
-                    # call success as a fresh start.
-                    if _had_prefill:
-                        self._thinking_prefill_retries = 0
-                        self._empty_content_retries = 0
 
                     messages.append(assistant_msg)
-                    self._emit_interim_assistant_message(assistant_msg)
 
                     # Close any open streaming display (response box, reasoning
                     # box) before tool execution begins.  Intermediate turns may
                     # have streamed early content that opened the response box;
                     # flushing here prevents it from wrapping tool feed lines.
-                    # Only signal the display callback — TTS (_stream_callback)
+                    # Only signal the display callback 鈥?TTS (_stream_callback)
                     # should NOT receive None (it uses None as end-of-stream).
                     if self.stream_delta_callback:
                         try:
@@ -9989,11 +9933,6 @@ class AIAgent:
                             pass
 
                     self._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
-
-                    # Reset per-turn retry counters after successful tool
-                    # execution so a single truncation doesn't poison the
-                    # entire conversation.
-                    truncated_tool_call_retries = 0
 
                     # Signal that a paragraph break is needed before the next
                     # streamed text.  We don't emit it immediately because
@@ -10013,7 +9952,7 @@ class AIAgent:
                     # Use real token counts from the API response to decide
                     # compression.  prompt_tokens + completion_tokens is the
                     # actual context size the provider reported plus the
-                    # assistant turn — a tight lower bound for the next prompt.
+                    # assistant turn 鈥?a tight lower bound for the next prompt.
                     # Tool results appended above aren't counted yet, but the
                     # threshold (default 50%) leaves ample headroom; if tool
                     # results push past it, the next API call will report the
@@ -10033,11 +9972,11 @@ class AIAgent:
                     else:
                         _real_tokens = estimate_messages_tokens_rough(messages)
 
-                    # ── Context pressure warnings (user-facing only) ──────────
+                    # 鈹€鈹€ Context pressure warnings (user-facing only) 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
                     # Notify the user (NOT the LLM) as context approaches the
                     # compaction threshold.  Thresholds are relative to where
                     # compaction fires, not the raw context window.
-                    # Does not inject into messages — just prints to CLI output
+                    # Does not inject into messages 鈥?just prints to CLI output
                     # and fires status_callback for gateway platforms.
                     # Tiered: 85% (orange) and 95% (red/critical).
                     if _compressor.threshold_tokens > 0:
@@ -10066,13 +10005,13 @@ class AIAgent:
                                 }
 
                     if self.compression_enabled and _compressor.should_compress(_real_tokens):
-                        self._safe_print("  ⟳ compacting context…")
+                        self._safe_print("  compacting context")
                         messages, active_system_prompt = self._compress_context(
                             messages, system_message,
                             approx_tokens=self.context_compressor.last_prompt_tokens,
                             task_id=effective_task_id,
                         )
-                        # Compression created a new session — clear history so
+                        # Compression created a new session 鈥?clear history so
                         # _flush_messages_to_session_db writes compressed messages
                         # to the new session (see preflight compression comment).
                         conversation_history = None
@@ -10090,30 +10029,6 @@ class AIAgent:
                     
                     # Check if response only has think block with no actual content after it
                     if not self._has_content_after_think_block(final_response):
-                        # ── Partial stream recovery ─────────────────────
-                        # If content was already streamed to the user before
-                        # the connection died, use it as the final response
-                        # instead of falling through to prior-turn fallback
-                        # or wasting API calls on retries.
-                        _partial_streamed = (
-                            getattr(self, "_current_streamed_assistant_text", "") or ""
-                        )
-                        if self._has_content_after_think_block(_partial_streamed):
-                            _turn_exit_reason = "partial_stream_recovery"
-                            _recovered = self._strip_think_blocks(_partial_streamed).strip()
-                            logger.info(
-                                "Partial stream content delivered (%d chars) "
-                                "— using as final response",
-                                len(_recovered),
-                            )
-                            self._emit_status(
-                                "↻ Stream interrupted — using delivered content "
-                                "as final response"
-                            )
-                            final_response = _recovered
-                            self._response_was_previewed = True
-                            break
-
                         # If the previous turn already delivered real content alongside
                         # tool calls (e.g. "You're welcome!" + memory save), the model
                         # has nothing more to say. Use the earlier content immediately
@@ -10121,8 +10036,7 @@ class AIAgent:
                         fallback = getattr(self, '_last_content_with_tools', None)
                         if fallback:
                             _turn_exit_reason = "fallback_prior_turn_content"
-                            logger.info("Empty follow-up after tool calls — using prior turn content as final response")
-                            self._emit_status("↻ Empty response after tool calls — using earlier content as final answer")
+                            logger.debug("Empty follow-up after tool calls 鈥?using prior turn content as final response")
                             self._last_content_with_tools = None
                             self._empty_content_retries = 0
                             for i in range(len(messages) - 1, -1, -1):
@@ -10132,18 +10046,18 @@ class AIAgent:
                                     for tc in msg["tool_calls"]:
                                         if not tc or not isinstance(tc, dict): continue
                                         fn = tc.get("function", {})
-                                        tool_names.append(fn.get("name", "unknown"))
+                                        tool_names.append(str(fn.get("name", "unknown")))
                                     msg["content"] = f"Calling the {', '.join(tool_names)} tool{'s' if len(tool_names) > 1 else ''}..."
                                     break
                             final_response = self._strip_think_blocks(fallback).strip()
                             self._response_was_previewed = True
                             break
 
-                        # ── Thinking-only prefill continuation ──────────
+                        # 鈹€鈹€ Thinking-only prefill continuation 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
                         # The model produced structured reasoning (via API
                         # fields) but no visible text content.  Rather than
                         # giving up, append the assistant message as-is and
-                        # continue — the model will see its own reasoning
+                        # continue 鈥?the model will see its own reasoning
                         # on the next turn and produce the text portion.
                         # Inspired by clawdbot's "incomplete-text" recovery.
                         _has_structured = bool(
@@ -10153,13 +10067,9 @@ class AIAgent:
                         )
                         if _has_structured and self._thinking_prefill_retries < 2:
                             self._thinking_prefill_retries += 1
-                            logger.info(
-                                "Thinking-only response (no visible content) — "
-                                "prefilling to continue (%d/2)",
-                                self._thinking_prefill_retries,
-                            )
-                            self._emit_status(
-                                f"↻ Thinking-only response — prefilling to continue "
+                            self._vprint(
+                                f"{self.log_prefix}鈫?Thinking-only response 鈥?"
+                                f"prefilling to continue "
                                 f"({self._thinking_prefill_retries}/2)"
                             )
                             interim_msg = self._build_assistant_message(
@@ -10171,68 +10081,27 @@ class AIAgent:
                             self._save_session_log(messages)
                             continue
 
-                        # ── Empty response retry ──────────────────────
-                        # Model returned nothing usable.  Retry up to 3
-                        # times before attempting fallback.  This covers
-                        # both truly empty responses (no content, no
-                        # reasoning) AND reasoning-only responses after
-                        # prefill exhaustion — models like mimo-v2-pro
-                        # always populate reasoning fields via OpenRouter,
-                        # so the old `not _has_structured` guard blocked
-                        # retries for every reasoning model after prefill.
-                        _truly_empty = not self._strip_think_blocks(
-                            final_response
-                        ).strip()
-                        _prefill_exhausted = (
-                            _has_structured
-                            and self._thinking_prefill_retries >= 2
-                        )
-                        if _truly_empty and (not _has_structured or _prefill_exhausted) and self._empty_content_retries < 3:
+                        # 鈹€鈹€ Empty response retry (no reasoning) 鈹€鈹€鈹€鈹€鈹€鈹€
+                        # Model returned nothing 鈥?no content, no
+                        # structured reasoning, no tool calls.  Common
+                        # with open models (transient provider issues,
+                        # rate limits, sampling flukes).  Silently retry
+                        # up to 3 times before giving up.  Skip when
+                        # content has inline <think> tags (model chose
+                        # to reason, just no visible text).
+                        _truly_empty = not final_response.strip()
+                        if _truly_empty and not _has_structured and self._empty_content_retries < 3:
                             self._empty_content_retries += 1
-                            logger.warning(
-                                "Empty response (no content or reasoning) — "
-                                "retry %d/3 (model=%s)",
-                                self._empty_content_retries, self.model,
-                            )
-                            self._emit_status(
-                                f"⚠️ Empty response from model — retrying "
-                                f"({self._empty_content_retries}/3)"
+                            self._vprint(
+                                f"{self.log_prefix}鈫?Empty response (no content or reasoning) "
+                                f"鈥?retrying ({self._empty_content_retries}/3)",
+                                force=True,
                             )
                             continue
 
-                        # ── Exhausted retries — try fallback provider ──
-                        # Before giving up with "(empty)", attempt to
-                        # switch to the next provider in the fallback
-                        # chain.  This covers the case where a model
-                        # (e.g. GLM-4.5-Air) consistently returns empty
-                        # due to context degradation or provider issues.
-                        if _truly_empty and self._fallback_chain:
-                            logger.warning(
-                                "Empty response after %d retries — "
-                                "attempting fallback (model=%s, provider=%s)",
-                                self._empty_content_retries, self.model,
-                                self.provider,
-                            )
-                            self._emit_status(
-                                "⚠️ Model returning empty responses — "
-                                "switching to fallback provider..."
-                            )
-                            if self._try_activate_fallback():
-                                self._empty_content_retries = 0
-                                self._emit_status(
-                                    f"↻ Switched to fallback: {self.model} "
-                                    f"({self.provider})"
-                                )
-                                logger.info(
-                                    "Fallback activated after empty responses: "
-                                    "now using %s on %s",
-                                    self.model, self.provider,
-                                )
-                                continue
-
-                        # Exhausted retries and fallback chain (or no
-                        # fallback configured).  Fall through to the
-                        # "(empty)" terminal.
+                        # Exhausted prefill attempts, empty retries, or
+                        # structured reasoning with no content 鈥?
+                        # fall through to "(empty)" terminal.
                         _turn_exit_reason = "empty_response_exhausted"
                         reasoning_text = self._extract_reasoning(assistant_message)
                         assistant_msg = self._build_assistant_message(assistant_message, finish_reason)
@@ -10241,34 +10110,17 @@ class AIAgent:
 
                         if reasoning_text:
                             reasoning_preview = reasoning_text[:500] + "..." if len(reasoning_text) > 500 else reasoning_text
-                            logger.warning(
-                                "Reasoning-only response (no visible content) "
-                                "after exhausting retries and fallback. "
-                                "Reasoning: %s", reasoning_preview,
-                            )
-                            self._emit_status(
-                                "⚠️ Model produced reasoning but no visible "
-                                "response after all retries. Returning empty."
-                            )
+                            self._vprint(f"{self.log_prefix}鈩癸笍  Reasoning-only response (no visible content). Reasoning: {reasoning_preview}")
                         else:
-                            logger.warning(
-                                "Empty response (no content or reasoning) "
-                                "after %d retries. No fallback available. "
-                                "model=%s provider=%s",
-                                self._empty_content_retries, self.model,
-                                self.provider,
-                            )
-                            self._emit_status(
-                                "❌ Model returned no content after all retries"
-                                + (" and fallback attempts." if self._fallback_chain else
-                                   ". No fallback providers configured.")
-                            )
+                            self._vprint(f"{self.log_prefix}鈩癸笍  Empty response (no content or reasoning) after 3 retries.")
 
                         final_response = "(empty)"
                         break
                     
                     # Reset retry counter/signature on successful content
-                    self._empty_content_retries = 0
+                    if hasattr(self, '_empty_content_retries'):
+                        self._empty_content_retries = 0
+                    self._last_empty_content_signature = None
                     self._thinking_prefill_retries = 0
 
                     if (
@@ -10284,7 +10136,6 @@ class AIAgent:
                         codex_ack_continuations += 1
                         interim_msg = self._build_assistant_message(assistant_message, "incomplete")
                         messages.append(interim_msg)
-                        self._emit_interim_assistant_message(interim_msg)
 
                         continue_msg = {
                             "role": "user",
@@ -10325,21 +10176,23 @@ class AIAgent:
                     
                     _turn_exit_reason = f"text_response(finish_reason={finish_reason})"
                     if not self.quiet_mode:
-                        self._safe_print(f"🎉 Conversation completed after {api_call_count} OpenAI-compatible API call(s)")
+                        self._safe_print(f"馃帀 Conversation completed after {api_call_count} OpenAI-compatible API call(s)")
                     break
                 
             except Exception as e:
                 error_msg = f"Error during OpenAI-compatible API call #{api_call_count}: {str(e)}"
                 try:
-                    print(f"❌ {error_msg}")
+                    print(f"鉂?{error_msg}")
                 except (OSError, ValueError):
                     logger.error(error_msg)
                 
-                logger.debug("Outer loop error in API call #%d", api_call_count, exc_info=True)
+                if self.verbose_logging:
+                    logging.exception("Detailed error information:")
                 
                 # If an assistant message with tool_calls was already appended,
                 # the API expects a role="tool" result for every tool_call_id.
                 # Fill in error results for any that weren't answered yet.
+                pending_handled = False
                 for idx in range(len(messages) - 1, -1, -1):
                     msg = messages[idx]
                     if not isinstance(msg, dict):
@@ -10382,19 +10235,9 @@ class AIAgent:
             api_call_count >= self.max_iterations
             or self.iteration_budget.remaining <= 0
         ):
-            # Budget exhausted — ask the model for a summary via one extra
-            # API call with tools stripped.  _handle_max_iterations injects a
-            # user message and makes a single toolless request.
             _turn_exit_reason = f"max_iterations_reached({api_call_count}/{self.max_iterations})"
-            self._emit_status(
-                f"⚠️ Iteration budget exhausted ({api_call_count}/{self.max_iterations}) "
-                "— asking model to summarise"
-            )
-            if not self.quiet_mode:
-                self._safe_print(
-                    f"\n⚠️  Iteration budget exhausted ({api_call_count}/{self.max_iterations}) "
-                    "— requesting summary..."
-                )
+            if self.iteration_budget.remaining <= 0 and not self.quiet_mode:
+                print(f"\n鈿狅笍  Iteration budget exhausted ({self.iteration_budget.used}/{self.iteration_budget.max_total} iterations used)")
             final_response = self._handle_max_iterations(messages, api_call_count)
         
         # Determine if conversation completed successfully
@@ -10409,10 +10252,10 @@ class AIAgent:
         # Persist session to both JSON log and SQLite
         self._persist_session(messages, conversation_history)
 
-        # ── Turn-exit diagnostic log ─────────────────────────────────────
+        # 鈹€鈹€ Turn-exit diagnostic log 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
         # Always logged at INFO so agent.log captures WHY every turn ended.
         # When the last message is a tool result (agent was mid-work), log
-        # at WARNING — this is the "just stops" scenario users report.
+        # at WARNING 鈥?this is the "just stops" scenario users report.
         _last_msg_role = messages[-1].get("role") if messages else None
         _last_tool_name = None
         if _last_msg_role == "tool":
@@ -10444,7 +10287,7 @@ class AIAgent:
         )
 
         if _last_msg_role == "tool" and not interrupted:
-            # Agent was mid-work — this is the "just stops" case.
+            # Agent was mid-work 鈥?this is the "just stops" case.
             logger.warning(
                 "Turn ended with pending tool result (agent may appear stuck). "
                 + _diag_msg + " last_tool=%s",
@@ -10458,6 +10301,9 @@ class AIAgent:
         # Plugins can use this to persist conversation data (e.g. sync
         # to an external memory system).
         if final_response and not interrupted:
+            self._note_model_registry_success(
+                response_model=str((self._last_provider_usage_metadata or {}).get("response_model") or "").strip() or None
+            )
             try:
                 from hermes_cli.plugins import invoke_hook as _invoke_hook
                 _invoke_hook(
@@ -10504,6 +10350,12 @@ class AIAgent:
             "estimated_cost_usd": self.session_estimated_cost_usd,
             "cost_status": self.session_cost_status,
             "cost_source": self.session_cost_source,
+            "provider_usage": dict(self._last_provider_usage_metadata or {}),
+            "provider_usage_totals": {
+                "billed_cost_usd": self.session_billed_cost_usd,
+                "upstream_inference_cost_usd": self.session_upstream_inference_cost_usd,
+                "cache_discount_usd": self.session_cache_discount_usd,
+            },
         }
         self._response_was_previewed = False
         
@@ -10517,7 +10369,7 @@ class AIAgent:
         # Clear stream callback so it doesn't leak into future calls
         self._stream_callback = None
 
-        # Check skill trigger NOW — based on how many tool iterations THIS turn used.
+        # Check skill trigger NOW 鈥?based on how many tool iterations THIS turn used.
         _should_review_skills = False
         if (self._skill_nudge_interval > 0
                 and self._iters_since_skill >= self._skill_nudge_interval
@@ -10526,7 +10378,7 @@ class AIAgent:
             self._iters_since_skill = 0
 
         # External memory provider: sync the completed turn + queue next prefetch.
-        # Use original_user_message (clean input) — user_message may contain
+        # Use original_user_message (clean input) 鈥?user_message may contain
         # injected skill content that bloats / breaks provider queries.
         if self._memory_manager and final_response and original_user_message:
             try:
@@ -10535,7 +10387,7 @@ class AIAgent:
             except Exception:
                 pass
 
-        # Background memory/skill review — runs AFTER the response is delivered
+        # Background memory/skill review 鈥?runs AFTER the response is delivered
         # so it never competes with the user's task for model attention.
         if final_response and not interrupted and (_should_review_memory or _should_review_skills):
             try:
@@ -10548,7 +10400,7 @@ class AIAgent:
                 pass  # Background review is best-effort
 
         # Note: Memory provider on_session_end() + shutdown_all() are NOT
-        # called here — run_conversation() is called once per user message in
+        # called here 鈥?run_conversation() is called once per user message in
         # multi-turn sessions. Shutting down after every turn would kill the
         # provider before the second message. Actual session-end cleanup is
         # handled by the CLI (atexit / /reset) and gateway (session expiry /
@@ -10623,7 +10475,7 @@ def main(
     Toolset Examples:
         - "research": Web search, extract, crawl + vision tools
     """
-    print("🤖 AI Agent with Tool Calling")
+    print("馃 AI Agent with Tool Calling")
     print("=" * 50)
     
     # Handle tool listing
@@ -10631,11 +10483,11 @@ def main(
         from model_tools import get_all_tool_names, get_toolset_for_tool, get_available_toolsets
         from toolsets import get_all_toolsets, get_toolset_info
         
-        print("📋 Available Tools & Toolsets:")
+        print("馃搵 Available Tools & Toolsets:")
         print("-" * 50)
         
         # Show new toolsets system
-        print("\n🎯 Predefined Toolsets (New System):")
+        print("\n馃幆 Predefined Toolsets (New System):")
         print("-" * 40)
         all_toolsets = get_all_toolsets()
         
@@ -10656,44 +10508,44 @@ def main(
                     scenario_toolsets.append(entry)
         
         # Print basic toolsets
-        print("\n📌 Basic Toolsets:")
+        print("\n馃搶 Basic Toolsets:")
         for name, info in basic_toolsets:
             tools_str = ', '.join(info['resolved_tools']) if info['resolved_tools'] else 'none'
-            print(f"  • {name:15} - {info['description']}")
+            print(f"  鈥?{name:15} - {info['description']}")
             print(f"    Tools: {tools_str}")
         
         # Print composite toolsets
-        print("\n📂 Composite Toolsets (built from other toolsets):")
+        print("\n馃搨 Composite Toolsets (built from other toolsets):")
         for name, info in composite_toolsets:
             includes_str = ', '.join(info['includes']) if info['includes'] else 'none'
-            print(f"  • {name:15} - {info['description']}")
+            print(f"  鈥?{name:15} - {info['description']}")
             print(f"    Includes: {includes_str}")
             print(f"    Total tools: {info['tool_count']}")
         
         # Print scenario-specific toolsets
-        print("\n🎭 Scenario-Specific Toolsets:")
+        print("\n馃幁 Scenario-Specific Toolsets:")
         for name, info in scenario_toolsets:
-            print(f"  • {name:20} - {info['description']}")
+            print(f"  鈥?{name:20} - {info['description']}")
             print(f"    Total tools: {info['tool_count']}")
         
         
         # Show legacy toolset compatibility
-        print("\n📦 Legacy Toolsets (for backward compatibility):")
+        print("\n馃摝 Legacy Toolsets (for backward compatibility):")
         legacy_toolsets = get_available_toolsets()
         for name, info in legacy_toolsets.items():
-            status = "✅" if info["available"] else "❌"
+            status = "[ok]" if info["available"] else "[missing]"
             print(f"  {status} {name}: {info['description']}")
             if not info["available"]:
                 print(f"    Requirements: {', '.join(info['requirements'])}")
         
         # Show individual tools
         all_tools = get_all_tool_names()
-        print(f"\n🔧 Individual Tools ({len(all_tools)} available):")
+        print(f"\n馃敡 Individual Tools ({len(all_tools)} available):")
         for tool_name in sorted(all_tools):
             toolset = get_toolset_for_tool(tool_name)
-            print(f"  📌 {tool_name} (from {toolset})")
+            print(f"  馃搶 {tool_name} (from {toolset})")
         
-        print("\n💡 Usage Examples:")
+        print("\n馃挕 Usage Examples:")
         print("  # Use predefined toolsets")
         print("  python run_agent.py --enabled_toolsets=research --query='search for Python news'")
         print("  python run_agent.py --enabled_toolsets=development --query='debug this code'")
@@ -10715,16 +10567,16 @@ def main(
     
     if enabled_toolsets:
         enabled_toolsets_list = [t.strip() for t in enabled_toolsets.split(",")]
-        print(f"🎯 Enabled toolsets: {enabled_toolsets_list}")
+        print(f"馃幆 Enabled toolsets: {enabled_toolsets_list}")
     
     if disabled_toolsets:
         disabled_toolsets_list = [t.strip() for t in disabled_toolsets.split(",")]
-        print(f"🚫 Disabled toolsets: {disabled_toolsets_list}")
+        print(f"馃毇 Disabled toolsets: {disabled_toolsets_list}")
     
     if save_trajectories:
-        print("💾 Trajectory saving: ENABLED")
-        print("   - Successful conversations → trajectory_samples.jsonl")
-        print("   - Failed conversations → failed_trajectories.jsonl")
+        print("馃捑 Trajectory saving: ENABLED")
+        print("   - Successful conversations 鈫?trajectory_samples.jsonl")
+        print("   - Failed conversations 鈫?failed_trajectories.jsonl")
     
     # Initialize agent with provided parameters
     try:
@@ -10740,7 +10592,7 @@ def main(
             log_prefix_chars=log_prefix_chars
         )
     except RuntimeError as e:
-        print(f"❌ Failed to initialize agent: {e}")
+        print(f"鉂?Failed to initialize agent: {e}")
         return
     
     # Use provided query or default to Python 3.13 example
@@ -10752,21 +10604,21 @@ def main(
     else:
         user_query = query
     
-    print(f"\n📝 User Query: {user_query}")
+    print(f"\n馃摑 User Query: {user_query}")
     print("\n" + "=" * 50)
     
     # Run conversation
     result = agent.run_conversation(user_query)
     
     print("\n" + "=" * 50)
-    print("📋 CONVERSATION SUMMARY")
+    print("馃搵 CONVERSATION SUMMARY")
     print("=" * 50)
-    print(f"✅ Completed: {result['completed']}")
-    print(f"📞 API Calls: {result['api_calls']}")
-    print(f"💬 Messages: {len(result['messages'])}")
+    print(f"鉁?Completed: {result['completed']}")
+    print(f"馃摓 API Calls: {result['api_calls']}")
+    print(f"馃挰 Messages: {len(result['messages'])}")
     
     if result['final_response']:
-        print("\n🎯 FINAL RESPONSE:")
+        print("\n馃幆 FINAL RESPONSE:")
         print("-" * 30)
         print(result['final_response'])
     
@@ -10794,11 +10646,11 @@ def main(
             with open(sample_filename, "w", encoding="utf-8") as f:
                 # Pretty-print JSON with indent for readability
                 f.write(json.dumps(entry, ensure_ascii=False, indent=2))
-            print(f"\n💾 Sample trajectory saved to: {sample_filename}")
+            print(f"\n馃捑 Sample trajectory saved to: {sample_filename}")
         except Exception as e:
-            print(f"\n⚠️ Failed to save sample: {e}")
+            print(f"\n鈿狅笍 Failed to save sample: {e}")
     
-    print("\n👋 Agent execution completed!")
+    print("\n馃憢 Agent execution completed!")
 
 
 if __name__ == "__main__":
