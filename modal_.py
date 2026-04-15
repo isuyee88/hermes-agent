@@ -78,6 +78,15 @@ DEFAULT_SUPERMEMORY_CONFIG_SOURCE = Path(__file__).with_name("supermemory.modal.
 DEFAULT_DISABLED_TOOLSETS = ["rl", "voice"]
 DEFAULT_UPDATE_TTL_SECONDS = 24 * 60 * 60
 DEFAULT_SECRET_NAME = os.getenv("HERMES_MODAL_SECRET_NAME", "custom-secret")
+DEFAULT_EXTRA_SECRET_NAMES = os.getenv("HERMES_MODAL_EXTRA_SECRET_NAMES", "")
+_FEISHU_OVERRIDE_ENV_MAP = {
+    "HERMES_FEISHU_APP_ID_OVERRIDE": "FEISHU_APP_ID",
+    "HERMES_FEISHU_APP_SECRET_OVERRIDE": "FEISHU_APP_SECRET",
+    "HERMES_FEISHU_INTERNAL_BEARER_TOKEN_OVERRIDE": "HERMES_FEISHU_INTERNAL_BEARER_TOKEN",
+    "HERMES_FEISHU_VERIFICATION_TOKEN_OVERRIDE": "FEISHU_VERIFICATION_TOKEN",
+    "HERMES_FEISHU_ENCRYPT_KEY_OVERRIDE": "FEISHU_ENCRYPT_KEY",
+    "HERMES_FEISHU_HOME_CHANNEL_OVERRIDE": "FEISHU_HOME_CHANNEL",
+}
 DEFAULT_CLOUDFLARE_AI_GATEWAY_BASE_URL = (
     "https://gateway.ai.cloudflare.com/v1/"
     "d1215a30b84b673ef0367010b0e78c10/affiliate-manager"
@@ -90,6 +99,34 @@ DEFAULT_CHAT_QUEUE_SPAWN_COOLDOWN_SECONDS = max(
     1,
     int(os.getenv("HERMES_MODAL_CHAT_QUEUE_SPAWN_COOLDOWN_SECONDS", "15")),
 )
+
+
+def _get_modal_secret_names() -> list[str]:
+    names: list[str] = []
+    seen: set[str] = set()
+    for raw_name in [DEFAULT_SECRET_NAME, *re.split(r"[;,]", DEFAULT_EXTRA_SECRET_NAMES)]:
+        name = str(raw_name or "").strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        names.append(name)
+    return names
+
+
+def _get_modal_secrets() -> list[Any]:
+    return [modal.Secret.from_name(name) for name in _get_modal_secret_names()]
+
+
+def _apply_feishu_env_overrides() -> None:
+    for source_name, target_name in _FEISHU_OVERRIDE_ENV_MAP.items():
+        value = str(os.getenv(source_name, "") or "").strip()
+        if value:
+            os.environ[target_name] = value
+
+
+_apply_feishu_env_overrides()
+
+
 _FEISHU_LOCAL_MODEL_MENU_MAP: dict[str, tuple[str | None, str | None]] = {
     "provider_openrouter": ("openrouter", "featured"),
     "provider_openrouter_featured": ("openrouter", "featured"),
@@ -5255,7 +5292,7 @@ async def _get_feishu_internal_gateway_runtime() -> _FeishuGatewayRuntime:
         return _FEISHU_INTERNAL_RUNTIME
 
 
-async def _run_feishu_internal_agent_exec(payload: Mapping[str, Any]) -> dict[str, Any]:
+async def _run_feishu_internal_agent_run(payload: Mapping[str, Any]) -> dict[str, Any]:
     payload_dict = dict(payload or {})
     correlation_id = str(payload_dict.get("correlation_id") or "").strip()
     event_id = str(payload_dict.get("event_id") or "").strip()
@@ -9532,7 +9569,7 @@ def create_web_app():
         )
 
     @app.post("/internal/feishu/agent-exec")
-    async def feishu_internal_agent_exec(
+    async def feishu_internal_agent_run(
         request: Request,
         authorization: Optional[str] = Header(default=None),
     ) -> dict[str, Any]:
@@ -9542,7 +9579,7 @@ def create_web_app():
         payload = await request.json()
         if not isinstance(payload, dict):
             raise HTTPException(status_code=400, detail="Expected JSON object payload")
-        return await _run_feishu_internal_agent_exec(payload)
+        return await _run_feishu_internal_agent_run(payload)
 
     @app.post("/internal/feishu/agent-plan")
     async def feishu_internal_agent_plan(
@@ -10182,8 +10219,14 @@ if modal is not None:
         .pip_install(["fastapi[standard]", "supermemory>=3.33.0,<4", "uv>=0.7.0,<1"])
         .env(
             {
+                "HERMES_MODAL_APP_NAME": APP_NAME,
                 "HERMES_HOME": "/data/hermes-home",
                 "HERMES_BUNDLED_SKILLS": "/root/skills",
+                "HERMES_MODAL_SECRET_NAME": DEFAULT_SECRET_NAME,
+                "HERMES_MODAL_EXTRA_SECRET_NAMES": DEFAULT_EXTRA_SECRET_NAMES,
+                "HERMES_MODAL_VOLUME_NAME": DEFAULT_VOLUME_NAME,
+                "HERMES_MODAL_CHAT_QUEUE_NAME": DEFAULT_CHAT_QUEUE_NAME,
+                "HERMES_MODAL_CRON_QUEUE_NAME": DEFAULT_CRON_QUEUE_NAME,
             }
         )
         .add_local_python_source(
@@ -10255,7 +10298,7 @@ if modal is not None:
         )
     volume = modal.Volume.from_name(DEFAULT_VOLUME_NAME, create_if_missing=True)
     MODAL_VOLUME = volume
-    secrets = [modal.Secret.from_name(DEFAULT_SECRET_NAME)]
+    secrets = _get_modal_secrets()
     maintenance_heartbeat_enabled = _maintenance_heartbeat_is_enabled()
     maintenance_heartbeat_schedule = (
         modal.Period(minutes=DEFAULT_MAINTENANCE_HEARTBEAT_MINUTES)
@@ -11487,6 +11530,6 @@ if modal is not None:
     @app.local_entrypoint()
     def main() -> None:
         print(f"Deploying/serving Modal app: {APP_NAME}")
-        print(f"Secrets source: {DEFAULT_SECRET_NAME}")
+        print(f"Secrets source: {', '.join(_get_modal_secret_names())}")
         print(f"Volume source: {DEFAULT_VOLUME_NAME}")
         print("Exposed routes: /healthz, /invoke, /telegram/webhook, /feishu/webhook, /qq/webhook")

@@ -572,7 +572,8 @@ class FeishuOpenApiClient:
             ):
                 return str(cached["token"])
 
-        response = httpx.post(
+        response = httpx.request(
+            "POST",
             f"{self.base_url}/open-apis/auth/v3/tenant_access_token/internal",
             json={"app_id": self.app_id, "app_secret": self.app_secret},
             timeout=self.timeout,
@@ -687,7 +688,8 @@ class FeishuOpenApiClient:
         resolved_name = str(file_name or file_path.name)
         file_type = detect_upload_file_type(Path(resolved_name))
         with file_path.open("rb") as fh:
-            response = httpx.post(
+            response = httpx.request(
+                "POST",
                 f"{self.base_url}/open-apis/im/v1/files",
                 headers=self._auth_headers(),
                 data={"file_type": file_type, "file_name": resolved_name},
@@ -708,7 +710,8 @@ class FeishuOpenApiClient:
     def upload_im_image(self, *, file_path: Path) -> Dict[str, Any]:
         resolved_name = str(file_path.name)
         with file_path.open("rb") as fh:
-            response = httpx.post(
+            response = httpx.request(
+                "POST",
                 f"{self.base_url}/open-apis/im/v1/images",
                 headers=self._auth_headers(),
                 data={"image_type": _FEISHU_IMAGE_UPLOAD_TYPE},

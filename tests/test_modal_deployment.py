@@ -36,6 +36,55 @@ def test_validate_bearer_token():
     assert module._validate_bearer_token(None, None) is True
 
 
+def test_get_modal_secret_names_defaults_to_primary_secret(monkeypatch):
+    monkeypatch.delenv("HERMES_MODAL_SECRET_NAME", raising=False)
+    monkeypatch.delenv("HERMES_MODAL_EXTRA_SECRET_NAMES", raising=False)
+
+    module = _load_module()
+
+    assert module._get_modal_secret_names() == ["custom-secret"]
+
+
+def test_get_modal_secret_names_appends_unique_overrides(monkeypatch):
+    monkeypatch.setenv("HERMES_MODAL_SECRET_NAME", "custom-secret-staging")
+    monkeypatch.setenv(
+        "HERMES_MODAL_EXTRA_SECRET_NAMES",
+        " custom-secret-staging-feishu ; custom-secret-staging-feishu , custom-secret-staging-ai ",
+    )
+
+    module = _load_module()
+
+    assert module._get_modal_secret_names() == [
+        "custom-secret-staging",
+        "custom-secret-staging-feishu",
+        "custom-secret-staging-ai",
+    ]
+
+
+def test_feishu_env_overrides_replace_runtime_credentials(monkeypatch):
+    monkeypatch.setenv("FEISHU_APP_ID", "primary-app")
+    monkeypatch.setenv("FEISHU_APP_SECRET", "primary-secret")
+    monkeypatch.setenv("HERMES_FEISHU_APP_ID_OVERRIDE", "secondary-app")
+    monkeypatch.setenv("HERMES_FEISHU_APP_SECRET_OVERRIDE", "secondary-secret")
+
+    _load_module()
+
+    assert os.environ["FEISHU_APP_ID"] == "secondary-app"
+    assert os.environ["FEISHU_APP_SECRET"] == "secondary-secret"
+
+
+def test_feishu_env_overrides_replace_internal_bearer_token(monkeypatch):
+    monkeypatch.setenv("HERMES_FEISHU_INTERNAL_BEARER_TOKEN", "primary-internal-token")
+    monkeypatch.setenv(
+        "HERMES_FEISHU_INTERNAL_BEARER_TOKEN_OVERRIDE",
+        "secondary-internal-token",
+    )
+
+    _load_module()
+
+    assert os.environ["HERMES_FEISHU_INTERNAL_BEARER_TOKEN"] == "secondary-internal-token"
+
+
 def test_extract_tool_names_handles_dict_payloads():
     module = _load_module()
     messages = [
