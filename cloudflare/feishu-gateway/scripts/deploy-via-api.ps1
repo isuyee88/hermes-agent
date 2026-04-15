@@ -3,7 +3,14 @@ param(
     [string]$WorkerName = "hermes-feishu-gateway",
     [string]$ModalInternalBaseUrl = "https://isuyee88--hermes-agent-web-app.modal.run",
     [string]$ProxyUrl = "",
-    [string]$CompatibilityDate = "2026-04-14"
+    [string]$CompatibilityDate = "2026-04-14",
+    [string]$FeishuAppId = "",
+    [string]$FeishuAppSecret = "",
+    [string]$ModalInternalBearerToken = "",
+    [string]$FeishuVerificationToken = "",
+    [string]$FeishuEncryptKey = "",
+    [string]$CloudflareAiGatewayBaseUrl = "",
+    [string]$CloudflareAiGatewayApiKey = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -52,9 +59,13 @@ $bundlePath = Join-Path $bundleDir "index.js"
 $metadataPath = Join-Path $repoRoot ".tmp-cf-upload-metadata.json"
 
 $token = Get-EnvValue "CLOUDFLARE_API_TOKEN"
-$appId = Get-EnvValue "FEISHU_APP_ID"
-$appSecret = Get-EnvValue "FEISHU_APP_SECRET"
-$internalBearer = Get-EnvValue "HERMES_FEISHU_INTERNAL_BEARER_TOKEN"
+$appId = if ($FeishuAppId) { $FeishuAppId } else { Get-EnvValue "FEISHU_APP_ID" }
+$appSecret = if ($FeishuAppSecret) { $FeishuAppSecret } else { Get-EnvValue "FEISHU_APP_SECRET" }
+$internalBearer = if ($ModalInternalBearerToken) { $ModalInternalBearerToken } else { Get-EnvValue "HERMES_FEISHU_INTERNAL_BEARER_TOKEN" }
+$verificationToken = if ($FeishuVerificationToken) { $FeishuVerificationToken } else { Get-EnvValue "FEISHU_VERIFICATION_TOKEN" }
+$encryptKey = if ($FeishuEncryptKey) { $FeishuEncryptKey } else { Get-EnvValue "FEISHU_ENCRYPT_KEY" }
+$cfAiGatewayBaseUrl = if ($CloudflareAiGatewayBaseUrl) { $CloudflareAiGatewayBaseUrl } else { Get-EnvValue "CLOUDFLARE_AI_GATEWAY_BASE_URL" }
+$cfAiGatewayApiKey = if ($CloudflareAiGatewayApiKey) { $CloudflareAiGatewayApiKey } else { Get-EnvValue "CLOUDFLARE_AI_GATEWAY_API_KEY" }
 
 if (-not $token) {
     throw "CLOUDFLARE_API_TOKEN is required."
@@ -79,6 +90,74 @@ try {
         throw "Bundled worker not found at $bundlePath"
     }
 
+    $bindings = @(
+        @{
+            name = "FEISHU_AGENT_WORKFLOW"
+            type = "workflow"
+            workflow_name = "hermes-feishu-agent-workflow"
+            class_name = "FeishuAgentWorkflow"
+        },
+        @{
+            name = "FEISHU_API_BASE"
+            type = "plain_text"
+            text = "https://open.feishu.cn"
+        },
+        @{
+            name = "FEISHU_ACK_REACTION_EMOJI"
+            type = "plain_text"
+            text = "OK"
+        },
+        @{
+            name = "MODAL_INTERNAL_BASE_URL"
+            type = "plain_text"
+            text = $ModalInternalBaseUrl
+        },
+        @{
+            name = "FEISHU_APP_ID"
+            type = "secret_text"
+            text = $appId
+        },
+        @{
+            name = "FEISHU_APP_SECRET"
+            type = "secret_text"
+            text = $appSecret
+        },
+        @{
+            name = "MODAL_INTERNAL_BEARER_TOKEN"
+            type = "secret_text"
+            text = $internalBearer
+        }
+    )
+
+    if ($verificationToken) {
+        $bindings += @{
+            name = "FEISHU_VERIFICATION_TOKEN"
+            type = "secret_text"
+            text = $verificationToken
+        }
+    }
+    if ($encryptKey) {
+        $bindings += @{
+            name = "FEISHU_ENCRYPT_KEY"
+            type = "secret_text"
+            text = $encryptKey
+        }
+    }
+    if ($cfAiGatewayBaseUrl) {
+        $bindings += @{
+            name = "CLOUDFLARE_AI_GATEWAY_BASE_URL"
+            type = "plain_text"
+            text = $cfAiGatewayBaseUrl
+        }
+    }
+    if ($cfAiGatewayApiKey) {
+        $bindings += @{
+            name = "CLOUDFLARE_AI_GATEWAY_API_KEY"
+            type = "secret_text"
+            text = $cfAiGatewayApiKey
+        }
+    }
+
     $metadata = @{
         main_module = "index.js"
         compatibility_date = $CompatibilityDate
@@ -98,44 +177,7 @@ try {
                 persist = $true
             }
         }
-        bindings = @(
-            @{
-                name = "FEISHU_AGENT_WORKFLOW"
-                type = "workflow"
-                workflow_name = "hermes-feishu-agent-workflow"
-                class_name = "FeishuAgentWorkflow"
-            },
-            @{
-                name = "FEISHU_API_BASE"
-                type = "plain_text"
-                text = "https://open.feishu.cn"
-            },
-            @{
-                name = "FEISHU_ACK_REACTION_EMOJI"
-                type = "plain_text"
-                text = "OK"
-            },
-            @{
-                name = "MODAL_INTERNAL_BASE_URL"
-                type = "plain_text"
-                text = $ModalInternalBaseUrl
-            },
-            @{
-                name = "FEISHU_APP_ID"
-                type = "secret_text"
-                text = $appId
-            },
-            @{
-                name = "FEISHU_APP_SECRET"
-                type = "secret_text"
-                text = $appSecret
-            },
-            @{
-                name = "MODAL_INTERNAL_BEARER_TOKEN"
-                type = "secret_text"
-                text = $internalBearer
-            }
-        )
+        bindings = $bindings
     } | ConvertTo-Json -Depth 12
 
     $utf8NoBom = New-Object System.Text.UTF8Encoding($false)

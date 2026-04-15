@@ -10172,7 +10172,7 @@ if modal is not None:
             # to the official browser-capable profile instead of relying on a
             # slow first-request npx bootstrap.
             "npm install -g agent-browser @askjo/camoufox-browser",
-            "agent-browser install --with-deps || agent-browser install || true",
+            "export PYTHONIOENCODING=UTF-8 PYTHONUTF8=1 LANG=C.UTF-8 LC_ALL=C.UTF-8; agent-browser install --with-deps >/tmp/agent-browser-install.log 2>&1 || agent-browser install >/tmp/agent-browser-install.log 2>&1 || true",
             "python -c \"from pathlib import Path; import uuid; mid = uuid.uuid4().hex; Path('/etc/machine-id').write_text(mid + '\\n', encoding='utf-8'); Path('/var/lib/dbus').mkdir(parents=True, exist_ok=True); Path('/var/lib/dbus/machine-id').write_text(mid + '\\n', encoding='utf-8')\"",
         )
         .pip_install_from_pyproject(
