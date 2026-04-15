@@ -10,7 +10,8 @@ param(
     [string]$FeishuVerificationToken = "",
     [string]$FeishuEncryptKey = "",
     [string]$CloudflareAiGatewayBaseUrl = "",
-    [string]$CloudflareAiGatewayApiKey = ""
+    [string]$CloudflareAiGatewayApiKey = "",
+    [string]$CloudflareApiTokenBinding = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -66,6 +67,7 @@ $verificationToken = if ($FeishuVerificationToken) { $FeishuVerificationToken } 
 $encryptKey = if ($FeishuEncryptKey) { $FeishuEncryptKey } else { Get-EnvValue "FEISHU_ENCRYPT_KEY" }
 $cfAiGatewayBaseUrl = if ($CloudflareAiGatewayBaseUrl) { $CloudflareAiGatewayBaseUrl } else { Get-EnvValue "CLOUDFLARE_AI_GATEWAY_BASE_URL" }
 $cfAiGatewayApiKey = if ($CloudflareAiGatewayApiKey) { $CloudflareAiGatewayApiKey } else { Get-EnvValue "CLOUDFLARE_AI_GATEWAY_API_KEY" }
+$cfApiTokenBinding = if ($CloudflareApiTokenBinding) { $CloudflareApiTokenBinding } else { Get-EnvValue "CLOUDFLARE_API_TOKEN" }
 
 if (-not $token) {
     throw "CLOUDFLARE_API_TOKEN is required."
@@ -155,6 +157,13 @@ try {
             name = "CLOUDFLARE_AI_GATEWAY_API_KEY"
             type = "secret_text"
             text = $cfAiGatewayApiKey
+        }
+    }
+    if ($cfApiTokenBinding) {
+        $bindings += @{
+            name = "CLOUDFLARE_API_TOKEN"
+            type = "secret_text"
+            text = $cfApiTokenBinding
         }
     }
 
