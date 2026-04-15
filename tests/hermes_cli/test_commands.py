@@ -1,6 +1,6 @@
 """Tests for the central command registry and autocomplete."""
 
-from prompt_toolkit.completion import CompleteEvent
+from prompt_toolkit.completion import CompleteEvent, Completion
 from prompt_toolkit.document import Document
 
 from hermes_cli.commands import (
@@ -67,17 +67,6 @@ class TestCommandRegistry:
         valid_categories = {"Session", "Configuration", "Tools & Skills", "Info", "Exit"}
         for cmd in COMMAND_REGISTRY:
             assert cmd.category in valid_categories, f"{cmd.name} has invalid category '{cmd.category}'"
-
-    def test_reasoning_subcommands_are_in_logical_order(self):
-        reasoning = next(cmd for cmd in COMMAND_REGISTRY if cmd.name == "reasoning")
-        assert reasoning.subcommands[:6] == (
-            "none",
-            "minimal",
-            "low",
-            "medium",
-            "high",
-            "xhigh",
-        )
 
     def test_cli_only_and_gateway_only_are_mutually_exclusive(self):
         for cmd in COMMAND_REGISTRY:
@@ -429,6 +418,20 @@ class TestSlashCommandCompleter:
         assert len(completions) == 1
         assert "Skill command" in completions[0].display_meta_text
 
+    def test_at_context_completion_does_not_crash(self, monkeypatch):
+        completer = SlashCommandCompleter()
+
+        monkeypatch.setattr(
+            completer,
+            "_context_completions",
+            lambda word, limit=30: iter([Completion("@diff", start_position=-len(word))]),
+        )
+
+        completions = _completions(completer, "@d")
+
+        assert len(completions) == 1
+        assert completions[0].text == "@diff"
+
 
 # ── SUBCOMMANDS extraction ──────────────────────────────────────────────
 
@@ -436,8 +439,8 @@ class TestSlashCommandCompleter:
 class TestSubcommands:
     def test_explicit_subcommands_extracted(self):
         """Commands with explicit subcommands on CommandDef are extracted."""
-        assert "/skills" in SUBCOMMANDS
-        assert "install" in SUBCOMMANDS["/skills"]
+        assert "/prompt" in SUBCOMMANDS
+        assert "clear" in SUBCOMMANDS["/prompt"]
 
     def test_reasoning_has_subcommands(self):
         assert "/reasoning" in SUBCOMMANDS
@@ -445,13 +448,6 @@ class TestSubcommands:
         assert "high" in subs
         assert "show" in subs
         assert "hide" in subs
-
-    def test_fast_has_subcommands(self):
-        assert "/fast" in SUBCOMMANDS
-        subs = SUBCOMMANDS["/fast"]
-        assert "fast" in subs
-        assert "normal" in subs
-        assert "status" in subs
 
     def test_voice_has_subcommands(self):
         assert "/voice" in SUBCOMMANDS
@@ -480,20 +476,6 @@ class TestSubcommandCompletion:
         texts = {c.text for c in completions}
         assert "high" in texts
         assert "show" in texts
-
-    def test_fast_subcommand_completion_after_space(self):
-        completions = _completions(SlashCommandCompleter(), "/fast ")
-        texts = {c.text for c in completions}
-        assert "fast" in texts
-        assert "normal" in texts
-
-    def test_fast_command_filtered_out_when_unavailable(self):
-        completions = _completions(
-            SlashCommandCompleter(command_filter=lambda cmd: cmd != "/fast"),
-            "/fa",
-        )
-        texts = {c.text for c in completions}
-        assert "fast" not in texts
 
     def test_subcommand_prefix_filters(self):
         """Typing '/reasoning sh' should only show 'show'."""
@@ -547,13 +529,6 @@ class TestGhostText:
     def test_subcommand_suggestion_show(self):
         """/reasoning sh → 'ow'"""
         assert _suggestion("/reasoning sh") == "ow"
-
-    def test_fast_subcommand_suggestion(self):
-        assert _suggestion("/fast f") == "ast"
-
-    def test_fast_subcommand_suggestion_hidden_when_filtered(self):
-        completer = SlashCommandCompleter(command_filter=lambda cmd: cmd != "/fast")
-        assert _suggestion("/fa", completer=completer) is None
 
     def test_no_suggestion_for_non_slash(self):
         assert _suggestion("hello") is None

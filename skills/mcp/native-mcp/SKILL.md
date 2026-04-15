@@ -131,6 +131,31 @@ Examples:
 
 After discovery, MCP tools are automatically injected into all `hermes-*` platform toolsets (CLI, Discord, Telegram, etc.). This means MCP tools are available in every conversation without any additional configuration.
 
+### Startup / Operator Layering
+
+For startup, affiliate, or operator-heavy teams, treat MCP as a layered extension to Hermes instead of a flat "turn everything on" surface.
+
+Recommended layering:
+
+- `knowledge-core`
+  Documentation, internal knowledge bases, reference search, read-only retrieval
+- `growth-data`
+  Analytics, SEO datasets, ad reporting, attribution, dashboards
+- `bd-stack`
+  CRM, enrichment, outreach support, partner lookup
+- `finance-stack`
+  Reporting, reconciliation, bookkeeping exports, profitability analysis
+- `restricted`
+  High-risk or mutation-heavy systems that should stay tightly scoped
+
+Recommended discipline:
+
+- Give the CLI the broadest MCP surface because it has the richest supervision and debugging loop.
+- Keep messaging platforms on narrower allowlists; prefer built-in tools and only add the MCP servers they truly need.
+- Prefer `tools.include` before reaching for large `exclude` lists so the effective surface is explicit.
+- Only enable MCP resources or prompts when there is a clear recurring ROI; tool calls are usually the highest-value first step.
+- Keep browser automation, terminal execution, and other high-agency native tools first-class; use MCP to extend systems access, not to replace Hermes execution surfaces.
+
 ### Connection Lifecycle
 
 - Each server runs as a long-lived asyncio Task in a background daemon thread

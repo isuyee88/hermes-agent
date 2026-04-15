@@ -1,0 +1,41 @@
+{
+  "$schema": "https://developers.cloudflare.com/workers/wrangler/config-schema.json",
+  "name": "hermes-feishu-gateway",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-04-14",
+  "compatibility_flags": [
+    "nodejs_compat"
+  ],
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
+  },
+  "vars": {
+    "FEISHU_API_BASE": "https://open.feishu.cn",
+    "FEISHU_ACK_REACTION_EMOJI": "OK",
+    "MODAL_INTERNAL_BASE_URL": "https://isuyee88--hermes-agent-web-app.modal.run"
+  },
+  "workflows": [
+    {
+      "binding": "FEISHU_AGENT_WORKFLOW",
+      "name": "hermes-feishu-agent-workflow",
+      "class_name": "FeishuAgentWorkflow"
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "FEISHU_RECONCILE_QUEUE",
+        "class_name": "FeishuReconcileQueue"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": [
+        "FeishuReconcileQueue"
+      ]
+    }
+  ]
+}

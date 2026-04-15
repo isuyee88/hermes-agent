@@ -9,7 +9,9 @@ import tools.skills_tool as skills_tool_module
 from agent.skill_commands import (
     build_plan_path,
     build_preloaded_skills_prompt,
+    build_session_start_skills_message,
     build_skill_invocation_message,
+    get_configured_startup_skills,
     resolve_skill_command_key,
     scan_skill_commands,
 )
@@ -217,6 +219,37 @@ class TestBuildPreloadedSkillsPrompt:
         assert "present-skill" in prompt
         assert loaded == ["present-skill"]
         assert missing == ["missing-skill"]
+
+
+class TestConfiguredStartupSkills:
+    def test_merges_global_and_platform_startup_skills(self):
+        config = {
+            "skills": {
+                "startup": ["affiliate-os", "browser-ops"],
+                "platform_startup": {
+                    "cli": ["automation-os", "browser-ops"],
+                },
+            }
+        }
+
+        result = get_configured_startup_skills(config, platform="cli")
+
+        assert result == ["affiliate-os", "browser-ops", "automation-os"]
+
+    def test_session_start_message_loads_multiple_skills_once(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "affiliate-os")
+            _make_skill(tmp_path, "browser-ops")
+
+            message, loaded, missing = build_session_start_skills_message(
+                ["affiliate-os", "browser-ops", "affiliate-os"],
+                user_instruction="audit this flow",
+            )
+
+        assert missing == []
+        assert loaded == ["affiliate-os", "browser-ops"]
+        assert 'auto-loaded from configuration' in message
+        assert "audit this flow" in message
 
 
 class TestBuildSkillInvocationMessage:

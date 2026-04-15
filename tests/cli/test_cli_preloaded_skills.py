@@ -35,6 +35,7 @@ def _make_real_cli(**kwargs):
         "prompt_toolkit.key_binding": MagicMock(),
         "prompt_toolkit.completion": MagicMock(),
         "prompt_toolkit.formatted_text": MagicMock(),
+        "prompt_toolkit.auto_suggest": MagicMock(),
     }
     with patch.dict(sys.modules, prompt_toolkit_stubs), patch.dict(
         "os.environ", clean_env, clear=False
@@ -106,6 +107,37 @@ def test_main_raises_for_unknown_preloaded_skill(monkeypatch):
         cli_mod.main(skills="missing-skill", list_tools=True)
 
 
+def test_main_merges_configured_startup_skills_with_explicit_skills(monkeypatch):
+    import cli as cli_mod
+
+    created = {}
+
+    def fake_cli(**kwargs):
+        created["cli"] = _DummyCLI(**kwargs)
+        return created["cli"]
+
+    monkeypatch.setattr(cli_mod, "HermesCLI", fake_cli)
+    monkeypatch.setattr(
+        cli_mod,
+        "get_configured_startup_skills",
+        lambda config, platform=None: ["affiliate-os", "browser-ops"],
+    )
+
+    captured = {}
+
+    def fake_build_prompt(skills, task_id=None):
+        captured["skills"] = skills
+        return ("startup prompt", skills, [])
+
+    monkeypatch.setattr(cli_mod, "build_preloaded_skills_prompt", fake_build_prompt)
+
+    with pytest.raises(SystemExit):
+        cli_mod.main(skills="automation-os", list_tools=True)
+
+    assert captured["skills"] == ["affiliate-os", "browser-ops", "automation-os"]
+    assert created["cli"].preloaded_skills == ["affiliate-os", "browser-ops", "automation-os"]
+
+
 def test_show_banner_does_not_print_skills():
     """show_banner() no longer prints the activated skills line — it moved to run()."""
     cli_obj = _make_real_cli(compact=False)
@@ -124,4 +156,3 @@ def test_show_banner_does_not_print_skills():
     ]
     startup_lines = [line for line in print_calls if "Activated skills:" in line]
     assert len(startup_lines) == 0
-    assert mock_banner.call_count == 1

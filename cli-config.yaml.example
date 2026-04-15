@@ -24,7 +24,6 @@ model:
   #   "minimax"      - MiniMax global (requires: MINIMAX_API_KEY)
   #   "minimax-cn"   - MiniMax China (requires: MINIMAX_CN_API_KEY)
   #   "huggingface"  - Hugging Face Inference (requires: HF_TOKEN)
-  #   "xiaomi"       - Xiaomi MiMo (requires: XIAOMI_API_KEY)
   #   "kilocode"     - KiloCode gateway (requires: KILOCODE_API_KEY)
   #   "ai-gateway"   - Vercel AI Gateway (requires: AI_GATEWAY_API_KEY)
   #
@@ -48,25 +47,6 @@ model:
   # API configuration (falls back to OPENROUTER_API_KEY env var)
   # api_key: "your-key-here"  # Uncomment to set here instead of .env
   base_url: "https://openrouter.ai/api/v1"
-
-  # ── Token limits — two settings, easy to confuse ──────────────────────────
-  #
-  # context_length: TOTAL context window (input + output tokens combined).
-  #   Controls when Hermes compresses history and validates requests.
-  #   Leave unset — Hermes auto-detects the correct value from the provider.
-  #   Set manually only when auto-detection is wrong (e.g. a local server with
-  #   a custom num_ctx, or a proxy that doesn't expose /v1/models).
-  #
-  # context_length: 131072
-  #
-  # max_tokens: OUTPUT cap — maximum tokens the model may generate per response.
-  #   Unrelated to how long your conversation history can be.
-  #   The OpenAI-standard name "max_tokens" is a misnomer; Anthropic's native
-  #   API has since renamed it "max_output_tokens" for clarity.
-  #   Leave unset to use the model's native output ceiling (recommended).
-  #   Set only if you want to deliberately limit individual response length.
-  #
-  # max_tokens: 8192
 
 # =============================================================================
 # OpenRouter Provider Routing (only applies when using OpenRouter)
@@ -267,9 +247,22 @@ terminal:
 # Browser Tool Configuration
 # =============================================================================
 browser:
+  # Browser backend selection:
+  #   local        - local agent-browser / Chromium
+  #   browser-use  - Browser Use cloud
+  #   browserbase  - Browserbase cloud
+  #   firecrawl    - Firecrawl cloud browser
+  cloud_provider: "local"
   # Inactivity timeout in seconds - browser sessions are automatically closed
   # after this period of no activity between agent loops (default: 120 = 2 minutes)
   inactivity_timeout: 120
+  # Timeout for browser commands like navigate / snapshot / click
+  command_timeout: 30
+  # Allow localhost / RFC1918 URLs when you intentionally want browser tools
+  # to interact with private admin panels or local apps.
+  allow_private_urls: false
+  camofox:
+    managed_persistence: false
 
 # =============================================================================
 # Context Compression (Auto-shrinks long conversations)
@@ -309,8 +302,15 @@ compression:
   # compression of older turns.
   protect_last_n: 20
 
-  # To pin a specific model/provider for compression summaries, use the
-  # auxiliary section below (auxiliary.compression.provider / model).
+  # Model to use for generating summaries (fast/cheap recommended)
+  # This model compresses the middle turns into a concise summary.
+  # IMPORTANT: it receives the full middle section of the conversation, so it
+  # MUST support a context length at least as large as your main model's.
+  summary_model: "google/gemini-3-flash-preview"
+  
+  # Provider for the summary model (default: "auto")
+  # Options: "auto", "openrouter", "nous", "main"
+  # summary_provider: "auto"
 
 # =============================================================================
 # Auxiliary Models (Advanced — Experimental)
@@ -447,6 +447,18 @@ skills:
   # Set to 0 to disable.
   creation_nudge_interval: 15
 
+  # Skills to auto-load into every new session.
+  # Useful for giving Hermes a default operating system for your project.
+  # startup:
+  #   - affiliate-os
+  #   - browser-ops
+
+  # Platform-specific startup skills layered on top of the global startup list.
+  # platform_startup:
+  #   cli: [automation-os]
+  #   feishu: [feishu-workbench, affiliate-os, browser-ops]
+  #   api_server: [ship, gov]
+
   # External skill directories — share skills across tools/agents without
   # copying them into ~/.hermes/skills/.  Each path is expanded (~ and ${VAR})
   # and resolved to an absolute path.  External dirs are read-only: skill
@@ -455,6 +467,12 @@ skills:
   # external_dirs:
   #   - ~/.agents/skills
   #   - /home/shared/team-skills
+
+plugins:
+  # Enable repo-local plugins from ./.hermes/plugins/.
+  # Environment variable HERMES_ENABLE_PROJECT_PLUGINS=true still works too.
+  enable_project: false
+  disabled: []
 
 # =============================================================================
 # Agent Behavior
@@ -474,12 +492,6 @@ agent:
   # Fires once per run when inactivity reaches this threshold (seconds).
   # Set to 0 to disable the warning.
   # gateway_timeout_warning: 900
-
-  # Graceful drain timeout for gateway stop/restart (seconds).
-  # The gateway stops accepting new work, waits for in-flight agents to
-  # finish, then interrupts anything still running after this timeout.
-  # 0 = no drain, interrupt immediately.
-  # restart_drain_timeout: 60
   
   # Enable verbose logging
   verbose: false
@@ -491,6 +503,50 @@ agent:
   
   # Predefined personalities (use with /personality command)
   personalities:
+    board:
+      description: "董事长 / 投委会视角，聚焦方向、资源、风险与停损。"
+      system_prompt: >
+        你以互联网初创公司的董事长/投委会视角工作。先判断方向、资源配置、
+        关键风险和停止条件，再讨论执行细节。不要把忙碌误当成进展，也不要把
+        局部优化误当成战略。
+      tone: "克制、直接、结论先行"
+      style: "先给判断，再给依据，再给边界与下一步动作。"
+    ceo:
+      description: "CEO 主操盘人格，统筹目标、优先级、推进与结果。"
+      system_prompt: >
+        你以互联网初创公司 CEO 视角工作。目标是用最少资源形成产品、增长、
+        交付闭环。优先聚焦目标、优先级、依赖、推进节奏和结果，不把问题推给
+        抽象理论。
+      tone: "清晰、稳健、偏经营与执行并重"
+      style: "把复杂问题收敛成目标、负责人、风险、节奏和可执行动作。"
+    grow:
+      description: "增长型人格，聚焦分发、转化、留存与用户感知。"
+      system_prompt: >
+        你以增长负责人视角工作。优先考虑分发、转化、留存、包装、用户感知和
+        实验设计。默认寻找低成本验证路径，让产品更容易被看见、被理解、被使用。
+      tone: "敏锐、结果导向、偏实验"
+      style: "优先给出假设、实验、指标、风险和复盘方式。"
+    cto:
+      description: "技术交付人格，聚焦实现、性能、稳定性、成本与回归。"
+      system_prompt: >
+        你以技术负责人视角工作。优先保证实现正确、性能可测、稳定可证、成本
+        可控、回归完整。不要用猜测替代证据，不要用花哨设计掩盖系统边界。
+      tone: "严谨、证据驱动、务实"
+      style: "先定位事实，再给方案，再给验证与风险。"
+    staff:
+      description: "参谋长人格，负责整理上下文、对齐信息、推动闭环。"
+      system_prompt: >
+        你以参谋长/运营中枢视角工作。负责整合上下文、对齐信息、形成行动项、
+        跟进闭环，让多人协作中的信息摩擦降到最低。
+      tone: "结构化、冷静、面向协同"
+      style: "先汇总共识和分歧，再列行动项、责任和时序。"
+    sev:
+      description: "事故指挥人格，优先止血、分诊、降级、恢复与复盘。"
+      system_prompt: >
+        你以事故指挥官视角工作。面对故障、超时、异常成本或线上回退时，优先
+        止血、分诊、降级、恢复与复盘，而不是展开冗长讨论。
+      tone: "简短、硬约束、面向恢复"
+      style: "按现象、影响、止血、根因、后续动作输出。"
     helpful: "You are a helpful, friendly AI assistant."
     concise: "You are a concise assistant. Keep responses brief and to the point."
     technical: "You are a technical expert. Provide detailed, accurate technical information."
@@ -543,6 +599,12 @@ agent:
 #   platform_toolsets:
 #     discord: [web, vision, skills, todo]
 #
+#   # Affiliate startup example:
+#   platform_toolsets:
+#     cli: [founder-max, feishu]
+#     feishu: [collab-safe, feishu]
+#     api_server: [cto-max]
+#
 # If not set, defaults are:
 #   cli:           hermes-cli            (everything + cronjob management)
 #   telegram:      hermes-telegram       (terminal, file, web, vision, image, tts, browser, skills, todo, cronjob, messaging)
@@ -575,14 +637,16 @@ platform_toolsets:
 #   file         - read_file, write_file, patch, search
 #   browser      - browser_navigate, browser_snapshot, browser_click, browser_type,
 #                  browser_scroll, browser_back, browser_press,
-#                  browser_get_images, browser_vision  (requires BROWSERBASE_API_KEY)
+#                  browser_get_images, browser_vision
+#                  Supports local agent-browser, Browser Use, Browserbase,
+#                  Firecrawl, or Camofox
 #   vision       - vision_analyze  (requires OPENROUTER_API_KEY)
 #   image_gen    - image_generate  (requires FAL_KEY)
 #   skills       - skills_list, skill_view
 #   skills_hub   - skill_hub (search/install/manage from online registries — user-driven only)
 #   moa          - mixture_of_agents  (requires OPENROUTER_API_KEY)
 #   todo         - todo (in-memory task planning, no deps)
-#   tts          - text_to_speech  (Edge TTS free, or ELEVENLABS/OPENAI/MINIMAX/MISTRAL key)
+#   tts          - text_to_speech  (Edge TTS free, or ELEVENLABS/OPENAI/MINIMAX key)
 #   cronjob      - cronjob (create/list/update/pause/resume/run/remove scheduled tasks)
 #   rl           - rl_list_environments, rl_start_training, etc. (requires TINKER_API_KEY)
 #
@@ -597,6 +661,16 @@ platform_toolsets:
 # COMPOSITE:
 #   debugging    - terminal + web + file
 #   safe         - web + vision + moa (no terminal access)
+#   founder-max  - affiliate founder / CEO high-agency toolkit with browser-first execution
+#   growth-max   - growth operator toolkit for research, funnel walkthroughs, and creative iteration
+#   content-max  - content operator toolkit for editorial research, repurposing, and visual QA
+#   seo-max      - SEO toolkit for SERP research, site inspection, and on-page review
+#   ads-max      - paid acquisition toolkit for funnel diagnosis and creative testing
+#   bd-max       - partner / business-development toolkit with outreach coordination
+#   ops-max      - operations toolkit with browser workflows, messaging, and cronjob loops
+#   finance-max  - finance toolkit with file + code execution for analysis and reconciliation
+#   cto-max      - technical leadership toolkit with founder-max + debugging
+#   collab-safe  - messaging-safe high-capability bundle with browser, no terminal or file mutation
 #   all          - Everything available
 #
 #   web          - Web search and content extraction (web_search, web_extract)
@@ -611,7 +685,7 @@ platform_toolsets:
 #   todo         - Task planning and tracking for multi-step work
 #   memory       - Persistent memory across sessions (personal notes + user profile)
 #   session_search - Search and recall past conversations (FTS5 + Gemini Flash summarization)
-#   tts          - Text-to-speech (Edge TTS free, ElevenLabs, OpenAI, MiniMax, Mistral)
+#   tts          - Text-to-speech (Edge TTS free, ElevenLabs, OpenAI, MiniMax)
 #   cronjob      - Schedule and manage automated tasks (CLI-only)
 #   rl           - RL training tools (Tinker-Atropos)
 #
@@ -646,6 +720,19 @@ platform_toolsets:
 #   connect_timeout: initial connection timeout (default: 60)
 #
 # mcp_servers:
+#   # Startup / operator layering example:
+#   # knowledge-core:
+#   #   command: npx
+#   #   args: ["-y", "@acme/docs-mcp"]
+#   # growth-data:
+#   #   command: npx
+#   #   args: ["-y", "@acme/analytics-mcp"]
+#   # bd-stack:
+#   #   command: npx
+#   #   args: ["-y", "@acme/crm-mcp"]
+#   # finance-stack:
+#   #   command: npx
+#   #   args: ["-y", "@acme/finance-mcp"]
 #   time:
 #     command: uvx
 #     args: ["mcp-server-time"]
@@ -684,11 +771,7 @@ platform_toolsets:
 stt:
   enabled: true
   # provider: "local"          # auto-detected if omitted
-  local:
-    model: "base"              # tiny | base | small | medium | large-v3 | turbo
-    # language: ""             # auto-detect; set to "en", "es", "fr", etc. to force
-  openai:
-    model: "whisper-1"         # whisper-1 | gpt-4o-mini-transcribe | gpt-4o-transcribe
+  model: "whisper-1"  # whisper-1 (cheapest) | gpt-4o-mini-transcribe | gpt-4o-transcribe
   # mistral:
   #   model: "voxtral-mini-latest"  # voxtral-mini-latest | voxtral-mini-2602
 
@@ -767,11 +850,6 @@ display:
   # Toggle at runtime with /verbose in the CLI
   tool_progress: all
 
-  # Gateway-only natural mid-turn assistant updates.
-  # When true, completed assistant status messages are sent as separate chat
-  # messages. This is independent of tool_progress and gateway streaming.
-  interim_assistant_messages: true
-
   # What Enter does when Hermes is already busy in the CLI.
   #   interrupt: Interrupt the current run and redirect Hermes (default)
   #   queue:     Queue your message for the next turn
@@ -780,7 +858,7 @@ display:
 
   # Background process notifications (gateway/messaging only).
   # Controls how chatty the process watcher is when you use
-  # terminal(background=true, notify_on_complete=true) from Telegram/Discord/etc.
+  # terminal(background=true, check_interval=...) from Telegram/Discord/etc.
   #   off:     No watcher messages at all
   #   result:  Only the final completion message
   #   error:   Only the final message when exit code != 0

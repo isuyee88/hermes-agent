@@ -58,6 +58,14 @@ _HERMES_CORE_TOOLS = [
     "cronjob",
     # Cross-platform messaging (gated on gateway running via check_fn)
     "send_message",
+    # Feishu/Lark collaboration APIs (gated on FEISHU_APP_ID / FEISHU_APP_SECRET)
+    "feishu_doc_create", "feishu_doc_get", "feishu_doc_append_markdown", "feishu_doc_replace_markdown",
+    "feishu_lookup_user", "feishu_sheet_create", "feishu_sheet_read_range",
+    "feishu_sheet_write_range", "feishu_bitable_get_schema",
+    "feishu_bitable_list_records", "feishu_bitable_upsert_records",
+    "feishu_message_send", "feishu_chat_lookup", "feishu_file_upload",
+    "feishu_file_send", "feishu_file_download",
+    "feishu_model_registry_sync", "feishu_model_registry_prepare_bitable", "feishu_model_registry_publish_card",
     # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
     "ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service",
 ]
@@ -131,6 +139,20 @@ TOOLSETS = {
         "tools": ["send_message"],
         "includes": []
     },
+
+    "feishu": {
+        "description": "Feishu/Lark collaboration tools for docs, sheets, bitable, messaging, files, and model registry operations",
+        "tools": [
+            "feishu_doc_create", "feishu_doc_get", "feishu_doc_append_markdown", "feishu_doc_replace_markdown",
+            "feishu_lookup_user", "feishu_sheet_create", "feishu_sheet_read_range",
+            "feishu_sheet_write_range", "feishu_bitable_get_schema",
+            "feishu_bitable_list_records", "feishu_bitable_upsert_records",
+            "feishu_message_send", "feishu_chat_lookup", "feishu_file_upload",
+            "feishu_file_send", "feishu_file_download",
+            "feishu_model_registry_sync", "feishu_model_registry_prepare_bitable", "feishu_model_registry_publish_card",
+        ],
+        "includes": []
+    },
     
     "rl": {
         "description": "RL training tools for running reinforcement learning on Tinker-Atropos",
@@ -199,6 +221,96 @@ TOOLSETS = {
         "description": "Home Assistant smart home control and monitoring",
         "tools": ["ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service"],
         "includes": []
+    },
+
+    # Affiliate startup operating presets
+    "founder-max": {
+        "description": "Founder / CEO high-agency toolkit with browser-first execution, automation, and cross-functional planning",
+        "tools": [],
+        "includes": [
+            "web", "browser", "terminal", "file", "code_execution",
+            "vision", "image_gen", "skills", "todo", "memory",
+            "session_search", "clarify", "delegation", "cronjob",
+            "messaging",
+        ],
+    },
+
+    "growth-max": {
+        "description": "Growth operator preset for channel analysis, landing-page debugging, creative iteration, and conversion experiments",
+        "tools": [],
+        "includes": [
+            "web", "browser", "vision", "image_gen", "skills",
+            "todo", "memory", "session_search", "clarify", "messaging",
+        ],
+    },
+
+    "content-max": {
+        "description": "Content and social preset for research, page walkthroughs, visual QA, and creative production",
+        "tools": [],
+        "includes": [
+            "web", "browser", "vision", "image_gen",
+            "skills", "memory", "session_search", "clarify",
+        ],
+    },
+
+    "seo-max": {
+        "description": "SEO preset for SERP research, on-page review, site inspection, and workflow memory",
+        "tools": [],
+        "includes": [
+            "web", "browser", "file", "skills",
+            "todo", "memory", "session_search", "clarify",
+        ],
+    },
+
+    "ads-max": {
+        "description": "Paid acquisition preset for funnel inspection, creative review, and campaign iteration",
+        "tools": [],
+        "includes": [
+            "web", "browser", "vision", "image_gen",
+            "skills", "todo", "memory", "session_search", "clarify",
+        ],
+    },
+
+    "bd-max": {
+        "description": "Business development preset for partner research, outreach preparation, and follow-up coordination",
+        "tools": [],
+        "includes": [
+            "web", "browser", "skills", "todo",
+            "memory", "session_search", "clarify", "messaging",
+        ],
+    },
+
+    "ops-max": {
+        "description": "Operations preset for publishing, handoffs, scheduling, and lightweight execution loops",
+        "tools": [],
+        "includes": [
+            "web", "browser", "skills", "todo", "memory",
+            "session_search", "clarify", "messaging", "cronjob",
+        ],
+    },
+
+    "finance-max": {
+        "description": "Finance and profitability preset for reporting, reconciliation, lightweight analysis, and budget governance",
+        "tools": [],
+        "includes": [
+            "web", "file", "code_execution", "skills",
+            "todo", "memory", "session_search", "clarify",
+        ],
+    },
+
+    "cto-max": {
+        "description": "Technical leadership preset for implementation, debugging, browser-based verification, and cost-aware delivery",
+        "tools": [],
+        "includes": ["founder-max", "debugging"],
+    },
+
+    "collab-safe": {
+        "description": "High-capability collaboration preset for messaging surfaces: browser-first, no terminal or file mutation",
+        "tools": [],
+        "includes": [
+            "web", "browser", "vision", "skills",
+            "todo", "memory", "session_search", "clarify", "messaging",
+        ],
     },
 
 
@@ -286,6 +398,12 @@ TOOLSETS = {
         "tools": _HERMES_CORE_TOOLS,
         "includes": []
     },
+
+    "hermes-qq": {
+        "description": "QQ official bot toolset - webhook-first QQ messaging access",
+        "tools": _HERMES_CORE_TOOLS,
+        "includes": []
+    },
     
     "hermes-discord": {
         "description": "Discord bot toolset - full access (terminal has safety checks via dangerous command approval)",
@@ -353,20 +471,8 @@ TOOLSETS = {
         "includes": []
     },
 
-    "hermes-weixin": {
-        "description": "Weixin bot toolset - personal WeChat messaging via iLink (full access)",
-        "tools": _HERMES_CORE_TOOLS,
-        "includes": []
-    },
-
     "hermes-wecom": {
         "description": "WeCom bot toolset - enterprise WeChat messaging (full access)",
-        "tools": _HERMES_CORE_TOOLS,
-        "includes": []
-    },
-
-    "hermes-wecom-callback": {
-        "description": "WeCom callback toolset - enterprise self-built app messaging (full access)",
         "tools": _HERMES_CORE_TOOLS,
         "includes": []
     },
@@ -386,7 +492,7 @@ TOOLSETS = {
     "hermes-gateway": {
         "description": "Gateway toolset - union of all messaging platform tools",
         "tools": [],
-        "includes": ["hermes-telegram", "hermes-discord", "hermes-whatsapp", "hermes-slack", "hermes-signal", "hermes-bluebubbles", "hermes-homeassistant", "hermes-email", "hermes-sms", "hermes-mattermost", "hermes-matrix", "hermes-dingtalk", "hermes-feishu", "hermes-wecom", "hermes-wecom-callback", "hermes-weixin", "hermes-webhook"]
+        "includes": ["hermes-telegram", "hermes-qq", "hermes-discord", "hermes-whatsapp", "hermes-slack", "hermes-signal", "hermes-bluebubbles", "hermes-homeassistant", "hermes-email", "hermes-sms", "hermes-mattermost", "hermes-matrix", "hermes-dingtalk", "hermes-feishu", "hermes-wecom", "hermes-webhook"]
     }
 }
 
@@ -449,7 +555,7 @@ def resolve_toolset(name: str, visited: Set[str] = None) -> List[str]:
         if name in _get_plugin_toolset_names():
             try:
                 from tools.registry import registry
-                return [e.name for e in registry._tools.values() if e.toolset == name]
+                return registry.get_tool_names_for_toolset(name)
             except Exception:
                 pass
         return []
@@ -495,9 +601,9 @@ def _get_plugin_toolset_names() -> Set[str]:
     try:
         from tools.registry import registry
         return {
-            entry.toolset
-            for entry in registry._tools.values()
-            if entry.toolset not in TOOLSETS
+            toolset_name
+            for toolset_name in registry.get_registered_toolset_names()
+            if toolset_name not in TOOLSETS
         }
     except Exception:
         return set()
@@ -518,10 +624,11 @@ def get_all_toolsets() -> Dict[str, Dict[str, Any]]:
         if ts_name not in result:
             try:
                 from tools.registry import registry
-                tools = [e.name for e in registry._tools.values() if e.toolset == ts_name]
+                tools = registry.get_tool_names_for_toolset(ts_name)
                 result[ts_name] = {
                     "description": f"Plugin toolset: {ts_name}",
                     "tools": tools,
+                    "includes": [],
                 }
             except Exception:
                 pass

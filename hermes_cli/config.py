@@ -32,25 +32,19 @@ _ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _EXTRA_ENV_KEYS = frozenset({
     "OPENAI_API_KEY", "OPENAI_BASE_URL",
     "ANTHROPIC_API_KEY", "ANTHROPIC_TOKEN",
+    "AUXILIARY_VISION_MODEL",
     "DISCORD_HOME_CHANNEL", "TELEGRAM_HOME_CHANNEL",
     "SIGNAL_ACCOUNT", "SIGNAL_HTTP_URL",
     "SIGNAL_ALLOWED_USERS", "SIGNAL_GROUP_ALLOWED_USERS",
     "DINGTALK_CLIENT_ID", "DINGTALK_CLIENT_SECRET",
     "FEISHU_APP_ID", "FEISHU_APP_SECRET", "FEISHU_ENCRYPT_KEY", "FEISHU_VERIFICATION_TOKEN",
     "WECOM_BOT_ID", "WECOM_SECRET",
-    "WECOM_CALLBACK_CORP_ID", "WECOM_CALLBACK_CORP_SECRET", "WECOM_CALLBACK_AGENT_ID",
-    "WECOM_CALLBACK_TOKEN", "WECOM_CALLBACK_ENCODING_AES_KEY",
-    "WECOM_CALLBACK_HOST", "WECOM_CALLBACK_PORT",
-    "WEIXIN_ACCOUNT_ID", "WEIXIN_TOKEN", "WEIXIN_BASE_URL", "WEIXIN_CDN_BASE_URL",
-    "WEIXIN_HOME_CHANNEL", "WEIXIN_HOME_CHANNEL_NAME", "WEIXIN_DM_POLICY", "WEIXIN_GROUP_POLICY",
-    "WEIXIN_ALLOWED_USERS", "WEIXIN_GROUP_ALLOWED_USERS", "WEIXIN_ALLOW_ALL_USERS",
     "BLUEBUBBLES_SERVER_URL", "BLUEBUBBLES_PASSWORD",
     "TERMINAL_ENV", "TERMINAL_SSH_KEY", "TERMINAL_SSH_PORT",
     "WHATSAPP_MODE", "WHATSAPP_ENABLED",
     "MATTERMOST_HOME_CHANNEL", "MATTERMOST_REPLY_MODE",
     "MATRIX_PASSWORD", "MATRIX_ENCRYPTION", "MATRIX_DEVICE_ID", "MATRIX_HOME_ROOM",
     "MATRIX_REQUIRE_MENTION", "MATRIX_FREE_RESPONSE_ROOMS", "MATRIX_AUTO_THREAD",
-    "MATRIX_RECOVERY_KEY",
 })
 import yaml
 
@@ -145,55 +139,6 @@ def managed_error(action: str = "modify configuration"):
 
 
 # =============================================================================
-# Container-aware CLI (NixOS container mode)
-# =============================================================================
-
-def get_container_exec_info() -> Optional[dict]:
-    """Read container mode metadata from HERMES_HOME/.container-mode.
-
-    Returns a dict with keys: backend, container_name, exec_user, hermes_bin
-    or None if container mode is not active, we're already inside the
-    container, or HERMES_DEV=1 is set.
-
-    The .container-mode file is written by the NixOS activation script when
-    container.enable = true. It tells the host CLI to exec into the container
-    instead of running locally.
-    """
-    if os.environ.get("HERMES_DEV") == "1":
-        return None
-
-    from hermes_constants import is_container
-    if is_container():
-        return None
-
-    container_mode_file = get_hermes_home() / ".container-mode"
-
-    try:
-        info = {}
-        with open(container_mode_file, "r") as f:
-            for line in f:
-                line = line.strip()
-                if "=" in line and not line.startswith("#"):
-                    key, _, value = line.partition("=")
-                    info[key.strip()] = value.strip()
-    except FileNotFoundError:
-        return None
-    # All other exceptions (PermissionError, malformed data, etc.) propagate
-
-    backend = info.get("backend", "docker")
-    container_name = info.get("container_name", "hermes-agent")
-    exec_user = info.get("exec_user", "hermes")
-    hermes_bin = info.get("hermes_bin", "/data/current-package/bin/hermes")
-
-    return {
-        "backend": backend,
-        "container_name": container_name,
-        "exec_user": exec_user,
-        "hermes_bin": hermes_bin,
-    }
-
-
-# =============================================================================
 # Config paths
 # =============================================================================
 
@@ -213,27 +158,16 @@ def get_project_root() -> Path:
     return Path(__file__).parent.parent.resolve()
 
 def _secure_dir(path):
-    """Set directory to owner-only access (0700 by default). No-op on Windows.
+    """Set directory to owner-only access (0700). No-op on Windows.
 
     Skipped in managed mode — the NixOS module sets group-readable
     permissions (0750) so interactive users in the hermes group can
     share state with the gateway service.
-
-    The mode can be overridden via the HERMES_HOME_MODE environment variable
-    (e.g. HERMES_HOME_MODE=0701) for deployments where a web server (nginx,
-    caddy, etc.) needs to traverse HERMES_HOME to reach a served subdirectory.
-    The execute-only bit on a directory permits cd-through without exposing
-    directory listings.
     """
     if is_managed():
         return
     try:
-        mode_str = os.environ.get("HERMES_HOME_MODE", "").strip()
-        mode = int(mode_str, 8) if mode_str else 0o700
-    except ValueError:
-        mode = 0o700
-    try:
-        os.chmod(path, mode)
+        os.chmod(path, 0o700)
     except (OSError, NotImplementedError):
         pass
 
@@ -263,44 +197,14 @@ def _ensure_default_soul_md(home: Path) -> None:
 
 
 def ensure_hermes_home():
-    """Ensure ~/.hermes directory structure exists with secure permissions.
-
-    In managed mode (NixOS), dirs are created by the activation script with
-    setgid + group-writable (2770). We skip mkdir and set umask(0o007) so
-    any files created (e.g. SOUL.md) are group-writable (0660).
-    """
+    """Ensure ~/.hermes directory structure exists with secure permissions."""
     home = get_hermes_home()
-    if is_managed():
-        old_umask = os.umask(0o007)
-        try:
-            _ensure_hermes_home_managed(home)
-        finally:
-            os.umask(old_umask)
-    else:
-        home.mkdir(parents=True, exist_ok=True)
-        _secure_dir(home)
-        for subdir in ("cron", "sessions", "logs", "memories"):
-            d = home / subdir
-            d.mkdir(parents=True, exist_ok=True)
-            _secure_dir(d)
-        _ensure_default_soul_md(home)
-
-
-def _ensure_hermes_home_managed(home: Path):
-    """Managed-mode variant: verify dirs exist (activation creates them), seed SOUL.md."""
-    if not home.is_dir():
-        raise RuntimeError(
-            f"HERMES_HOME {home} does not exist. "
-            "Run 'sudo nixos-rebuild switch' first."
-        )
+    home.mkdir(parents=True, exist_ok=True)
+    _secure_dir(home)
     for subdir in ("cron", "sessions", "logs", "memories"):
         d = home / subdir
-        if not d.is_dir():
-            raise RuntimeError(
-                f"{d} does not exist. "
-                "Run 'sudo nixos-rebuild switch' first."
-            )
-    # Inside umask(0o007) scope — SOUL.md will be created as 0660
+        d.mkdir(parents=True, exist_ok=True)
+        _secure_dir(d)
     _ensure_default_soul_md(home)
 
 
@@ -321,12 +225,6 @@ DEFAULT_CONFIG = {
         # tools or receiving API responses.  Only fires when the agent has
         # been completely idle for this duration.  0 = unlimited.
         "gateway_timeout": 1800,
-        # Graceful drain timeout for gateway stop/restart (seconds).
-        # The gateway stops accepting new work, waits for running agents
-        # to finish, then interrupts any remaining runs after the timeout.
-        # 0 = no drain, interrupt immediately.
-        "restart_drain_timeout": 60,
-        "service_tier": "",
         # Tool-use enforcement: injects system prompt guidance that tells the
         # model to actually call tools instead of describing intended actions.
         # Values: "auto" (default — applies to gpt/codex models), true/false
@@ -337,10 +235,126 @@ DEFAULT_CONFIG = {
         # threshold before escalating to a full timeout.  The warning fires
         # once per run and does not interrupt the agent.  0 = disable warning.
         "gateway_timeout_warning": 900,
-        # Periodic "still working" notification interval (seconds).
-        # Sends a status message every N seconds so the user knows the
-        # agent hasn't died during long tasks.  0 = disable notifications.
-        "gateway_notify_interval": 600,
+        # Organization operating-system personalities for /personality switching.
+        "personalities": {
+            "board": {
+                "description": "董事长 / 投委会视角，聚焦方向、资源、风险与停损。",
+                "system_prompt": (
+                    "你以互联网初创公司的董事长/投委会视角工作。先判断方向、"
+                    "资源配置、关键风险和停止条件，再讨论执行细节。不要把忙碌"
+                    "误当成进展，也不要把局部优化误当成战略。"
+                ),
+                "tone": "克制、直接、结论先行",
+                "style": "先给判断，再给依据，再给边界与下一步动作。",
+            },
+            "ceo": {
+                "description": "CEO 主操盘人格，统筹目标、优先级、推进与结果。",
+                "system_prompt": (
+                    "你以互联网初创公司 CEO 视角工作。目标是用最少资源形成"
+                    "产品、增长、交付闭环。优先聚焦目标、优先级、依赖、推进"
+                    "节奏和结果，不把问题推给抽象理论。"
+                ),
+                "tone": "清晰、稳健、偏经营与执行并重",
+                "style": "把复杂问题收敛成目标、负责人、风险、节奏和可执行动作。",
+            },
+            "grow": {
+                "description": "增长型人格，聚焦分发、转化、留存与用户感知。",
+                "system_prompt": (
+                    "你以增长负责人视角工作。优先考虑分发、转化、留存、包装、"
+                    "用户感知和实验设计。默认寻找低成本验证路径，让产品更容易"
+                    "被看见、被理解、被使用。"
+                ),
+                "tone": "敏锐、结果导向、偏实验",
+                "style": "优先给出假设、实验、指标、风险和复盘方式。",
+            },
+            "content": {
+                "description": "Content operator for editorial strategy, repurposing, distribution, and audience clarity.",
+                "system_prompt": (
+                    "You work like a content lead for an affiliate startup. Turn product, market, and campaign context "
+                    "into publishable assets, editorial systems, and reusable distribution plans. Focus on clarity, "
+                    "angles, hooks, narrative structure, and repurposing across channels."
+                ),
+                "tone": "clear, editorial, audience-aware",
+                "style": "Start with audience and angle, then outline assets, distribution, and reuse opportunities.",
+            },
+            "seo": {
+                "description": "SEO operator for keyword clusters, SERP intent, on-page structure, and search defensibility.",
+                "system_prompt": (
+                    "You work like an SEO lead for an affiliate startup. Prioritize search intent, keyword clustering, "
+                    "page structure, internal linking, and competitive gaps. Recommend the smallest high-leverage SEO "
+                    "moves before broader content expansion."
+                ),
+                "tone": "structured, evidence-driven, search-focused",
+                "style": "Lead with search intent and opportunity size, then give page structure, risks, and next actions.",
+            },
+            "ads": {
+                "description": "Paid acquisition operator for creative testing, funnel review, budget pacing, and ROAS discipline.",
+                "system_prompt": (
+                    "You work like a paid acquisition lead for an affiliate startup. Focus on creative testing velocity, "
+                    "landing-page friction, spend efficiency, and signal quality. Prefer low-cost validation loops over "
+                    "large speculative budget shifts."
+                ),
+                "tone": "practical, metric-driven, experimental",
+                "style": "Frame problems as hypotheses, tests, budget implications, and success metrics.",
+            },
+            "bd": {
+                "description": "Business development operator for partner sourcing, outreach, negotiation, and follow-up discipline.",
+                "system_prompt": (
+                    "You work like a business development lead for an affiliate startup. Focus on partner fit, outreach "
+                    "quality, offer positioning, objections, and follow-up sequencing. Always turn vague relationship "
+                    "ideas into concrete next-touch plans."
+                ),
+                "tone": "concise, commercial, relationship-aware",
+                "style": "Start with target partner fit, then outreach angle, offer, objections, and follow-up cadence.",
+            },
+            "ops": {
+                "description": "Operations operator for scheduling, handoffs, SOPs, publishing flow, and execution hygiene.",
+                "system_prompt": (
+                    "You work like an operations lead for an affiliate startup. Reduce coordination drag, make handoffs "
+                    "explicit, and turn messy work into repeatable checklists. Prefer simple operating rhythms over complex process."
+                ),
+                "tone": "organized, calm, execution-oriented",
+                "style": "Convert ambiguity into owners, deadlines, checklists, and visible completion criteria.",
+            },
+            "finance": {
+                "description": "Finance operator for profitability, ROI, cash discipline, reconciliation, and spend prioritization.",
+                "system_prompt": (
+                    "You work like a finance lead for an affiliate startup. Focus on contribution margin, payout quality, "
+                    "cash timing, budget discipline, and unit economics. Push back on activity that consumes spend without "
+                    "clear evidence of return."
+                ),
+                "tone": "measured, analytical, capital-aware",
+                "style": "Lead with financial signal, then diagnose leakage, tradeoffs, and the minimum corrective action.",
+            },
+            "cto": {
+                "description": "技术交付人格，聚焦实现、性能、稳定性、成本与回归。",
+                "system_prompt": (
+                    "你以技术负责人视角工作。优先保证实现正确、性能可测、稳定"
+                    "可证、成本可控、回归完整。不要用猜测替代证据，不要用花哨"
+                    "设计掩盖系统边界。"
+                ),
+                "tone": "严谨、证据驱动、务实",
+                "style": "先定位事实，再给方案，再给验证与风险。",
+            },
+            "staff": {
+                "description": "参谋长人格，负责整理上下文、对齐信息、推动闭环。",
+                "system_prompt": (
+                    "你以参谋长/运营中枢视角工作。负责整合上下文、对齐信息、"
+                    "形成行动项、跟进闭环，让多人协作中的信息摩擦降到最低。"
+                ),
+                "tone": "结构化、冷静、面向协同",
+                "style": "先汇总共识和分歧，再列行动项、责任和时序。",
+            },
+            "sev": {
+                "description": "事故指挥人格，优先止血、分诊、降级、恢复与复盘。",
+                "system_prompt": (
+                    "你以事故指挥官视角工作。面对故障、超时、异常成本或线上回退"
+                    "时，优先止血、分诊、降级、恢复与复盘，而不是展开冗长讨论。"
+                ),
+                "tone": "简短、硬约束、面向恢复",
+                "style": "按现象、影响、止血、根因、后续动作输出。",
+            },
+        },
     },
     
     "terminal": {
@@ -383,6 +397,7 @@ DEFAULT_CONFIG = {
     },
     
     "browser": {
+        "cloud_provider": "local",  # local | browser-use | browserbase | firecrawl
         "inactivity_timeout": 120,
         "command_timeout": 30,  # Timeout for browser commands in seconds (screenshot, navigate, etc.)
         "record_sessions": False,  # Auto-record browser sessions as WebM videos
@@ -414,13 +429,9 @@ DEFAULT_CONFIG = {
         "threshold": 0.50,            # compress when context usage exceeds this ratio
         "target_ratio": 0.20,         # fraction of threshold to preserve as recent tail
         "protect_last_n": 20,         # minimum recent messages to keep uncompressed
-
-    },
-    "smart_model_routing": {
-        "enabled": False,
-        "max_simple_chars": 160,
-        "max_simple_words": 28,
-        "cheap_model": {},
+        "summary_model": "",          # empty = use main configured model
+        "summary_provider": "auto",
+        "summary_base_url": None,
     },
     
     # Auxiliary model config — provider:model for each side task.
@@ -435,7 +446,7 @@ DEFAULT_CONFIG = {
             "model": "",           # e.g. "google/gemini-2.5-flash", "gpt-4o"
             "base_url": "",        # direct OpenAI-compatible endpoint (takes precedence over provider)
             "api_key": "",         # API key for base_url (falls back to OPENAI_API_KEY)
-            "timeout": 120,        # seconds — LLM API call timeout; vision payloads need generous timeout
+            "timeout": 30,         # seconds — LLM API call timeout; increase for slow local vision models
             "download_timeout": 30,  # seconds — image HTTP download timeout; increase for slow connections
         },
         "web_extract": {
@@ -500,11 +511,9 @@ DEFAULT_CONFIG = {
         "inline_diffs": True,     # Show inline diff previews for write actions (write_file, patch, skill_manage)
         "show_cost": False,       # Show $ cost in the status bar (off by default)
         "skin": "default",
-        "interim_assistant_messages": True,  # Gateway: show natural mid-turn assistant status messages
         "tool_progress_command": False,  # Enable /verbose command in messaging gateway
-        "tool_progress_overrides": {},  # DEPRECATED — use display.platforms instead
+        "tool_progress_overrides": {},  # Per-platform overrides: {"signal": "off", "telegram": "all"}
         "tool_preview_length": 0,  # Max chars for tool call previews (0 = no limit, show full paths/commands)
-        "platforms": {},  # Per-platform display overrides: {"telegram": {"tool_progress": "all"}, "slack": {"tool_progress": "off"}}
     },
 
     # Privacy settings
@@ -514,7 +523,7 @@ DEFAULT_CONFIG = {
     
     # Text-to-speech configuration
     "tts": {
-        "provider": "edge",  # "edge" (free) | "elevenlabs" (premium) | "openai" | "minimax" | "mistral" | "neutts" (local)
+        "provider": "edge",  # "edge" (free) | "elevenlabs" (premium) | "openai" | "neutts" (local)
         "edge": {
             "voice": "en-US-AriaNeural",
             # Popular: AriaNeural, JennyNeural, AndrewNeural, BrianNeural, SoniaNeural
@@ -527,10 +536,6 @@ DEFAULT_CONFIG = {
             "model": "gpt-4o-mini-tts",
             "voice": "alloy",
             # Voices: alloy, echo, fable, onyx, nova, shimmer
-        },
-        "mistral": {
-            "model": "voxtral-mini-tts-2603",
-            "voice_id": "c69964a6-ab8b-4f8a-9465-ec0925096ec8",  # Paul - Neutral
         },
         "neutts": {
             "ref_audio": "",  # Path to reference voice audio (empty = bundled default)
@@ -569,16 +574,6 @@ DEFAULT_CONFIG = {
         "max_ms": 2500,
     },
     
-    # Context engine -- controls how the context window is managed when
-    # approaching the model's token limit.
-    # "compressor" = built-in lossy summarization (default).
-    # Set to a plugin name to activate an alternative engine (e.g. "lcm"
-    # for Lossless Context Management).  The engine must be installed as
-    # a plugin in plugins/context_engine/<name>/ or ~/.hermes/plugins/.
-    "context": {
-        "engine": "compressor",
-    },
-
     # Persistent memory -- bounded curated memory injected into system prompt
     "memory": {
         "memory_enabled": True,
@@ -603,8 +598,6 @@ DEFAULT_CONFIG = {
         "api_key": "",     # API key for delegation.base_url (falls back to OPENAI_API_KEY)
         "max_iterations": 50,  # per-subagent iteration cap (each subagent gets its own budget,
                                # independent of the parent's max_iterations)
-        "reasoning_effort": "",  # reasoning effort for subagents: "xhigh", "high", "medium",
-                                 # "low", "minimal", "none" (empty = inherit parent's level)
     },
 
     # Ephemeral prefill messages file — JSON list of {role, content} dicts
@@ -617,6 +610,13 @@ DEFAULT_CONFIG = {
     # always goes to ~/.hermes/skills/.
     "skills": {
         "external_dirs": [],   # e.g. ["~/.agents/skills", "/shared/team-skills"]
+        "startup": [],         # skills auto-loaded into every new session
+        "platform_startup": {},  # per-platform startup skill lists
+    },
+
+    "plugins": {
+        "disabled": [],
+        "enable_project": False,
     },
 
     # Honcho AI-native memory -- reads ~/.honcho/config.json as single source of truth.
@@ -632,7 +632,6 @@ DEFAULT_CONFIG = {
     "discord": {
         "require_mention": True,       # Require @mention to respond in server channels
         "free_response_channels": "",  # Comma-separated channel IDs where bot responds without mention
-        "allowed_channels": "",        # If set, bot ONLY responds in these channel IDs (whitelist)
         "auto_thread": True,           # Auto-create threads on @mention in channels (like Slack)
         "reactions": True,             # Add 👀/✅/❌ reactions to messages during processing
     },
@@ -661,7 +660,125 @@ DEFAULT_CONFIG = {
     # Custom personalities — add your own entries here
     # Supports string format: {"name": "system prompt"}
     # Or dict format: {"name": {"description": "...", "system_prompt": "...", "tone": "...", "style": "..."}}
-    "personalities": {},
+    "personalities": {
+        "board": {
+            "description": "董事长 / 投委会视角，聚焦方向、资源、风险与停损。",
+            "system_prompt": (
+                "你以互联网初创公司的董事长/投委会视角工作。先判断方向、"
+                "资源配置、关键风险和停止条件，再讨论执行细节。不要把忙碌"
+                "误当成进展，也不要把局部优化误当成战略。"
+            ),
+            "tone": "克制、直接、结论先行",
+            "style": "先给判断，再给依据，再给边界与下一步动作。",
+        },
+        "ceo": {
+            "description": "CEO 主操盘人格，统筹目标、优先级、推进与结果。",
+            "system_prompt": (
+                "你以互联网初创公司 CEO 视角工作。目标是用最少资源形成"
+                "产品、增长、交付闭环。优先聚焦目标、优先级、依赖、推进"
+                "节奏和结果，不把问题推给抽象理论。"
+            ),
+            "tone": "清晰、稳健、偏经营与执行并重",
+            "style": "把复杂问题收敛成目标、负责人、风险、节奏和可执行动作。",
+        },
+        "grow": {
+            "description": "增长型人格，聚焦分发、转化、留存与用户感知。",
+            "system_prompt": (
+                "你以增长负责人视角工作。优先考虑分发、转化、留存、包装、"
+                "用户感知和实验设计。默认寻找低成本验证路径，让产品更容易"
+                "被看见、被理解、被使用。"
+            ),
+            "tone": "敏锐、结果导向、偏实验",
+            "style": "优先给出假设、实验、指标、风险和复盘方式。",
+        },
+        "content": {
+            "description": "Content operator for editorial strategy, repurposing, distribution, and audience clarity.",
+            "system_prompt": (
+                "You work like a content lead for an affiliate startup. Turn product, market, and campaign context "
+                "into publishable assets, editorial systems, and reusable distribution plans. Focus on clarity, "
+                "angles, hooks, narrative structure, and repurposing across channels."
+            ),
+            "tone": "clear, editorial, audience-aware",
+            "style": "Start with audience and angle, then outline assets, distribution, and reuse opportunities.",
+        },
+        "seo": {
+            "description": "SEO operator for keyword clusters, SERP intent, on-page structure, and search defensibility.",
+            "system_prompt": (
+                "You work like an SEO lead for an affiliate startup. Prioritize search intent, keyword clustering, "
+                "page structure, internal linking, and competitive gaps. Recommend the smallest high-leverage SEO "
+                "moves before broader content expansion."
+            ),
+            "tone": "structured, evidence-driven, search-focused",
+            "style": "Lead with search intent and opportunity size, then give page structure, risks, and next actions.",
+        },
+        "ads": {
+            "description": "Paid acquisition operator for creative testing, funnel review, budget pacing, and ROAS discipline.",
+            "system_prompt": (
+                "You work like a paid acquisition lead for an affiliate startup. Focus on creative testing velocity, "
+                "landing-page friction, spend efficiency, and signal quality. Prefer low-cost validation loops over "
+                "large speculative budget shifts."
+            ),
+            "tone": "practical, metric-driven, experimental",
+            "style": "Frame problems as hypotheses, tests, budget implications, and success metrics.",
+        },
+        "bd": {
+            "description": "Business development operator for partner sourcing, outreach, negotiation, and follow-up discipline.",
+            "system_prompt": (
+                "You work like a business development lead for an affiliate startup. Focus on partner fit, outreach "
+                "quality, offer positioning, objections, and follow-up sequencing. Always turn vague relationship "
+                "ideas into concrete next-touch plans."
+            ),
+            "tone": "concise, commercial, relationship-aware",
+            "style": "Start with target partner fit, then outreach angle, offer, objections, and follow-up cadence.",
+        },
+        "ops": {
+            "description": "Operations operator for scheduling, handoffs, SOPs, publishing flow, and execution hygiene.",
+            "system_prompt": (
+                "You work like an operations lead for an affiliate startup. Reduce coordination drag, make handoffs "
+                "explicit, and turn messy work into repeatable checklists. Prefer simple operating rhythms over complex process."
+            ),
+            "tone": "organized, calm, execution-oriented",
+            "style": "Convert ambiguity into owners, deadlines, checklists, and visible completion criteria.",
+        },
+        "finance": {
+            "description": "Finance operator for profitability, ROI, cash discipline, reconciliation, and spend prioritization.",
+            "system_prompt": (
+                "You work like a finance lead for an affiliate startup. Focus on contribution margin, payout quality, "
+                "cash timing, budget discipline, and unit economics. Push back on activity that consumes spend without "
+                "clear evidence of return."
+            ),
+            "tone": "measured, analytical, capital-aware",
+            "style": "Lead with financial signal, then diagnose leakage, tradeoffs, and the minimum corrective action.",
+        },
+        "cto": {
+            "description": "技术交付人格，聚焦实现、性能、稳定性、成本与回归。",
+            "system_prompt": (
+                "你以技术负责人视角工作。优先保证实现正确、性能可测、稳定"
+                "可证、成本可控、回归完整。不要用猜测替代证据，不要用花哨"
+                "设计掩盖系统边界。"
+            ),
+            "tone": "严谨、证据驱动、务实",
+            "style": "先定位事实，再给方案，再给验证与风险。",
+        },
+        "staff": {
+            "description": "参谋长人格，负责整理上下文、对齐信息、推动闭环。",
+            "system_prompt": (
+                "你以参谋长/运营中枢视角工作。负责整合上下文、对齐信息、"
+                "形成行动项、跟进闭环，让多人协作中的信息摩擦降到最低。"
+            ),
+            "tone": "结构化、冷静、面向协同",
+            "style": "先汇总共识和分歧，再列行动项、责任和时序。",
+        },
+        "sev": {
+            "description": "事故指挥人格，优先止血、分诊、降级、恢复与复盘。",
+            "system_prompt": (
+                "你以事故指挥官视角工作。面对故障、超时、异常成本或线上回退"
+                "时，优先止血、分诊、降级、恢复与复盘，而不是展开冗长讨论。"
+            ),
+            "tone": "简短、硬约束、面向恢复",
+            "style": "按现象、影响、止血、根因、后续动作输出。",
+        },
+    },
 
     # Pre-exec security scanning via tirith
     "security": {
@@ -691,16 +808,8 @@ DEFAULT_CONFIG = {
         "backup_count": 3,     # Number of rotated backup files to keep
     },
 
-    # Network settings — workarounds for connectivity issues.
-    "network": {
-        # Force IPv4 connections.  On servers with broken or unreachable IPv6,
-        # Python tries AAAA records first and hangs for the full TCP timeout
-        # before falling back to IPv4.  Set to true to skip IPv6 entirely.
-        "force_ipv4": False,
-    },
-
     # Config schema version - bump this when adding new required fields
-    "_config_version": 17,
+    "_config_version": 13,
 }
 
 # =============================================================================
@@ -816,14 +925,6 @@ OPTIONAL_ENV_VARS = {
         "category": "provider",
         "advanced": True,
     },
-    "KIMI_CN_API_KEY": {
-        "description": "Kimi / Moonshot China API key",
-        "prompt": "Kimi (China) API key",
-        "url": "https://platform.moonshot.cn/",
-        "password": True,
-        "category": "provider",
-        "advanced": True,
-    },
     "MINIMAX_API_KEY": {
         "description": "MiniMax API key (international)",
         "prompt": "MiniMax API key",
@@ -935,21 +1036,6 @@ OPTIONAL_ENV_VARS = {
     "HF_BASE_URL": {
         "description": "Hugging Face Inference Providers base URL override",
         "prompt": "HF base URL (leave empty for default)",
-        "url": None,
-        "password": False,
-        "category": "provider",
-        "advanced": True,
-    },
-    "XIAOMI_API_KEY": {
-        "description": "Xiaomi MiMo API key for MiMo models (mimo-v2-pro, mimo-v2-omni, mimo-v2-flash)",
-        "prompt": "Xiaomi MiMo API Key",
-        "url": "https://platform.xiaomimimo.com",
-        "password": True,
-        "category": "provider",
-    },
-    "XIAOMI_BASE_URL": {
-        "description": "Xiaomi MiMo base URL override (default: https://api.xiaomimimo.com/v1)",
-        "prompt": "Xiaomi base URL (leave empty for default)",
         "url": None,
         "password": False,
         "category": "provider",
@@ -1104,13 +1190,6 @@ OPTIONAL_ENV_VARS = {
         "description": "ElevenLabs API key for premium text-to-speech voices",
         "prompt": "ElevenLabs API key",
         "url": "https://elevenlabs.io/",
-        "password": True,
-        "category": "tool",
-    },
-    "MISTRAL_API_KEY": {
-        "description": "Mistral API key for Voxtral TTS and transcription (STT)",
-        "prompt": "Mistral API key",
-        "url": "https://console.mistral.ai/",
         "password": True,
         "category": "tool",
     },
@@ -1286,14 +1365,6 @@ OPTIONAL_ENV_VARS = {
         "category": "messaging",
         "advanced": True,
     },
-    "MATRIX_RECOVERY_KEY": {
-        "description": "Matrix recovery key for cross-signing verification after device key rotation (from Element: Settings → Security → Recovery Key)",
-        "prompt": "Matrix recovery key",
-        "url": None,
-        "password": True,
-        "category": "messaging",
-        "advanced": True,
-    },
     "BLUEBUBBLES_SERVER_URL": {
         "description": "BlueBubbles server URL for iMessage integration (e.g. http://192.168.1.10:1234)",
         "prompt": "BlueBubbles server URL",
@@ -1332,8 +1403,8 @@ OPTIONAL_ENV_VARS = {
         "advanced": True,
     },
     "API_SERVER_KEY": {
-        "description": "Bearer token for API server authentication. Required for non-loopback binding; server refuses to start without it. On loopback (127.0.0.1), all requests are allowed if empty.",
-        "prompt": "API server auth key (required for network access)",
+        "description": "Bearer token for API server authentication. If empty, all requests are allowed (local use only).",
+        "prompt": "API server auth key (optional)",
         "url": None,
         "password": True,
         "category": "messaging",
@@ -1348,16 +1419,8 @@ OPTIONAL_ENV_VARS = {
         "advanced": True,
     },
     "API_SERVER_HOST": {
-        "description": "Host/bind address for the API server (default: 127.0.0.1). Use 0.0.0.0 for network access — server refuses to start without API_SERVER_KEY.",
+        "description": "Host/bind address for the API server (default: 127.0.0.1). Use 0.0.0.0 for network access — requires API_SERVER_KEY for security.",
         "prompt": "API server host",
-        "url": None,
-        "password": False,
-        "category": "messaging",
-        "advanced": True,
-    },
-    "API_SERVER_MODEL_NAME": {
-        "description": "Model name advertised on /v1/models. Defaults to the profile name (or 'hermes-agent' for the default profile). Useful for multi-user setups with OpenWebUI.",
-        "prompt": "API server model name",
         "url": None,
         "password": False,
         "category": "messaging",
@@ -1552,136 +1615,6 @@ def get_missing_skill_config_vars() -> List[Dict[str, Any]]:
     return missing
 
 
-def _normalize_custom_provider_entry(
-    entry: Any,
-    *,
-    provider_key: str = "",
-) -> Optional[Dict[str, Any]]:
-    """Return a runtime-compatible custom provider entry or ``None``."""
-    if not isinstance(entry, dict):
-        return None
-
-    base_url = ""
-    for url_key in ("api", "url", "base_url"):
-        raw_url = entry.get(url_key)
-        if isinstance(raw_url, str) and raw_url.strip():
-            base_url = raw_url.strip()
-            break
-    if not base_url:
-        return None
-
-    name = ""
-    raw_name = entry.get("name")
-    if isinstance(raw_name, str) and raw_name.strip():
-        name = raw_name.strip()
-    elif provider_key.strip():
-        name = provider_key.strip()
-    if not name:
-        return None
-
-    normalized: Dict[str, Any] = {
-        "name": name,
-        "base_url": base_url,
-    }
-
-    provider_key = provider_key.strip()
-    if provider_key:
-        normalized["provider_key"] = provider_key
-
-    api_key = entry.get("api_key")
-    if isinstance(api_key, str) and api_key.strip():
-        normalized["api_key"] = api_key.strip()
-
-    key_env = entry.get("key_env")
-    if isinstance(key_env, str) and key_env.strip():
-        normalized["key_env"] = key_env.strip()
-
-    api_mode = entry.get("api_mode") or entry.get("transport")
-    if isinstance(api_mode, str) and api_mode.strip():
-        normalized["api_mode"] = api_mode.strip()
-
-    model_name = entry.get("model") or entry.get("default_model")
-    if isinstance(model_name, str) and model_name.strip():
-        normalized["model"] = model_name.strip()
-
-    models = entry.get("models")
-    if isinstance(models, dict) and models:
-        normalized["models"] = models
-
-    context_length = entry.get("context_length")
-    if isinstance(context_length, int) and context_length > 0:
-        normalized["context_length"] = context_length
-
-    rate_limit_delay = entry.get("rate_limit_delay")
-    if isinstance(rate_limit_delay, (int, float)) and rate_limit_delay >= 0:
-        normalized["rate_limit_delay"] = rate_limit_delay
-
-    return normalized
-
-
-def providers_dict_to_custom_providers(providers_dict: Any) -> List[Dict[str, Any]]:
-    """Normalize ``providers`` config entries into the legacy custom-provider shape."""
-    if not isinstance(providers_dict, dict):
-        return []
-
-    custom_providers: List[Dict[str, Any]] = []
-    for key, entry in providers_dict.items():
-        normalized = _normalize_custom_provider_entry(entry, provider_key=str(key))
-        if normalized is not None:
-            custom_providers.append(normalized)
-
-    return custom_providers
-
-
-def get_compatible_custom_providers(
-    config: Optional[Dict[str, Any]] = None,
-) -> List[Dict[str, Any]]:
-    """Return a deduplicated custom-provider view across legacy and v12+ config.
-
-    ``custom_providers`` remains the on-disk legacy format, while ``providers``
-    is the newer keyed schema.  Runtime and picker flows still need a single
-    list-shaped view, but we should not materialise that compatibility layer
-    back into config.yaml because it duplicates entries in UIs.
-    """
-    if config is None:
-        config = load_config()
-
-    compatible: List[Dict[str, Any]] = []
-    seen_provider_keys: set = set()
-    seen_name_url_pairs: set = set()
-
-    def _append_if_new(entry: Optional[Dict[str, Any]]) -> None:
-        if entry is None:
-            return
-        provider_key = str(entry.get("provider_key", "") or "").strip().lower()
-        name = str(entry.get("name", "") or "").strip().lower()
-        base_url = str(entry.get("base_url", "") or "").strip().rstrip("/").lower()
-        pair = (name, base_url)
-
-        if provider_key and provider_key in seen_provider_keys:
-            return
-        if name and base_url and pair in seen_name_url_pairs:
-            return
-
-        compatible.append(entry)
-        if provider_key:
-            seen_provider_keys.add(provider_key)
-        if name and base_url:
-            seen_name_url_pairs.add(pair)
-
-    custom_providers = config.get("custom_providers")
-    if custom_providers is not None:
-        if not isinstance(custom_providers, list):
-            return []
-        for entry in custom_providers:
-            _append_if_new(_normalize_custom_provider_entry(entry))
-
-    for entry in providers_dict_to_custom_providers(config.get("providers")):
-        _append_if_new(entry)
-
-    return compatible
-
-
 def check_config_version() -> Tuple[int, int]:
     """
     Check config version.
@@ -1703,12 +1636,12 @@ _KNOWN_ROOT_KEYS = {
     "_config_version", "model", "providers", "fallback_model",
     "fallback_providers", "credential_pool_strategies", "toolsets",
     "agent", "terminal", "display", "compression", "delegation",
-    "auxiliary", "custom_providers", "context", "memory", "gateway",
+    "auxiliary", "custom_providers", "memory", "gateway",
 }
 
 # Valid fields inside a custom_providers list entry
 _VALID_CUSTOM_PROVIDER_FIELDS = {
-    "name", "base_url", "api_key", "api_mode", "model", "models",
+    "name", "base_url", "api_key", "api_mode", "models",
     "context_length", "rate_limit_delay",
 }
 
@@ -1999,8 +1932,8 @@ def migrate_config(interactive: bool = True, quiet: bool = False) -> Dict[str, A
 
             if migrated_count > 0:
                 config["providers"] = providers_dict
-                # Remove the old list — runtime reads via get_compatible_custom_providers()
-                config.pop("custom_providers", None)
+                # Remove the old list
+                del config["custom_providers"]
                 save_config(config)
                 if not quiet:
                     print(f"  ✓ Migrated {migrated_count} custom provider(s) to providers: section")
@@ -2022,131 +1955,6 @@ def migrate_config(interactive: bool = True, quiet: bool = False) -> Dict[str, A
                         print(f"  ✓ Cleared {dead_var} from .env (no longer used — config.yaml is source of truth)")
             except Exception:
                 pass
-
-    # ── Version 13 → 14: migrate legacy flat stt.model to provider section ──
-    # Old configs (and cli-config.yaml.example) had a flat `stt.model` key
-    # that was provider-agnostic.  When the provider was "local" this caused
-    # OpenAI model names (e.g. "whisper-1") to be fed to faster-whisper,
-    # crashing with "Invalid model size".  Move the value into the correct
-    # provider-specific section and remove the flat key.
-    if current_ver < 14:
-        # Read raw config (no defaults merged) to check what the user actually
-        # wrote, then apply changes to the merged config for saving.
-        raw = read_raw_config()
-        raw_stt = raw.get("stt", {})
-        if isinstance(raw_stt, dict) and "model" in raw_stt:
-            legacy_model = raw_stt["model"]
-            provider = raw_stt.get("provider", "local")
-            config = load_config()
-            stt = config.get("stt", {})
-            # Remove the legacy flat key
-            stt.pop("model", None)
-            # Place it in the appropriate provider section only if the
-            # user didn't already set a model there
-            if provider in ("local", "local_command"):
-                # Don't migrate an OpenAI model name into the local section
-                _local_models = {
-                    "tiny.en", "tiny", "base.en", "base", "small.en", "small",
-                    "medium.en", "medium", "large-v1", "large-v2", "large-v3",
-                    "large", "distil-large-v2", "distil-medium.en",
-                    "distil-small.en", "distil-large-v3", "distil-large-v3.5",
-                    "large-v3-turbo", "turbo",
-                }
-                if legacy_model in _local_models:
-                    # Check raw config — only set if user didn't already
-                    # have a nested local.model
-                    raw_local = raw_stt.get("local", {})
-                    if not isinstance(raw_local, dict) or "model" not in raw_local:
-                        local_cfg = stt.setdefault("local", {})
-                        local_cfg["model"] = legacy_model
-                # else: drop it — it was an OpenAI model name, local section
-                # already defaults to "base" via DEFAULT_CONFIG
-            else:
-                # Cloud provider — put it in that provider's section only
-                # if user didn't already set a nested model
-                raw_provider = raw_stt.get(provider, {})
-                if not isinstance(raw_provider, dict) or "model" not in raw_provider:
-                    provider_cfg = stt.setdefault(provider, {})
-                    provider_cfg["model"] = legacy_model
-            config["stt"] = stt
-            save_config(config)
-            if not quiet:
-                print(f"  ✓ Migrated legacy stt.model to provider-specific config")
-
-    # ── Version 14 → 15: add explicit gateway interim-message gate ──
-    if current_ver < 15:
-        config = read_raw_config()
-        display = config.get("display", {})
-        if not isinstance(display, dict):
-            display = {}
-        if "interim_assistant_messages" not in display:
-            display["interim_assistant_messages"] = True
-            config["display"] = display
-            results["config_added"].append("display.interim_assistant_messages=true (default)")
-            save_config(config)
-            if not quiet:
-                print("  ✓ Added display.interim_assistant_messages=true")
-
-    # ── Version 15 → 16: migrate tool_progress_overrides into display.platforms ──
-    if current_ver < 16:
-        config = read_raw_config()
-        display = config.get("display", {})
-        if not isinstance(display, dict):
-            display = {}
-        old_overrides = display.get("tool_progress_overrides")
-        if isinstance(old_overrides, dict) and old_overrides:
-            platforms = display.get("platforms", {})
-            if not isinstance(platforms, dict):
-                platforms = {}
-            for plat, mode in old_overrides.items():
-                if plat not in platforms:
-                    platforms[plat] = {}
-                if "tool_progress" not in platforms[plat]:
-                    platforms[plat]["tool_progress"] = mode
-            display["platforms"] = platforms
-            config["display"] = display
-            save_config(config)
-            if not quiet:
-                migrated = ", ".join(f"{p}={m}" for p, m in old_overrides.items())
-                print(f"  ✓ Migrated tool_progress_overrides → display.platforms: {migrated}")
-            results["config_added"].append("display.platforms (migrated from tool_progress_overrides)")
-
-    # ── Version 16 → 17: remove legacy compression.summary_* keys ──
-    if current_ver < 17:
-        config = read_raw_config()
-        comp = config.get("compression", {})
-        if isinstance(comp, dict):
-            s_model = comp.pop("summary_model", None)
-            s_provider = comp.pop("summary_provider", None)
-            s_base_url = comp.pop("summary_base_url", None)
-            migrated_keys = []
-            # Migrate non-empty, non-default values to auxiliary.compression
-            if s_model and str(s_model).strip():
-                aux = config.setdefault("auxiliary", {})
-                aux_comp = aux.setdefault("compression", {})
-                if not aux_comp.get("model"):
-                    aux_comp["model"] = str(s_model).strip()
-                    migrated_keys.append(f"model={s_model}")
-            if s_provider and str(s_provider).strip() not in ("", "auto"):
-                aux = config.setdefault("auxiliary", {})
-                aux_comp = aux.setdefault("compression", {})
-                if not aux_comp.get("provider") or aux_comp.get("provider") == "auto":
-                    aux_comp["provider"] = str(s_provider).strip()
-                    migrated_keys.append(f"provider={s_provider}")
-            if s_base_url and str(s_base_url).strip():
-                aux = config.setdefault("auxiliary", {})
-                aux_comp = aux.setdefault("compression", {})
-                if not aux_comp.get("base_url"):
-                    aux_comp["base_url"] = str(s_base_url).strip()
-                    migrated_keys.append(f"base_url={s_base_url}")
-            if migrated_keys or s_model is not None or s_provider is not None or s_base_url is not None:
-                config["compression"] = comp
-                save_config(config)
-                if not quiet:
-                    if migrated_keys:
-                        print(f"  ✓ Migrated compression.summary_* → auxiliary.compression: {', '.join(migrated_keys)}")
-                    else:
-                        print("  ✓ Removed unused compression.summary_* keys")
 
     if current_ver < latest_ver and not quiet:
         print(f"Config version: {current_ver} → {latest_ver}")
@@ -2433,7 +2241,7 @@ def load_config() -> Dict[str, Any]:
 
 
 _SECURITY_COMMENT = """
-# ── Security ──────────────────────────────────────────────────────────
+# ---- Security -----------------------------------------------------------
 # API keys, tokens, and passwords are redacted from tool output by default.
 # Set to false to see full values (useful for debugging auth issues).
 # tirith pre-exec scanning is enabled by default when the tirith binary
@@ -2449,20 +2257,19 @@ _SECURITY_COMMENT = """
 """
 
 _FALLBACK_COMMENT = """
-# ── Fallback Model ────────────────────────────────────────────────────
+# ---- Fallback Model -----------------------------------------------------
 # Automatic provider failover when primary is unavailable.
 # Uncomment and configure to enable. Triggers on rate limits (429),
 # overload (529), service errors (503), or connection failures.
 #
 # Supported providers:
-#   openrouter   (OPENROUTER_API_KEY)  — routes to any model
-#   openai-codex (OAuth — hermes auth) — OpenAI Codex
-#   nous         (OAuth — hermes auth) — Nous Portal
-#   zai          (ZAI_API_KEY)         — Z.AI / GLM
-#   kimi-coding  (KIMI_API_KEY)        — Kimi / Moonshot
-#   kimi-coding-cn (KIMI_CN_API_KEY)   — Kimi / Moonshot (China)
-#   minimax      (MINIMAX_API_KEY)     — MiniMax
-#   minimax-cn   (MINIMAX_CN_API_KEY)  — MiniMax (China)
+#   openrouter   (OPENROUTER_API_KEY) - routes to any model
+#   openai-codex (OAuth via `hermes auth`) - OpenAI Codex
+#   nous         (OAuth via `hermes auth`) - Nous Portal
+#   zai          (ZAI_API_KEY) - Z.AI / GLM
+#   kimi-coding  (KIMI_API_KEY) - Kimi / Moonshot
+#   minimax      (MINIMAX_API_KEY) - MiniMax
+#   minimax-cn   (MINIMAX_CN_API_KEY) - MiniMax (China)
 #
 # For custom OpenAI-compatible endpoints, add base_url and api_key_env.
 #
@@ -2470,62 +2277,11 @@ _FALLBACK_COMMENT = """
 #   provider: openrouter
 #   model: anthropic/claude-sonnet-4
 #
-# ── Smart Model Routing ────────────────────────────────────────────────
+# ---- Smart Model Routing -----------------------------------------------
 # Optional cheap-vs-strong routing for simple turns.
 # Keeps the primary model for complex work, but can route short/simple
 # messages to a cheaper model across providers.
 #
-# smart_model_routing:
-#   enabled: true
-#   max_simple_chars: 160
-#   max_simple_words: 28
-#   cheap_model:
-#     provider: openrouter
-#     model: google/gemini-2.5-flash
-"""
-
-
-_COMMENTED_SECTIONS = """
-# ── Security ──────────────────────────────────────────────────────────
-# API keys, tokens, and passwords are redacted from tool output by default.
-# Set to false to see full values (useful for debugging auth issues).
-#
-# security:
-#   redact_secrets: false
-
-# ── Fallback Model ────────────────────────────────────────────────────
-# Automatic provider failover when primary is unavailable.
-# Uncomment and configure to enable. Triggers on rate limits (429),
-# overload (529), service errors (503), or connection failures.
-#
-# Supported providers:
-#   openrouter   (OPENROUTER_API_KEY)  — routes to any model
-#   openai-codex (OAuth — hermes auth) — OpenAI Codex
-#   nous         (OAuth — hermes auth) — Nous Portal
-#   zai          (ZAI_API_KEY)         — Z.AI / GLM
-#   kimi-coding  (KIMI_API_KEY)        — Kimi / Moonshot
-#   kimi-coding-cn (KIMI_CN_API_KEY)   — Kimi / Moonshot (China)
-#   minimax      (MINIMAX_API_KEY)     — MiniMax
-#   minimax-cn   (MINIMAX_CN_API_KEY)  — MiniMax (China)
-#
-# For custom OpenAI-compatible endpoints, add base_url and api_key_env.
-#
-# fallback_model:
-#   provider: openrouter
-#   model: anthropic/claude-sonnet-4
-#
-# ── Smart Model Routing ────────────────────────────────────────────────
-# Optional cheap-vs-strong routing for simple turns.
-# Keeps the primary model for complex work, but can route short/simple
-# messages to a cheaper model across providers.
-#
-# smart_model_routing:
-#   enabled: true
-#   max_simple_chars: 160
-#   max_simple_words: 28
-#   cheap_model:
-#     provider: openrouter
-#     model: google/gemini-2.5-flash
 """
 
 
@@ -2559,13 +2315,7 @@ def save_config(config: Dict[str, Any]):
 
 
 def load_env() -> Dict[str, str]:
-    """Load environment variables from ~/.hermes/.env.
-
-    Sanitizes lines before parsing so that corrupted files (e.g.
-    concatenated KEY=VALUE pairs on a single line) are handled
-    gracefully instead of producing mangled values such as duplicated
-    bot tokens.  See #8908.
-    """
+    """Load environment variables from ~/.hermes/.env."""
     env_path = get_env_path()
     env_vars = {}
     
@@ -2574,21 +2324,17 @@ def load_env() -> Dict[str, str]:
         # fail on UTF-8 .env files. Use explicit UTF-8 only on Windows.
         open_kw = {"encoding": "utf-8", "errors": "replace"} if _IS_WINDOWS else {}
         with open(env_path, **open_kw) as f:
-            raw_lines = f.readlines()
-        # Sanitize before parsing: split concatenated lines & drop stale
-        # placeholders so corrupted .env files don't produce invalid tokens.
-        lines = _sanitize_env_lines(raw_lines)
-        for line in lines:
-            line = line.strip()
-            if line and not line.startswith('#') and '=' in line:
-                key, _, value = line.partition('=')
-                env_vars[key.strip()] = value.strip().strip('"\'')
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#') and '=' in line:
+                    key, _, value = line.partition('=')
+                    env_vars[key.strip()] = value.strip().strip('"\'')
     
     return env_vars
 
 
 def _sanitize_env_lines(lines: list) -> list:
-    """Fix corrupted .env lines before reading or writing.
+    """Fix corrupted .env lines before writing.
 
     Handles two known corruption patterns:
     1. Concatenated KEY=VALUE pairs on a single line (missing newline between
@@ -2821,28 +2567,6 @@ def save_env_value_secure(key: str, value: str) -> Dict[str, Any]:
 
 
 
-def reload_env() -> int:
-    """Re-read ~/.hermes/.env into os.environ. Returns count of vars updated.
-
-    Adds/updates vars that changed and removes vars that were deleted from
-    the .env file (but only vars known to Hermes — OPTIONAL_ENV_VARS and
-    _EXTRA_ENV_KEYS — to avoid clobbering unrelated environment).
-    """
-    env_vars = load_env()
-    known_keys = set(OPTIONAL_ENV_VARS.keys()) | _EXTRA_ENV_KEYS
-    count = 0
-    for key, value in env_vars.items():
-        if os.environ.get(key) != value:
-            os.environ[key] = value
-            count += 1
-    # Remove known Hermes vars that are no longer in .env
-    for key in known_keys:
-        if key not in env_vars and key in os.environ:
-            del os.environ[key]
-            count += 1
-    return count
-
-
 def get_env_value(key: str) -> Optional[str]:
     """Get a value from ~/.hermes/.env or environment."""
     # Check environment first
@@ -2902,8 +2626,7 @@ def show_config():
     for env_key, name in keys:
         value = get_env_value(env_key)
         print(f"  {name:<14} {redact_key(value)}")
-    from hermes_cli.auth import get_anthropic_key
-    anthropic_value = get_anthropic_key()
+    anthropic_value = get_env_value("ANTHROPIC_TOKEN") or get_env_value("ANTHROPIC_API_KEY")
     print(f"  {'Anthropic':<14} {redact_key(anthropic_value)}")
     
     # Model settings
@@ -2965,11 +2688,10 @@ def show_config():
         print(f"  Threshold:    {compression.get('threshold', 0.50) * 100:.0f}%")
         print(f"  Target ratio: {compression.get('target_ratio', 0.20) * 100:.0f}% of threshold preserved")
         print(f"  Protect last: {compression.get('protect_last_n', 20)} messages")
-        _aux_comp = config.get('auxiliary', {}).get('compression', {})
-        _sm = _aux_comp.get('model', '') or '(auto)'
+        _sm = compression.get('summary_model', '') or '(main model)'
         print(f"  Model:        {_sm}")
-        comp_provider = _aux_comp.get('provider', 'auto')
-        if comp_provider and comp_provider != 'auto':
+        comp_provider = compression.get('summary_provider', 'auto')
+        if comp_provider != 'auto':
             print(f"  Provider:     {comp_provider}")
     
     # Auxiliary models
@@ -3120,8 +2842,8 @@ def set_config_value(key: str, value: str):
     
     # Write only user config back (not the full merged defaults)
     ensure_hermes_home()
-    from utils import atomic_yaml_write
-    atomic_yaml_write(config_path, user_config, sort_keys=False)
+    with open(config_path, 'w', encoding="utf-8") as f:
+        yaml.dump(user_config, f, default_flow_style=False, sort_keys=False)
     
     # Keep .env in sync for keys that terminal_tool reads directly from env vars.
     # config.yaml is authoritative, but terminal_tool only reads TERMINAL_ENV etc.
@@ -3137,10 +2859,6 @@ def set_config_value(key: str, value: str):
         "terminal.timeout": "TERMINAL_TIMEOUT",
         "terminal.sandbox_dir": "TERMINAL_SANDBOX_DIR",
         "terminal.persistent_shell": "TERMINAL_PERSISTENT_SHELL",
-        "terminal.container_cpu": "TERMINAL_CONTAINER_CPU",
-        "terminal.container_memory": "TERMINAL_CONTAINER_MEMORY",
-        "terminal.container_disk": "TERMINAL_CONTAINER_DISK",
-        "terminal.container_persistent": "TERMINAL_CONTAINER_PERSISTENT",
     }
     if key in _config_to_env_sync:
         save_env_value(_config_to_env_sync[key], str(value))

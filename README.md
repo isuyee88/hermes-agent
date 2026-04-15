@@ -33,10 +33,8 @@ Use any model you want — [Nous Portal](https://portal.nousresearch.com), [Open
 curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash
 ```
 
-Works on Linux, macOS, WSL2, and Android via Termux. The installer handles the platform-specific setup for you.
+Works on Linux, macOS, and WSL2. The installer handles everything — Python, Node.js, dependencies, and the `hermes` command. No prerequisites except git.
 
-> **Android / Termux:** The tested manual path is documented in the [Termux guide](https://hermes-agent.nousresearch.com/docs/getting-started/termux). On Termux, Hermes installs a curated `.[termux]` extra because the full `.[all]` extra currently pulls Android-incompatible voice dependencies.
->
 > **Windows:** Native Windows is not supported. Please install [WSL2](https://learn.microsoft.com/en-us/windows/wsl/install) and run the command above.
 
 After installation:
@@ -62,7 +60,95 @@ hermes update       # Update to the latest version
 hermes doctor       # Diagnose any issues
 ```
 
+## Modal Deployment
+
+This fork includes a production-oriented Modal entrypoint in [`modal_.py`](./modal_.py).
+It runs Hermes on Modal with a single protected surface and seeds the official
+Hermes config path (`$HERMES_HOME/config.yaml`) from [`config.modal.yaml`](./config.modal.yaml):
+
+- `run_agent_task` for remote task execution
+- `run_batch_tasks` for JSON batch jobs
+- `web_app` for `/healthz`, `/invoke`, `/telegram/webhook`, and `/qq/webhook`
+
+Telegram and QQ official bot webhook traffic are dispatched through Hermes's
+upstream gateway code, so authorization, sessions, slash commands, memory,
+tool progress, and platform-specific behavior stay aligned with the main
+project instead of a parallel OpenRouter-only webhook loop.
+
+Use [`./.env.modal.example`](./.env.modal.example) as the contract for the
+required environment variables, then load the real values through a Modal
+Secret named `custom-secret` (or override `HERMES_MODAL_SECRET_NAME`).
+
+Example deployment flow:
+
+```bash
+modal secret create custom-secret \
+  DEFAULT_MODEL=openrouter/free \
+  OPENROUTER_API_KEY=... \
+  HERMES_INFERENCE_USE_CLOUDFLARE_AI_GATEWAY=true \
+  CLOUDFLARE_AI_GATEWAY_BASE_URL=https://gateway.ai.cloudflare.com/v1/d1215a30b84b673ef0367010b0e78c10/affiliate-manager \
+  HERMES_CLOUDFLARE_AI_GATEWAY_PROVIDERS=openrouter,nvidia \
+  CLOUDFLARE_AI_GATEWAY_ROUTE_GENERAL=affiliate-general \
+  CLOUDFLARE_AI_GATEWAY_ROUTE_CODING=affiliate-coding \
+  CLOUDFLARE_AI_GATEWAY_ROUTE_TOOLS=affiliate-tools \
+  CLOUDFLARE_AI_GATEWAY_ROUTE_CREATIVE=affiliate-general \
+  CLOUDFLARE_AI_GATEWAY_ROUTE_IMAGE=affiliate-general \
+  CLOUDFLARE_API_TOKEN=... \
+  SUPERMEMORY_API_KEY=... \
+  TELEGRAM_BOT_TOKEN=... \
+  TELEGRAM_ALLOWED_USERS=123456789 \
+  TELEGRAM_WEBHOOK_SECRET=... \
+  HERMES_PUBLIC_BASE_URL=https://<your-workspace>--hermes-agent-web-app.modal.run \
+  QQ_APP_ID=... \
+  QQ_APP_SECRET=... \
+  WEBHOOK_SECRET=...
+
+modal deploy modal_.py
+```
+
+If you already fixed the gateway/account constants in the repo, the only Cloudflare
+secret you still need to supply at deploy time is `CLOUDFLARE_API_TOKEN`.
+
+If you omit `DEFAULT_MODEL`, this Modal entrypoint now defaults to
+`openrouter/free`, which uses OpenRouter's official Free Models Router. Override
+it in your Modal Secret when you want a specific paid or pinned model.
+
+After deploy:
+
+- Set `HERMES_PUBLIC_BASE_URL` to your Modal public base URL. Hermes now derives
+  the desired Telegram webhook URL as `<base>/telegram/webhook`, exposes the
+  registration state in `/healthz`, and can auto-sync the Telegram webhook on
+  cold start when `TELEGRAM_WEBHOOK_AUTO_SYNC=true` (default).
+- You can also force a re-registration with:
+
+  ```bash
+  modal run modal_.py::sync_telegram_webhook
+  ```
+
+- Telegram should use the generated `/telegram/webhook` endpoint and the same
+  `TELEGRAM_WEBHOOK_SECRET` as the Bot API webhook `secret_token`.
+- Point QQ official bot webhook mode at `https://<your-modal-endpoint>/qq/webhook`.
+  The QQ platform will first issue an `op=13` callback validation request; Hermes
+  now handles that handshake natively and routes accepted events into the gateway.
+- This Modal profile enables the official Supermemory Hermes integration when
+  `SUPERMEMORY_API_KEY` is present. It activates `memory.provider=supermemory`
+  in [`config.modal.yaml`](./config.modal.yaml) and installs the SDK into the
+  Modal image, matching [Supermemory's Hermes integration guide](https://supermemory.ai/docs/integrations/hermes).
+- This Modal profile also aligns with Hermes's official [Integrations](https://hermes-agent.nousresearch.com/docs/integrations/):
+  MCP support is installed in the image, common web/browser/Home Assistant/API
+  env vars are included in the Modal config contract, and project-local plugins
+  from `./.hermes/plugins/` are auto-mounted when present.
+
 📖 **[Full documentation →](https://hermes-agent.nousresearch.com/docs/)**
+
+- The Modal runtime also seeds [`supermemory.modal.json`](./supermemory.modal.json)
+  into `$HERMES_HOME/supermemory.json` so recall and capture settings stay stable
+  across cold starts.
+- Run a live Supermemory regression smoke test any time with:
+
+  ```bash
+  python scripts/validate_supermemory_modal.py
+  ```
 
 ## CLI vs Messaging Quick Reference
 
@@ -167,7 +253,6 @@ python -m pytest tests/ -q
 - 📚 [Skills Hub](https://agentskills.io)
 - 🐛 [Issues](https://github.com/NousResearch/hermes-agent/issues)
 - 💡 [Discussions](https://github.com/NousResearch/hermes-agent/discussions)
-- 🔌 [HermesClaw](https://github.com/AaronWong1999/hermesclaw) — Community WeChat bridge: Run Hermes Agent and OpenClaw on the same WeChat account.
 
 ---
 

@@ -8,13 +8,37 @@ import os
 from pathlib import Path
 
 
+def _safe_home_dir() -> Path:
+    """Best-effort home directory resolution that survives stripped envs."""
+    env_candidates = (
+        os.getenv("HERMES_HOME", "").strip(),
+        os.getenv("HOME", "").strip(),
+        os.getenv("USERPROFILE", "").strip(),
+        (
+            f"{os.getenv('HOMEDRIVE', '').strip()}{os.getenv('HOMEPATH', '').strip()}"
+            if os.getenv("HOMEDRIVE") or os.getenv("HOMEPATH")
+            else ""
+        ),
+    )
+    for candidate in env_candidates:
+        if candidate:
+            return Path(candidate).expanduser()
+    try:
+        return Path.home()
+    except RuntimeError:
+        return Path.cwd()
+
+
 def get_hermes_home() -> Path:
     """Return the Hermes home directory (default: ~/.hermes).
 
     Reads HERMES_HOME env var, falls back to ~/.hermes.
     This is the single source of truth — all other copies should import this.
     """
-    return Path(os.getenv("HERMES_HOME", Path.home() / ".hermes"))
+    env_home = os.getenv("HERMES_HOME", "").strip()
+    if env_home:
+        return Path(env_home).expanduser()
+    return _safe_home_dir() / ".hermes"
 
 
 def get_default_hermes_root() -> Path:
@@ -33,7 +57,7 @@ def get_default_hermes_root() -> Path:
 
     Import-safe — no dependencies beyond stdlib.
     """
-    native_home = Path.home() / ".hermes"
+    native_home = _safe_home_dir() / ".hermes"
     env_home = os.environ.get("HERMES_HOME", "")
     if not env_home:
         return native_home
@@ -106,7 +130,7 @@ def display_hermes_home() -> str:
     """
     home = get_hermes_home()
     try:
-        return "~/" + str(home.relative_to(Path.home()))
+        return "~/" + str(home.relative_to(_safe_home_dir()))
     except ValueError:
         return str(home)
 

@@ -33,6 +33,19 @@ Key capabilities:
 
 ## Setup
 
+### Recommended config
+
+Make the browser backend explicit in `config.yaml` instead of relying on implicit provider detection:
+
+```yaml
+browser:
+  cloud_provider: local   # local | browser-use | browserbase | firecrawl
+  command_timeout: 30
+  inactivity_timeout: 120
+```
+
+For startup or affiliate operating presets, `founder-max`, `growth-max`, `content-max`, `ads-max`, `seo-max`, `bd-max`, `ops-max`, `cto-max`, and `collab-safe` all treat browser automation as a first-class capability surface.
+
 ### Browserbase cloud mode
 
 To use Browserbase-managed cloud browsers, add:

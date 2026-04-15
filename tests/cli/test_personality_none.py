@@ -144,6 +144,17 @@ class TestGatewayPersonalityNone:
 
         assert "none" in result.lower()
 
+    @pytest.mark.asyncio
+    async def test_list_uses_builtin_personalities_without_config_file(self, tmp_path):
+        runner = self._make_runner()
+
+        with patch("gateway.run._hermes_home", tmp_path):
+            event = self._make_event("")
+            result = await runner._handle_personality_command(event)
+
+        assert "ceo" in result
+        assert "cto" in result
+
 
 class TestPersonalityDictFormat:
     """Test dict-format custom personalities with description, tone, style."""
@@ -210,3 +221,56 @@ class TestPersonalityDictFormat:
         from cli import HermesCLI
         result = HermesCLI._resolve_personality_prompt("You are helpful.")
         assert result == "You are helpful."
+
+
+class TestOrganizationPersonalities:
+
+    def test_cli_config_includes_org_personalities(self):
+        from cli import CLI_CONFIG
+
+        personalities = CLI_CONFIG["agent"]["personalities"]
+
+        for name in ("board", "ceo", "grow", "content", "seo", "ads", "bd", "ops", "finance", "cto", "staff", "sev"):
+            assert name in personalities
+
+    def test_org_personality_uses_dict_prompt_parts(self):
+        from cli import HermesCLI, CLI_CONFIG
+
+        ceo = CLI_CONFIG["agent"]["personalities"]["ceo"]
+        result = HermesCLI._resolve_personality_prompt(ceo)
+
+        assert "互联网初创公司 CEO" in result
+        assert "Tone:" in result
+        assert "Style:" in result
+
+    @pytest.mark.asyncio
+    async def test_gateway_lists_org_personalities(self, tmp_path):
+        from gateway.run import GatewayRunner
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner._ephemeral_system_prompt = ""
+        config_data = {
+            "agent": {
+                "personalities": {
+                    "ceo": {
+                        "description": "CEO 主操盘人格",
+                        "system_prompt": "你以互联网初创公司 CEO 视角工作。",
+                    },
+                    "sev": {
+                        "description": "事故指挥人格",
+                        "system_prompt": "你以事故指挥官视角工作。",
+                    },
+                }
+            }
+        }
+        (tmp_path / "config.yaml").write_text(yaml.dump(config_data, allow_unicode=True), encoding="utf-8")
+
+        event = MagicMock()
+        event.get_command.return_value = "personality"
+        event.get_command_args.return_value = ""
+
+        with patch("gateway.run._hermes_home", tmp_path):
+            result = await runner._handle_personality_command(event)
+
+        assert "ceo" in result
+        assert "sev" in result

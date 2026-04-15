@@ -21,6 +21,68 @@ _SKILL_INVALID_CHARS = re.compile(r"[^a-z0-9-]")
 _SKILL_MULTI_HYPHEN = re.compile(r"-{2,}")
 
 
+def _normalize_skill_identifier_list(value: Any) -> list[str]:
+    """Normalize config-driven skill identifiers into a clean list."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        raw_items = value.split(",")
+    elif isinstance(value, (list, tuple, set)):
+        raw_items = list(value)
+    else:
+        return []
+
+    result: list[str] = []
+    seen: set[str] = set()
+    for item in raw_items:
+        identifier = str(item or "").strip()
+        if not identifier or identifier in seen:
+            continue
+        seen.add(identifier)
+        result.append(identifier)
+    return result
+
+
+def get_configured_startup_skills(
+    config: Optional[dict[str, Any]] = None,
+    *,
+    platform: str | None = None,
+) -> list[str]:
+    """Return startup skills configured globally and optionally per platform."""
+    if config is None:
+        try:
+            from hermes_cli.config import load_config
+
+            config = load_config()
+        except Exception:
+            config = {}
+
+    if not isinstance(config, dict):
+        return []
+
+    skills_cfg = config.get("skills", {})
+    if not isinstance(skills_cfg, dict):
+        return []
+
+    resolved: list[str] = []
+    seen: set[str] = set()
+
+    for identifier in _normalize_skill_identifier_list(skills_cfg.get("startup")):
+        if identifier not in seen:
+            seen.add(identifier)
+            resolved.append(identifier)
+
+    if platform:
+        platform_startup = skills_cfg.get("platform_startup", {})
+        if isinstance(platform_startup, dict):
+            for identifier in _normalize_skill_identifier_list(platform_startup.get(platform)):
+                if identifier not in seen:
+                    seen.add(identifier)
+                    resolved.append(identifier)
+
+    return resolved
+
+
 def build_plan_path(
     user_instruction: str = "",
     *,
@@ -168,7 +230,7 @@ def _build_skill_message(
             subdir_path = skill_dir / subdir
             if subdir_path.exists():
                 for f in sorted(subdir_path.rglob("*")):
-                    if f.is_file() and not f.is_symlink():
+                    if f.is_file():
                         rel = str(f.relative_to(skill_dir))
                         supporting.append(rel)
 
@@ -363,6 +425,51 @@ def build_preloaded_skills_prompt(
                 activation_note,
             )
         )
+        loaded_names.append(skill_name)
+
+    return "\n\n".join(prompt_parts), loaded_names, missing
+
+
+def build_session_start_skills_message(
+    skill_identifiers: list[str],
+    *,
+    user_instruction: str = "",
+    task_id: str | None = None,
+) -> tuple[str, list[str], list[str]]:
+    """Build a durable session-start message that auto-loads one or more skills."""
+    prompt_parts: list[str] = []
+    loaded_names: list[str] = []
+    missing: list[str] = []
+
+    seen: set[str] = set()
+    attached_user_instruction = False
+
+    for raw_identifier in skill_identifiers:
+        identifier = (raw_identifier or "").strip()
+        if not identifier or identifier in seen:
+            continue
+        seen.add(identifier)
+
+        loaded = _load_skill_payload(identifier, task_id=task_id)
+        if not loaded:
+            missing.append(identifier)
+            continue
+
+        loaded_skill, skill_dir, skill_name = loaded
+        activation_note = (
+            f'[SYSTEM: This new session started with the "{skill_name}" skill '
+            "auto-loaded from configuration. Treat its instructions as active guidance "
+            "for this conversation unless the user overrides them.]"
+        )
+        prompt_parts.append(
+            _build_skill_message(
+                loaded_skill,
+                skill_dir,
+                activation_note,
+                user_instruction=user_instruction if not attached_user_instruction else "",
+            )
+        )
+        attached_user_instruction = attached_user_instruction or bool(user_instruction)
         loaded_names.append(skill_name)
 
     return "\n\n".join(prompt_parts), loaded_names, missing

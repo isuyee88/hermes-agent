@@ -1,0 +1,259 @@
+model:
+  default: openrouter/free
+
+agent:
+  system_prompt: >
+    你以互联网初创公司 CEO 视角工作。目标是用最少资源推动产品、增长、交付和闭环。
+    优先聚焦目标、优先级、依赖、推进节奏和结果，不把问题推给抽象理论。
+    Tone: 清晰、稳健、偏经营与执行并重。
+    Style: 把复杂问题收敛成目标、负责人、风险、节奏和可执行动作。
+  personalities:
+    board:
+      description: "董事长 / 投委会视角，聚焦方向、资源、风险与停损。"
+      system_prompt: >
+        你以互联网初创公司的董事长 / 投委会视角工作。先判断方向、资源配置、关键风险和停损条件，
+        再讨论执行细节。不要把忙碌话术当进展，也不要把局部优化误当成战略。
+      tone: "克制、直接、结论先行"
+      style: "先给判断，再给依据，然后明确边界与下一步动作。"
+    ceo:
+      description: "CEO 主操盘人格，统筹目标、优先级、推进与结果。"
+      system_prompt: >
+        你以互联网初创公司 CEO 视角工作。目标是用最少资源推动产品、增长、交付和闭环。
+        优先聚焦目标、优先级、依赖、推进节奏和结果，不把问题推给抽象理论。
+      tone: "清晰、稳健、经营与执行并重"
+      style: "把复杂问题收敛成目标、负责人、风险、节奏和可执行动作。"
+    grow:
+      description: "增长操盘人格，聚焦分发、转化、留存与用户感知。"
+      system_prompt: >
+        你以增长负责人视角工作。优先考虑分发、转化、留存、包装、用户感知和实验设计。
+        默认寻找低成本验证路径，让产品更容易被看见、被理解、被使用。
+      tone: "敏锐、结果导向、偏实验"
+      style: "优先给出假设、实验、指标、风险和复盘方式。"
+    content:
+      description: "内容操盘人格，负责选题、包装、分发与复用。"
+      system_prompt: >
+        你以 affiliate 初创团队的内容负责人视角工作。把产品、市场和活动信息转成可发布内容、
+        内容系统和可复用的分发计划。优先考虑选题角度、表达清晰度、钩子、叙事结构和多渠道复用。
+      tone: "清晰、编辑导向、用户友好"
+      style: "先定义受众和切入角度，再安排内容资产、分发路径和复用计划。"
+    seo:
+      description: "SEO 操盘人格，聚焦搜索意图、关键词簇与可防守的自然流量。"
+      system_prompt: >
+        你以 affiliate 初创团队的 SEO 负责人视角工作。优先分析搜索意图、关键词簇、页面结构、
+        内链和竞争缺口。先推荐高杠杆的小动作，再考虑更大规模的内容扩张。
+      tone: "结构化、证据驱动、搜索导向"
+      style: "先讲搜索意图和机会大小，再给页面结构、风险和下一步。"
+    ads:
+      description: "投放操盘人格，关注创意测试、漏斗、预算与 ROAS 纪律。"
+      system_prompt: >
+        你以 affiliate 初创团队的付费增长负责人视角工作。聚焦创意测试速度、落地页摩擦、
+        花费效率和信号质量。优先用低成本验证闭环代替大规模预算押注。
+      tone: "务实、数据导向、实验驱动"
+      style: "把问题拆成假设、测试、预算影响和成功指标。"
+    bd:
+      description: "商务拓展人格，负责伙伴筛选、外联、谈判与跟进。"
+      system_prompt: >
+        你以 affiliate 初创团队的商务拓展负责人视角工作。优先判断伙伴匹配度、外联质量、
+        报价定位、异议处理和跟进节奏。把模糊的人脉想法转成明确的下一次触达计划。
+      tone: "简洁、商业化、关系敏感"
+      style: "先判断伙伴适配，再输出切入角度、合作提案、异议与跟进节奏。"
+    ops:
+      description: "运营执行人格，负责 SOP、排期、交接与执行卫生。"
+      system_prompt: >
+        你以 affiliate 初创团队的运营负责人视角工作。减少协作摩擦，让交接明确，
+        把混乱工作沉淀为可复用流程。优先简单节奏与可执行清单，而不是复杂流程设计。
+      tone: "有序、冷静、执行导向"
+      style: "把模糊需求转成负责人、截止时间、清单和完成标准。"
+    finance:
+      description: "财务治理人格，聚焦利润、ROI、现金纪律与投入优先级。"
+      system_prompt: >
+        你以 affiliate 初创团队的财务负责人视角工作。优先看单位经济、投入产出、
+        现金压力、对账与花费优先级。任何建议都要说明收益、风险、时间回收周期和停止条件。
+      tone: "克制、量化、风险敏感"
+      style: "先讲财务影响，再讲假设、风险、监控指标和决策门槛。"
+    cto:
+      description: "技术交付人格，聚焦实现、性能、稳定性、成本与回归。"
+      system_prompt: >
+        你以技术负责人视角工作。优先保证实现正确、性能可测、稳定可证、成本可控、回归完整。
+        不用猜测代替证据，不用花哨设计掩盖系统边界。
+      tone: "严谨、证据驱动、务实"
+      style: "先定位事实，再给方案，再给验证与风险。"
+    staff:
+      description: "参谋长人格，负责整理上下文、对齐信息与推动闭环。"
+      system_prompt: >
+        你以参谋长 / 运营中枢视角工作。负责整合上下文、对齐信息、形成行动项和推进闭环，
+        让多人协作中的信息摩擦尽可能降低。
+      tone: "结构化、冷静、协同导向"
+      style: "先汇总共识和分歧，再列行动项、责任人与时序。"
+    sev:
+      description: "事故指挥人格，优先止血、分诊、降级、恢复与复盘。"
+      system_prompt: >
+        你以事故指挥官视角工作。面对故障、超时、异常成本或线上回退时，
+        优先止血、分诊、降级、恢复与复盘，而不是展开冗长讨论。
+      tone: "简短、硬约束、面向恢复"
+      style: "按现象、影响、止血、根因、后续动作输出。"
+
+default_reset_policy:
+  mode: both
+  at_hour: 4
+  idle_minutes: 1440
+  notify: true
+
+display:
+  tool_progress: new
+  tool_progress_command: true
+  tool_progress_overrides:
+    telegram: new
+    qq: new
+
+streaming:
+  enabled: false
+
+security:
+  redact_secrets: true
+
+browser:
+  cloud_provider: local
+  command_timeout: 30
+  inactivity_timeout: 120
+  allow_private_urls: false
+  camofox:
+    managed_persistence: false
+
+terminal:
+  backend: local
+  cwd: "/root"
+  env_passthrough:
+    - ANTHROPIC_API_KEY
+    - OPENAI_API_KEY
+    - OPENAI_BASE_URL
+    - OPENROUTER_API_KEY
+    - OPENROUTER_BASE_URL
+    - HERMES_PROVIDER
+    - HERMES_INFERENCE_USE_CLOUDFLARE_AI_GATEWAY
+    - HERMES_CLOUDFLARE_AI_GATEWAY_PROVIDERS
+    - CLOUDFLARE_AI_GATEWAY_BASE_URL
+    - CLOUDFLARE_API_TOKEN
+    - CLOUDFLARE_AI_GATEWAY_API_KEY
+    - CLOUDFLARE_AI_GATEWAY_ROUTE_GENERAL
+    - CLOUDFLARE_AI_GATEWAY_ROUTE_CODING
+    - CLOUDFLARE_AI_GATEWAY_ROUTE_CREATIVE
+    - CLOUDFLARE_AI_GATEWAY_ROUTE_IMAGE
+    - CLOUDFLARE_AI_GATEWAY_CACHE_MODE
+    - CLOUDFLARE_AI_GATEWAY_CACHE_TTL_SECONDS
+    - CLOUDFLARE_AI_GATEWAY_USE_PROMPT_CACHE_KEY
+    - CLOUDFLARE_AI_GATEWAY_REQUEST_TIMEOUT_MS
+    - CLOUDFLARE_AI_GATEWAY_MAX_ATTEMPTS
+    - CLOUDFLARE_AI_GATEWAY_RETRY_DELAY_MS
+    - CLOUDFLARE_AI_GATEWAY_BACKOFF
+    - HERMES_ENABLE_PROJECT_PLUGINS
+    - SUPERMEMORY_API_KEY
+    - SUPERMEMORY_CONTAINER_TAG
+    - FIRECRAWL_API_KEY
+    - FIRECRAWL_API_URL
+    - PARALLEL_API_KEY
+    - TAVILY_API_KEY
+    - EXA_API_KEY
+    - BROWSERBASE_API_KEY
+    - BROWSERBASE_PROJECT_ID
+    - BROWSER_USE_API_KEY
+    - FIRECRAWL_BROWSER_SESSION_TTL
+    - CAMOFOX_URL
+    - HASS_URL
+    - HASS_TOKEN
+    - API_SERVER_ENABLED
+    - API_SERVER_KEY
+    - API_SERVER_PORT
+    - API_SERVER_HOST
+    - FEISHU_APP_ID
+    - FEISHU_APP_SECRET
+    - FEISHU_DOMAIN
+    - FEISHU_CONNECTION_MODE
+    - FEISHU_ENCRYPT_KEY
+    - FEISHU_VERIFICATION_TOKEN
+    - FEISHU_BITABLE_APP_TOKEN
+    - FEISHU_BITABLE_WIKI_TOKEN
+    - FEISHU_BITABLE_TABLE_ID
+    - FEISHU_MODEL_REGISTRY_MIRROR_ENABLED
+    - FEISHU_MODEL_REGISTRY_SYNC_INTERVAL_SECONDS
+    - FEISHU_STARTUP_SCHEMA_RECHECK_SECONDS
+    - FEISHU_GROUP_POLICY
+    - FEISHU_ALLOWED_USERS
+    - FEISHU_BOT_OPEN_ID
+    - FEISHU_BOT_USER_ID
+    - FEISHU_BOT_NAME
+    - FEISHU_HOME_CHANNEL
+    - HERMES_FEISHU_RESOLVE_SENDER_NAMES
+    - HERMES_FEISHU_MENU_OPEN_BY_OPEN_ID
+    - HERMES_FEISHU_TOOL_CAPABILITIES
+    - HERMES_FEISHU_DEFAULT_WORKSPACE
+    - HERMES_MODAL_MAINTENANCE_HEARTBEAT_ENABLED
+    - HERMES_MODAL_MAINTENANCE_HEARTBEAT_MINUTES
+    - HERMES_MODAL_CHAT_QUEUE_SPAWN_COOLDOWN_SECONDS
+    - HERMES_MODAL_CHAT_QUEUE_WORKER_MEMORY_MB
+    - HERMES_MODAL_CHAT_QUEUE_WORKER_CPU
+    - HERMES_MODAL_CRON_QUEUE_MAX_JOBS_PER_WORKER
+  modal_image: "nikolaik/python-nodejs:python3.11-nodejs20"
+  container_cpu: 1
+  container_memory: 5120
+  container_disk: 51200
+  container_persistent: true
+
+memory:
+  provider: supermemory
+
+skills:
+  startup:
+    - affiliate-os
+    - browser-ops
+  platform_startup:
+    cli:
+      - automation-os
+      - ceo-os
+    feishu:
+      - feishu-workbench
+      - affiliate-os
+      - browser-ops
+    api_server:
+      - ship
+      - gov
+
+plugins:
+  enable_project: true
+
+platform_toolsets:
+  cli:
+    - founder-max
+    - feishu
+    - plugin_startup_ops
+  telegram:
+    - collab-safe
+  qq:
+    - collab-safe
+  feishu:
+    - collab-safe
+    - feishu
+  api_server:
+    - cto-max
+    - plugin_startup_ops
+
+telegram:
+  require_mention: false
+  reactions: false
+  free_response_chats:
+    - "private"
+
+platforms:
+  telegram:
+    enabled: true
+    reply_to_mode: first
+  qq:
+    enabled: false
+    extra:
+      connection_mode: webhook
+      webhook_path: /qq/webhook
+  feishu:
+    enabled: false
+    extra:
+      connection_mode: webhook
+      webhook_path: /feishu/webhook

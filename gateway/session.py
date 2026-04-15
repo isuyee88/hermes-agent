@@ -32,6 +32,9 @@ def _now() -> datetime:
 # PII redaction helpers
 # ---------------------------------------------------------------------------
 
+_PHONE_RE = re.compile(r"^\+?\d[\d\-\s]{6,}$")
+
+
 def _hash_id(value: str) -> str:
     """Deterministic 12-char hex hash of an identifier."""
     return hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
@@ -54,6 +57,10 @@ def _hash_chat_id(value: str) -> str:
         return f"{prefix}:{_hash_id(value[colon + 1:])}"
     return _hash_id(value)
 
+
+def _looks_like_phone(value: str) -> bool:
+    """Return True if *value* looks like a phone number (E.164 or similar)."""
+    return bool(_PHONE_RE.match(value.strip()))
 
 from .config import (
     Platform,
@@ -137,6 +144,15 @@ class SessionSource:
             chat_id_alt=data.get("chat_id_alt"),
         )
     
+    @classmethod
+    def local_cli(cls) -> "SessionSource":
+        """Create a source representing the local CLI."""
+        return cls(
+            platform=Platform.LOCAL,
+            chat_id="cli",
+            chat_name="CLI terminal",
+            chat_type="dm",
+        )
 
 
 @dataclass
@@ -321,7 +337,41 @@ def build_session_context_prompt(
     # Note about explicit targeting
     lines.append("")
     lines.append("*For explicit targeting, use `\"platform:chat_id\"` format if the user provides a specific chat ID.*")
-    
+
+    if context.source.platform == Platform.FEISHU:
+        bitable_app_token = str(os.getenv("FEISHU_BITABLE_APP_TOKEN") or "").strip()
+        bitable_wiki_token = str(os.getenv("FEISHU_BITABLE_WIKI_TOKEN") or "").strip()
+        bitable_table_id = str(os.getenv("FEISHU_BITABLE_TABLE_ID") or "").strip()
+        if bitable_table_id and (bitable_app_token or bitable_wiki_token):
+            lines.append("")
+            lines.append("**Feishu workbench defaults:**")
+            lines.append(
+                "Use the configured default Bitable target for registry/workbench reads when the user means the default table."
+            )
+            lines.append(
+                "Do not ask the user for a table link, app_token, or table_id again unless they want a different table."
+            )
+            lines.append(
+                "Do not claim a user access token is required when the configured target below is enough for the requested action."
+            )
+            lines.append(
+                "For requests like saving keywords/rows into the default Feishu Bitable, call the native `feishu_bitable_*` tools against the configured default target before asking the user for a link or token again."
+            )
+            lines.append(
+                "If the configured default Bitable target returns 403/404, explain that the current default table target is inaccessible or misconfigured; do not say Feishu Bitable capability is unavailable in general."
+            )
+            lines.append(
+                "For default Hermes model catalog questions, prefer the native Hermes model registry tools first instead of querying the mirrored Bitable table."
+            )
+            if bitable_app_token:
+                lines.append(f"- Default Bitable app_token: `{bitable_app_token}`")
+            if bitable_wiki_token:
+                lines.append(f"- Default Bitable wiki_token: `{bitable_wiki_token}`")
+            lines.append(f"- Default Bitable table_id: `{bitable_table_id}`")
+            lines.append(
+                "- Only reveal these identifiers explicitly if the user asks for them or if a tool call truly needs them."
+            )
+
     return "\n".join(lines)
 
 
@@ -369,10 +419,11 @@ class SessionEntry:
     # set was lost on restart, causing redundant re-flushes).
     memory_flushed: bool = False
 
-    # When True the next call to get_or_create_session() will auto-reset
-    # this session (create a new session_id) so the user starts fresh.
-    # Set by /stop to break stuck-resume loops (#7536).
-    suspended: bool = False
+    # Session-level provider/model lease and debug metadata used to keep
+    # messaging turns on a stable route for cache locality and observability.
+    route_lease: Optional[Dict[str, Any]] = None
+    route_debug: Optional[Dict[str, Any]] = None
+    route_metrics: Optional[Dict[str, Any]] = None
     
     def to_dict(self) -> Dict[str, Any]:
         result = {
@@ -392,7 +443,9 @@ class SessionEntry:
             "estimated_cost_usd": self.estimated_cost_usd,
             "cost_status": self.cost_status,
             "memory_flushed": self.memory_flushed,
-            "suspended": self.suspended,
+            "route_lease": self.route_lease or None,
+            "route_debug": self.route_debug or {},
+            "route_metrics": self.route_metrics or {},
         }
         if self.origin:
             result["origin"] = self.origin.to_dict()
@@ -429,7 +482,9 @@ class SessionEntry:
             estimated_cost_usd=data.get("estimated_cost_usd", 0.0),
             cost_status=data.get("cost_status", "unknown"),
             memory_flushed=data.get("memory_flushed", False),
-            suspended=data.get("suspended", False),
+            route_lease=data.get("route_lease"),
+            route_debug=data.get("route_debug") or {},
+            route_metrics=data.get("route_metrics") or {},
         )
 
 
@@ -501,7 +556,8 @@ class SessionStore:
     """
     
     def __init__(self, sessions_dir: Path, config: GatewayConfig,
-                 has_active_processes_fn=None):
+                 has_active_processes_fn=None,
+                 on_auto_reset=None):
         self.sessions_dir = sessions_dir
         self.config = config
         self._entries: Dict[str, SessionEntry] = {}
@@ -705,12 +761,7 @@ class SessionStore:
             if session_key in self._entries and not force_new:
                 entry = self._entries[session_key]
 
-                # Auto-reset sessions marked as suspended (e.g. after /stop
-                # broke a stuck loop — #7536).
-                if entry.suspended:
-                    reset_reason = "suspended"
-                else:
-                    reset_reason = self._should_reset(entry, source)
+                reset_reason = self._should_reset(entry, source)
                 if not reset_reason:
                     entry.updated_at = now
                     self._save()
@@ -765,12 +816,50 @@ class SessionStore:
             except Exception as e:
                 print(f"[gateway] Warning: Failed to create SQLite session: {e}")
 
+        # Seed new DM thread sessions with parent DM session history.
+        # When a bot reply creates a Slack thread and the user responds in it,
+        # the thread gets a new session (keyed by thread_ts).  Without seeding,
+        # the thread session starts with zero context — the user's original
+        # question and the bot's answer are invisible.  Fix: copy the parent
+        # DM session's transcript into the new thread session so context carries
+        # over while still keeping threads isolated from each other.
+        if (
+            source.chat_type == "dm"
+            and source.thread_id
+            and entry.created_at == entry.updated_at  # brand-new session
+            and not was_auto_reset
+        ):
+            parent_source = SessionSource(
+                platform=source.platform,
+                chat_id=source.chat_id,
+                chat_type="dm",
+                user_id=source.user_id,
+                # no thread_id — this is the parent DM session
+            )
+            parent_key = self._generate_session_key(parent_source)
+            with self._lock:
+                parent_entry = self._entries.get(parent_key)
+            if parent_entry and parent_entry.session_id != entry.session_id:
+                try:
+                    parent_history = self.load_transcript(parent_entry.session_id)
+                    if parent_history:
+                        self.rewrite_transcript(entry.session_id, parent_history)
+                        logger.info(
+                            "[Session] Seeded DM thread session %s with %d messages from parent %s",
+                            entry.session_id, len(parent_history), parent_entry.session_id,
+                        )
+                except Exception as e:
+                    logger.warning("[Session] Failed to seed thread session: %s", e)
+
         return entry
 
     def update_session(
         self,
         session_key: str,
         last_prompt_tokens: int = None,
+        route_lease: Optional[Dict[str, Any]] = None,
+        route_debug: Optional[Dict[str, Any]] = None,
+        route_metrics: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Update lightweight session metadata after an interaction."""
         with self._lock:
@@ -781,45 +870,13 @@ class SessionStore:
                 entry.updated_at = _now()
                 if last_prompt_tokens is not None:
                     entry.last_prompt_tokens = last_prompt_tokens
+                if route_lease is not None:
+                    entry.route_lease = route_lease
+                if route_debug is not None:
+                    entry.route_debug = route_debug
+                if route_metrics is not None:
+                    entry.route_metrics = route_metrics
                 self._save()
-
-    def suspend_session(self, session_key: str) -> bool:
-        """Mark a session as suspended so it auto-resets on next access.
-
-        Used by ``/stop`` to prevent stuck sessions from being resumed
-        after a gateway restart (#7536).  Returns True if the session
-        existed and was marked.
-        """
-        with self._lock:
-            self._ensure_loaded_locked()
-            if session_key in self._entries:
-                self._entries[session_key].suspended = True
-                self._save()
-                return True
-        return False
-
-    def suspend_recently_active(self, max_age_seconds: int = 120) -> int:
-        """Mark recently-active sessions as suspended.
-
-        Called on gateway startup to prevent sessions that were likely
-        in-flight when the gateway last exited from being blindly resumed
-        (#7536).  Only suspends sessions updated within *max_age_seconds*
-        to avoid resetting long-idle sessions that are harmless to resume.
-        Returns the number of sessions that were suspended.
-        """
-        from datetime import timedelta
-
-        cutoff = _now() - timedelta(seconds=max_age_seconds)
-        count = 0
-        with self._lock:
-            self._ensure_loaded_locked()
-            for entry in self._entries.values():
-                if not entry.suspended and entry.updated_at >= cutoff:
-                    entry.suspended = True
-                    count += 1
-            if count:
-                self._save()
-        return count
 
     def reset_session(self, session_key: str) -> Optional[SessionEntry]:
         """Force reset a session, creating a new session ID."""
@@ -878,8 +935,7 @@ class SessionStore:
         Used by ``/resume`` to restore a previously-named session.
         Ends the current session in SQLite (like reset), but instead of
         generating a fresh session ID, re-uses ``target_session_id`` so the
-        old transcript is loaded on the next message. If the target session was
-        previously ended, re-open it so gateway resume semantics match the CLI.
+        old transcript is loaded on the next message.
         """
         db_end_session_id = None
         new_entry = None
@@ -918,12 +974,6 @@ class SessionStore:
                 self._db.end_session(db_end_session_id, "session_switch")
             except Exception as e:
                 logger.debug("Session DB end_session failed: %s", e)
-
-        if self._db:
-            try:
-                self._db.reopen_session(target_session_id)
-            except Exception as e:
-                logger.debug("Session DB reopen_session failed: %s", e)
 
         return new_entry
 
