@@ -71,6 +71,32 @@ tools/model_registry_refresh.py
 tests/tools/test_model_registry_refresh.py
 # Modal inspect temp
 tmp-modal-inspect/
-# Random hash-named temp files
-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*
-_[0-9a-f]*
+# Random hash-named temp files at repo root
+/[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*
+/_[0-9a-f]*
+.hermes/
+build/
+output/
+.tmp_modal_logs_*.txt
+.tmp_perf_cost_*.json
+.tmp_webhooks.txt
+.tmp_nvidia_models.html
+.tmp_official_*.md
+.tmp_official_*.toml
+tmp_triparty_*.txt
+tmp_modal_recent_*.txt
+modal_full.log
+cf_feishu_trace.json
+wf_instance_details.json
+feishu_kpi_test_report_*.json
+feishu_bot_test_*.json
+feishu_tenant_token_*.txt
+cloudflare/feishu-gateway/.cf-out/
+cloudflare/feishu-gateway/.wrangler/
+cloudflare/feishu-gateway/.tmp-cf-*/
+cloudflare/feishu-gateway/.dev.vars
+cloudflare/feishu-gateway/dist/
+cloudflare/feishu-gateway/node_modules/
+cloudflare/feishu-gateway/tmp_wrangler_tail.jsonl
+cloudflare/feishu-gateway/*.tgz
+cloudflare/workflow-benchmark/output/

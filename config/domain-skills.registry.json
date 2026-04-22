@@ -1,0 +1,182 @@
+{
+  "version": 1,
+  "generated_at": "2026-04-19T00:00:00Z",
+  "templates": {
+    "content_docs": {
+      "kind": "content",
+      "description": "Documentation and developer content site",
+      "preferred_actions": [
+        "open the direct content URL before the homepage",
+        "prefer docs, reference, guide, and changelog pages",
+        "summarize navigation structure only when it helps the answer"
+      ],
+      "avoid_actions": [
+        "blind homepage crawl",
+        "interactive form submission unless explicitly requested"
+      ]
+    },
+    "content_pricing": {
+      "kind": "content",
+      "description": "Pricing, plans, and billing information page",
+      "preferred_actions": [
+        "open the pricing or plans URL directly",
+        "extract plan names, limits, and billing qualifiers",
+        "compare table rows carefully before summarizing"
+      ],
+      "avoid_actions": [
+        "navigating into account areas unless explicitly requested"
+      ]
+    },
+    "login_portal": {
+      "kind": "interactive_light",
+      "description": "Login or signup entry page",
+      "preferred_actions": [
+        "use the direct auth entry URL first",
+        "locate login, signup, password reset, and SSO entry points",
+        "capture field labels and blockers before attempting interaction"
+      ],
+      "avoid_actions": [
+        "blind homepage scan when a direct auth URL is known"
+      ]
+    },
+    "console_dashboard": {
+      "kind": "interactive_heavy",
+      "description": "Dashboard or console with authenticated interactions",
+      "preferred_actions": [
+        "prefer deep links into console areas when available",
+        "map the left navigation and primary actions before multi-step work",
+        "treat uploads, forms, and destructive actions as high risk"
+      ],
+      "avoid_actions": [
+        "guessing hidden settings paths",
+        "destructive actions without explicit user confirmation"
+      ]
+    }
+  },
+  "domains": {
+    "developers.cloudflare.com": {
+      "skill_name": "site.cloudflare-developers-docs",
+      "template": "content_docs",
+      "tier": 1,
+      "entry_url": "https://developers.cloudflare.com/",
+      "site_intents": ["docs", "api"],
+      "browser_strategy": "local_preferred",
+      "notes": [
+        "Prefer docs, workers, ai-gateway, and reference pages over marketing surfaces.",
+        "Use direct documentation URLs instead of the homepage whenever possible."
+      ],
+      "common_actions": [
+        "follow sidebar or top navigation into reference pages",
+        "quote exact limits or headers only after checking the target page"
+      ],
+      "disabled_actions": [
+        "homepage-first exploration"
+      ]
+    },
+    "browserbase.com": {
+      "skill_name": "site.browserbase-main",
+      "template": "login_portal",
+      "tier": 1,
+      "entry_url": "https://www.browserbase.com/",
+      "site_intents": ["pricing", "login", "signup"],
+      "browser_strategy": "local_preferred",
+      "notes": [
+        "Pricing, docs, and signup flows are common entry points.",
+        "Escalate to cloud only when local automation hits bot detection or auth friction."
+      ],
+      "common_actions": [
+        "open pricing or login directly when requested",
+        "surface signup, login, and docs links before navigating broadly"
+      ]
+    },
+    "docs.browserbase.com": {
+      "skill_name": "site.browserbase-docs",
+      "template": "content_docs",
+      "tier": 1,
+      "entry_url": "https://docs.browserbase.com/",
+      "site_intents": ["docs", "api"],
+      "browser_strategy": "local_preferred",
+      "notes": [
+        "Treat docs and API reference as content work unless the user explicitly requests browser interaction."
+      ],
+      "common_actions": [
+        "prefer API reference, SDK, and integration pages"
+      ]
+    },
+    "platform.openai.com": {
+      "skill_name": "site.openai-platform",
+      "template": "console_dashboard",
+      "tier": 1,
+      "entry_url": "https://platform.openai.com/",
+      "site_intents": ["docs", "login", "navigation"],
+      "browser_strategy": "local_preferred",
+      "notes": [
+        "Docs and account surfaces coexist; distinguish content retrieval from authenticated console work."
+      ],
+      "common_actions": [
+        "open docs, pricing, or dashboard deep links directly",
+        "capture account gating before continuing"
+      ]
+    },
+    "docs.github.com": {
+      "skill_name": "site.github-docs",
+      "template": "content_docs",
+      "tier": 1,
+      "entry_url": "https://docs.github.com/",
+      "site_intents": ["docs", "help"],
+      "browser_strategy": "local_preferred",
+      "notes": [
+        "Prefer GitHub Docs over the main github.com UI for content questions."
+      ]
+    },
+    "github.com": {
+      "skill_name": "site.github-main",
+      "template": "login_portal",
+      "tier": 1,
+      "entry_url": "https://github.com/login",
+      "site_intents": ["login", "signup", "navigation"],
+      "browser_strategy": "local_preferred",
+      "notes": [
+        "Repository content can often be answered from direct URLs without browsing the homepage."
+      ],
+      "common_actions": [
+        "use repository, issue, or pull-request URLs directly when present",
+        "treat auth-required flows as login portal tasks"
+      ]
+    },
+    "dashboard.stripe.com": {
+      "skill_name": "site.stripe-dashboard",
+      "template": "console_dashboard",
+      "tier": 1,
+      "entry_url": "https://dashboard.stripe.com/login",
+      "site_intents": ["login", "navigation"],
+      "browser_strategy": "cloud_required",
+      "notes": [
+        "Stripe dashboard often uses stronger bot checks and authenticated multi-step flows."
+      ],
+      "common_actions": [
+        "open the login page directly",
+        "escalate to cloud browser for authenticated console tasks"
+      ]
+    },
+    "stripe.com": {
+      "skill_name": "site.stripe-site",
+      "template": "content_pricing",
+      "tier": 2,
+      "entry_url": "https://stripe.com/pricing",
+      "site_intents": ["pricing", "docs", "help"],
+      "browser_strategy": "local_preferred",
+      "notes": [
+        "Pricing and docs content should remain on the lightweight path."
+      ]
+    },
+    "docs.anthropic.com": {
+      "skill_name": "site.anthropic-docs",
+      "template": "content_docs",
+      "tier": 2,
+      "entry_url": "https://docs.anthropic.com/",
+      "site_intents": ["docs", "api"],
+      "browser_strategy": "local_preferred"
+    }
+  }
+}
