@@ -138,6 +138,13 @@ PLATFORMS = {
     "webhook": {"label": "🔗 Webhook", "default_toolset": "hermes-webhook"},
 }
 
+# Native platform API toolsets that should stay available alongside the
+# generic composite platform defaults. Feishu is the current case where the
+# messaging platform also exposes a first-class workspace API surface.
+_PLATFORM_NATIVE_TOOLSETS = {
+    "feishu": {"feishu"},
+}
+
 
 # ─── Tool Categories (provider-aware configuration) ──────────────────────────
 # Maps toolset keys to their provider options. When a toolset is newly enabled,
@@ -523,6 +530,8 @@ def _get_platform_tools(
             ts_tools = set(resolve_toolset(ts_key))
             if ts_tools and ts_tools.issubset(all_tool_names):
                 enabled_toolsets.add(ts_key)
+
+    enabled_toolsets.update(_PLATFORM_NATIVE_TOOLSETS.get(platform, set()))
 
     # Plugin toolsets: enabled by default unless explicitly disabled.
     # A plugin toolset is "known" for a platform once `hermes tools`

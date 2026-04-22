@@ -19,6 +19,7 @@ from tools.feishu_api import (
     get_model_registry_path,
     mirror_model_registry_to_bitable,
     normalize_document_summary,
+    normalize_sheet_range,
     resolve_bitable_target,
 )
 from tools.feishu_tools import (
@@ -159,7 +160,10 @@ class TestFeishuDocTools:
 
     def test_doc_append_markdown_reports_inserted_blocks(self):
         client = FakeClient()
-        client.request_json = lambda *_args, **_kwargs: {"document_revision_id": 7}
+        def _request_json(method, path, **kwargs):
+            client.calls.append((method, path, kwargs))
+            return {"document_revision_id": 7}
+        client.request_json = _request_json
         with patch("tools.feishu_tools._client", return_value=client):
             result = json.loads(
                 feishu_doc_append_markdown_tool(
@@ -169,6 +173,16 @@ class TestFeishuDocTools:
 
         assert result["success"] is True
         assert result["inserted_blocks"] == 2
+        assert client.calls == [
+            (
+                "POST",
+                "/open-apis/docx/v1/documents/doxcnProject123/blocks/doxcnProject123/children",
+                {"json_body": {"children": [
+                    {"block_type": 2, "text": {"elements": [{"text_run": {"content": "First line"}}]}},
+                    {"block_type": 2, "text": {"elements": [{"text_run": {"content": "Second line"}}]}},
+                ], "index": -1}},
+            )
+        ]
 
     def test_doc_replace_markdown_clears_existing_children_then_inserts(self):
         client = FakeClient()
@@ -211,8 +225,8 @@ class TestFeishuDocTools:
                 "POST",
                 "/open-apis/docx/v1/documents/doxcnProject123/blocks/doxcnProject123/children",
                 {"json_body": {"children": [
-                    {"block_type": 2, "paragraph": {"elements": [{"text_run": {"content": "Replacement line 1"}, "type": "text_run"}]}},
-                    {"block_type": 2, "paragraph": {"elements": [{"text_run": {"content": "Replacement line 2"}, "type": "text_run"}]}},
+                    {"block_type": 2, "text": {"elements": [{"text_run": {"content": "Replacement line 1"}}]}},
+                    {"block_type": 2, "text": {"elements": [{"text_run": {"content": "Replacement line 2"}}]}},
                 ], "index": 0}},
             ),
         ]
@@ -267,7 +281,9 @@ class TestFeishuLookupAndSheets:
         client = FakeClient()
         responses = iter(
             [
+                {"sheets": [{"sheetId": "sheet_123", "title": "Sheet1", "index": 0}]},
                 {"valueRange": {"values": [["A1", "B1"]]}},
+                {"sheets": [{"sheetId": "sheet_123", "title": "Sheet1", "index": 0}]},
                 {"updatedRange": "Sheet1!A1:B1", "updatedRows": 1},
             ]
         )
@@ -290,6 +306,21 @@ class TestFeishuLookupAndSheets:
 
         assert read_result["values"] == [["A1", "B1"]]
         assert write_result["updated_rows"] == 1
+
+    def test_normalize_sheet_range_resolves_title_and_default_sheet(self):
+        client = FakeClient()
+        client.request_json = lambda *_args, **_kwargs: {
+            "sheets": [
+                {"sheetId": "sheet_123", "title": "Sheet1", "index": 0},
+                {"sheetId": "sheet_456", "title": "Sheet2", "index": 1},
+            ]
+        }
+
+        by_title = normalize_sheet_range(client, spreadsheet_token="shtcn123", range_name="Sheet2!A1:B2")
+        default_sheet = normalize_sheet_range(client, spreadsheet_token="shtcn123", range_name="A1:B2")
+
+        assert by_title == "sheet_456!A1:B2"
+        assert default_sheet == "sheet_123!A1:B2"
 
     def test_sheet_create_returns_token(self):
         client = FakeClient()

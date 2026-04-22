@@ -31,7 +31,15 @@ _DEFAULT_WEBSITE_BLOCKLIST = {
 # Cache: parsed policy + timestamp.  Avoids re-reading config.yaml on every
 # URL check (a web_crawl with 50 pages would otherwise mean 51 YAML parses).
 _CACHE_TTL_SECONDS = 30.0
-_cache_lock = threading.Lock()
+_cache_lock = None
+
+
+def _get_cache_lock_lock() -> threading.Lock:
+    """Lazy-initialized lock to avoid Modal serialization issues."""
+    global _cache_lock
+    if _cache_lock is None:
+        _cache_lock = threading.Lock()
+    return _cache_lock
 _cached_policy: Optional[Dict[str, Any]] = None
 _cached_policy_path: Optional[str] = None
 _cached_policy_time: float = 0.0
@@ -142,7 +150,7 @@ def load_website_blocklist(config_path: Optional[Path] = None) -> Dict[str, Any]
 
     # Return cached policy if still fresh and same path
     if config_path is None:
-        with _cache_lock:
+        with _get_cache_lock_lock():
             if (
                 _cached_policy is not None
                 and _cached_policy_path == resolved_path
@@ -191,7 +199,7 @@ def load_website_blocklist(config_path: Optional[Path] = None) -> Dict[str, Any]
 
     # Cache the result (only for the default path — explicit paths are tests)
     if config_path == _get_default_config_path():
-        with _cache_lock:
+        with _get_cache_lock_lock():
             _cached_policy = result
             _cached_policy_path = "__default__"
             _cached_policy_time = now
@@ -202,7 +210,7 @@ def load_website_blocklist(config_path: Optional[Path] = None) -> Dict[str, Any]
 def invalidate_cache() -> None:
     """Force the next ``check_website_access`` call to re-read config."""
     global _cached_policy
-    with _cache_lock:
+    with _get_cache_lock_lock():
         _cached_policy = None
 
 
@@ -242,7 +250,7 @@ def check_website_access(url: str, config_path: Optional[Path] = None) -> Option
     # Fast path: if no explicit config_path and the cached policy is disabled
     # or empty, skip all work (no YAML read, no host extraction).
     if config_path is None:
-        with _cache_lock:
+        with _get_cache_lock_lock():
             if _cached_policy is not None and not _cached_policy.get("enabled"):
                 return None
 

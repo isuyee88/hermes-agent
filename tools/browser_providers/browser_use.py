@@ -14,7 +14,15 @@ from tools.tool_backend_helpers import managed_nous_tools_enabled
 
 logger = logging.getLogger(__name__)
 _pending_create_keys: Dict[str, str] = {}
-_pending_create_keys_lock = threading.Lock()
+_pending_create_keys_lock = None
+
+
+def _get_pending_create_keys_lock_lock() -> threading.Lock:
+    """Lazy-initialized lock to avoid Modal serialization issues."""
+    global _pending_create_keys_lock
+    if _pending_create_keys_lock is None:
+        _pending_create_keys_lock = threading.Lock()
+    return _pending_create_keys_lock
 
 _BASE_URL = "https://api.browser-use.com/api/v3"
 _DEFAULT_MANAGED_TIMEOUT_MINUTES = 5
@@ -22,7 +30,7 @@ _DEFAULT_MANAGED_PROXY_COUNTRY_CODE = "us"
 
 
 def _get_or_create_pending_create_key(task_id: str) -> str:
-    with _pending_create_keys_lock:
+    with _get_pending_create_keys_lock_lock():
         existing = _pending_create_keys.get(task_id)
         if existing:
             return existing
@@ -33,7 +41,7 @@ def _get_or_create_pending_create_key(task_id: str) -> str:
 
 
 def _clear_pending_create_key(task_id: str) -> None:
-    with _pending_create_keys_lock:
+    with _get_pending_create_keys_lock_lock():
         _pending_create_keys.pop(task_id, None)
 
 

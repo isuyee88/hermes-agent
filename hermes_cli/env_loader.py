@@ -5,7 +5,11 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from dotenv import load_dotenv
+try:
+    from dotenv import load_dotenv
+except ImportError:  # pragma: no cover - fallback for lean test envs
+    def load_dotenv(*_args, **_kwargs):
+        return False
 
 
 def _load_dotenv_with_fallback(path: Path, *, override: bool) -> None:

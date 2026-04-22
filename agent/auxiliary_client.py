@@ -1645,7 +1645,16 @@ def auxiliary_max_tokens_param(value: int) -> dict:
 
 # Client cache: (provider, async_mode, base_url, api_key) -> (client, default_model)
 _client_cache: Dict[tuple, tuple] = {}
-_client_cache_lock = threading.Lock()
+_client_cache_lock = None
+
+
+def _get_client_cache_lock() -> threading.Lock:
+    """Lazy-initialized lock to avoid Modal serialization issues."""
+    global _client_cache_lock
+    if _client_cache_lock is None:
+        _client_cache_lock = threading.Lock()
+    return _client_cache_lock
+
 
 
 def neuter_async_httpx_del() -> None:
@@ -1709,7 +1718,7 @@ def shutdown_cached_clients() -> None:
     """
     import inspect
 
-    with _client_cache_lock:
+    with _get_client_cache_lock():
         for key, entry in list(_client_cache.items()):
             client = entry[0]
             if client is None:
@@ -1736,7 +1745,7 @@ def cleanup_stale_async_clients() -> None:
     This is defense-in-depth — the primary fix is ``neuter_async_httpx_del``
     which disables ``__del__`` entirely.
     """
-    with _client_cache_lock:
+    with _get_client_cache_lock():
         stale_keys = []
         for key, entry in _client_cache.items():
             client, _default, cached_loop = entry
@@ -1777,7 +1786,7 @@ def _get_cached_client(
         except RuntimeError:
             pass
     cache_key = (provider, async_mode, base_url or "", api_key or "", loop_id)
-    with _client_cache_lock:
+    with _get_client_cache_lock():
         if cache_key in _client_cache:
             cached_client, cached_default, cached_loop = _client_cache[cache_key]
             if async_mode:
@@ -1803,7 +1812,7 @@ def _get_cached_client(
         # For async clients, remember which loop they were created on so we
         # can detect stale entries later.
         bound_loop = current_loop
-        with _client_cache_lock:
+        with _get_client_cache_lock():
             if cache_key not in _client_cache:
                 _client_cache[cache_key] = (client, default_model, bound_loop)
             else:

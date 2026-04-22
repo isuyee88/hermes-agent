@@ -5,7 +5,7 @@ Hermes Plugin System
 Discovers, loads, and manages plugins from three sources:
 
 1. **User plugins**   – ``~/.hermes/plugins/<name>/``
-2. **Project plugins** – ``./.hermes/plugins/<name>/`` (opt-in via
+2. **Project plugins** – nearest ancestor ``.hermes/plugins/<name>/`` (opt-in via
    ``HERMES_ENABLE_PROJECT_PLUGINS``)
 3. **Pip plugins**     – packages that expose the ``hermes_agent.plugins``
    entry-point group.
@@ -73,6 +73,36 @@ _NS_PARENT = "hermes_plugins"
 def _env_enabled(name: str) -> bool:
     """Return True when an env var is set to a truthy opt-in value."""
     return env_var_enabled(name)
+
+
+def _project_plugins_enabled() -> bool:
+    """Enable project-local plugins via env var or config.yaml."""
+    if _env_enabled("HERMES_ENABLE_PROJECT_PLUGINS"):
+        return True
+    try:
+        from hermes_cli.config import load_config
+
+        config = load_config()
+        return bool(config.get("plugins", {}).get("enable_project", False))
+    except Exception:
+        return False
+
+
+def _find_project_plugins_dir(start: Path | None = None) -> Path:
+    """Return the nearest project-local plugin directory for the current cwd.
+
+    We walk upward so nested app directories (for example Modal deploy roots)
+    can still discover a repository-level ``.hermes/plugins`` folder.
+    If nothing exists yet, fall back to the cwd-local path so callers can
+    create or scan the conventional location without special casing.
+    """
+    current = (start or Path.cwd()).resolve()
+    candidates = [current, *current.parents]
+    for base in candidates:
+        plugin_dir = base / ".hermes" / "plugins"
+        if plugin_dir.is_dir():
+            return plugin_dir
+    return current / ".hermes" / "plugins"
 
 
 def _get_disabled_plugins() -> set:
@@ -264,9 +294,9 @@ class PluginManager:
         user_dir = get_hermes_home() / "plugins"
         manifests.extend(self._scan_directory(user_dir, source="user"))
 
-        # 2. Project plugins (./.hermes/plugins/)
-        if _env_enabled("HERMES_ENABLE_PROJECT_PLUGINS"):
-            project_dir = Path.cwd() / ".hermes" / "plugins"
+        # 2. Project plugins (nearest ancestor ./.hermes/plugins/)
+        if _project_plugins_enabled():
+            project_dir = _find_project_plugins_dir()
             manifests.extend(self._scan_directory(project_dir, source="project"))
 
         # 3. Pip / entry-point plugins
@@ -585,7 +615,7 @@ def get_plugin_toolsets() -> List[tuple]:
     toolset_tools: Dict[str, List[str]] = {}
     toolset_plugin: Dict[str, LoadedPlugin] = {}
     for tool_name in manager._plugin_tool_names:
-        entry = registry._tools.get(tool_name)
+        entry = registry.get_entry(tool_name)
         if not entry:
             continue
         ts = entry.toolset
@@ -594,7 +624,7 @@ def get_plugin_toolsets() -> List[tuple]:
     # Map toolsets back to the plugin that registered them
     for _name, loaded in manager._plugins.items():
         for tool_name in loaded.tools_registered:
-            entry = registry._tools.get(tool_name)
+            entry = registry.get_entry(tool_name)
             if entry and entry.toolset in toolset_tools:
                 toolset_plugin.setdefault(entry.toolset, loaded)
 

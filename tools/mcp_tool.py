@@ -886,7 +886,7 @@ class MCPServerTask:
             # Capture the newly spawned subprocess PID for force-kill cleanup.
             new_pids = _snapshot_child_pids() - pids_before
             if new_pids:
-                with _lock:
+                with _get_lock():
                     _stdio_pids.update(new_pids)
             async with ClientSession(read_stream, write_stream, **sampling_kwargs) as session:
                 await session.initialize()
@@ -896,7 +896,7 @@ class MCPServerTask:
                 await self._shutdown_event.wait()
         # Context exited cleanly — subprocess was terminated by the SDK.
         if new_pids:
-            with _lock:
+            with _get_lock():
                 _stdio_pids.difference_update(new_pids)
 
     async def _run_http(self, config: dict):
@@ -1100,7 +1100,16 @@ _mcp_loop: Optional[asyncio.AbstractEventLoop] = None
 _mcp_thread: Optional[threading.Thread] = None
 
 # Protects _mcp_loop, _mcp_thread, _servers, and _stdio_pids.
-_lock = threading.Lock()
+_lock = None
+
+
+def _get_lock() -> threading.Lock:
+    """Lazy-initialized lock to avoid Modal serialization issues."""
+    global _lock
+    if _lock is None:
+        _lock = threading.Lock()
+    return _lock
+
 
 # PIDs of stdio MCP server subprocesses.  Tracked so we can force-kill
 # them on shutdown if the graceful cleanup (SDK context-manager teardown)
@@ -1153,7 +1162,7 @@ def _mcp_loop_exception_handler(loop, context):
 def _ensure_mcp_loop():
     """Start the background event loop thread if not already running."""
     global _mcp_loop, _mcp_thread
-    with _lock:
+    with _get_lock():
         if _mcp_loop is not None and _mcp_loop.is_running():
             return
         _mcp_loop = asyncio.new_event_loop()
@@ -1168,7 +1177,7 @@ def _ensure_mcp_loop():
 
 def _run_on_mcp_loop(coro, timeout: float = 30):
     """Schedule a coroutine on the MCP event loop and block until done."""
-    with _lock:
+    with _get_lock():
         loop = _mcp_loop
     if loop is None or not loop.is_running():
         raise RuntimeError("MCP event loop is not running")
@@ -1261,7 +1270,7 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
     """
 
     def _handler(args: dict, **kwargs) -> str:
-        with _lock:
+        with _get_lock():
             server = _servers.get(server_name)
         if not server or not server.session:
             return json.dumps({
@@ -1315,7 +1324,7 @@ def _make_list_resources_handler(server_name: str, tool_timeout: float):
     """Return a sync handler that lists resources from an MCP server."""
 
     def _handler(args: dict, **kwargs) -> str:
-        with _lock:
+        with _get_lock():
             server = _servers.get(server_name)
         if not server or not server.session:
             return json.dumps({
@@ -1359,7 +1368,7 @@ def _make_read_resource_handler(server_name: str, tool_timeout: float):
     def _handler(args: dict, **kwargs) -> str:
         from tools.registry import tool_error
 
-        with _lock:
+        with _get_lock():
             server = _servers.get(server_name)
         if not server or not server.session:
             return json.dumps({
@@ -1401,7 +1410,7 @@ def _make_list_prompts_handler(server_name: str, tool_timeout: float):
     """Return a sync handler that lists prompts from an MCP server."""
 
     def _handler(args: dict, **kwargs) -> str:
-        with _lock:
+        with _get_lock():
             server = _servers.get(server_name)
         if not server or not server.session:
             return json.dumps({
@@ -1450,7 +1459,7 @@ def _make_get_prompt_handler(server_name: str, tool_timeout: float):
     def _handler(args: dict, **kwargs) -> str:
         from tools.registry import tool_error
 
-        with _lock:
+        with _get_lock():
             server = _servers.get(server_name)
         if not server or not server.session:
             return json.dumps({
@@ -1503,7 +1512,7 @@ def _make_check_fn(server_name: str):
     """Return a check function that verifies the MCP connection is alive."""
 
     def _check() -> bool:
-        with _lock:
+        with _get_lock():
             server = _servers.get(server_name)
         return server is not None and server.session is not None
 
@@ -1882,7 +1891,7 @@ async def _discover_and_register_server(name: str, config: dict) -> List[str]:
         _connect_server(name, config),
         timeout=connect_timeout,
     )
-    with _lock:
+    with _get_lock():
         _servers[name] = server
 
     registered_names = _register_server_tools(name, server, config)
@@ -1923,7 +1932,7 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
 
     # Only attempt servers that aren't already connected and are enabled
     # (enabled: false skips the server entirely without removing its config)
-    with _lock:
+    with _get_lock():
         new_servers = {
             k: v
             for k, v in servers.items()
@@ -1965,7 +1974,7 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
     _sync_mcp_toolsets(list(servers.keys()))
 
     # Log a summary so ACP callers get visibility into what was registered.
-    with _lock:
+    with _get_lock():
         connected = [n for n in new_servers if n in _servers]
         new_tool_count = sum(
             len(getattr(_servers[n], "_registered_tool_names", []))
@@ -2006,7 +2015,7 @@ def discover_mcp_tools() -> List[str]:
         logger.debug("No MCP servers configured")
         return []
 
-    with _lock:
+    with _get_lock():
         new_server_names = [
             name
             for name, cfg in servers.items()
@@ -2017,7 +2026,7 @@ def discover_mcp_tools() -> List[str]:
     if not new_server_names:
         return tool_names
 
-    with _lock:
+    with _get_lock():
         connected_server_names = [name for name in new_server_names if name in _servers]
         new_tool_count = sum(
             len(getattr(_servers[name], "_registered_tool_names", []))
@@ -2047,7 +2056,7 @@ def get_mcp_status() -> List[dict]:
     if not configured:
         return result
 
-    with _lock:
+    with _get_lock():
         active_servers = dict(_servers)
 
     for name, cfg in configured.items():
@@ -2147,7 +2156,7 @@ def shutdown_mcp_servers():
     the anyio cancel-scope cleanup happens in the same Task that opened it.
     All servers are shut down in parallel via ``asyncio.gather``.
     """
-    with _lock:
+    with _get_lock():
         servers_snapshot = list(_servers.values())
 
     # Fast path: nothing to shut down.
@@ -2165,10 +2174,10 @@ def shutdown_mcp_servers():
                 logger.debug(
                     "Error closing MCP server '%s': %s", server.name, result,
                 )
-        with _lock:
+        with _get_lock():
             _servers.clear()
 
-    with _lock:
+    with _get_lock():
         loop = _mcp_loop
     if loop is not None and loop.is_running():
         try:
@@ -2191,7 +2200,7 @@ def _kill_orphaned_mcp_children() -> None:
     """
     import signal as _signal
 
-    with _lock:
+    with _get_lock():
         pids = list(_stdio_pids)
         _stdio_pids.clear()
 
@@ -2206,7 +2215,7 @@ def _kill_orphaned_mcp_children() -> None:
 def _stop_mcp_loop():
     """Stop the background event loop and join its thread."""
     global _mcp_loop, _mcp_thread
-    with _lock:
+    with _get_lock():
         loop = _mcp_loop
         thread = _mcp_thread
         _mcp_loop = None

@@ -23,6 +23,19 @@ This skill teaches Hermes to treat Feishu as a real workbench, not just a chat t
 3. Hermes local registry, session state, and route lease remain the truth source.
 4. Bitable is an operator mirror and console, not live routing truth.
 
+## Recommended Organization Modes
+
+- `ceo + ceo-os`
+  用于日常项目推进、工作台协同和默认 Feishu 主会话。
+- `staff + ceo-os`
+  用于纪要、跨模块同步、行动项整理和推进闭环。
+- `grow + growth-os`
+  用于菜单、卡片、模型切换体验和工作台产品化优化。
+- `sev + gov + retro`
+  用于回调超时、卡片报错、重试率异常、线上回归事故。
+
+注意：这些人格和组织技能只影响分析与回执风格，不改变 Feishu 控制面的直连 handler 优先级。
+
 ## Native Hermes Tool Map
 
 ### Docs

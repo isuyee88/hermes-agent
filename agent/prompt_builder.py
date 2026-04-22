@@ -305,7 +305,18 @@ PLATFORM_HINTS = {
     "feishu": (
         "You are on a text messaging communication platform, Feishu/Lark. "
         "Prefer plain text over markdown-heavy formatting so replies stay readable "
-        "in chat. You can send media files natively: to deliver a file to the user, "
+        "in chat. Native Feishu workspace tools are available in this conversation, "
+        "including Docs, Sheets, Bitable, chat delivery, and file operations via "
+        "the `feishu_*` tool family. "
+        "If this turn exposes `browser_*` tools, you can also operate a real browser "
+        "for navigation, clicking, typing, registration flows, screenshots, and live "
+        "web verification; do not claim browser automation is unavailable when those "
+        "tools are present. "
+        "When the user asks you to read, write, update, send, or fetch something in "
+        "Feishu, use those native tools instead of claiming that Feishu access is unavailable. "
+        "When a default Feishu Bitable target is configured in the session context, treat it as "
+        "the write target for ordinary table-save requests unless the user explicitly asks for a different table. "
+        "You can send media files natively: to deliver a file to the user, "
         "include MEDIA:/absolute/path/to/file in your response. Images (.png, .jpg, "
         ".jpeg, .webp) are sent as native image messages, and documents such as "
         ".pdf, .txt, .md, and .docx are sent as native file attachments. You can "
@@ -385,7 +396,16 @@ CONTEXT_TRUNCATE_TAIL_RATIO = 0.2
 
 _SKILLS_PROMPT_CACHE_MAX = 8
 _SKILLS_PROMPT_CACHE: OrderedDict[tuple, str] = OrderedDict()
-_SKILLS_PROMPT_CACHE_LOCK = threading.Lock()
+_SKILLS_PROMPT_CACHE_LOCK = None
+
+
+def _get_SKILLS_PROMPT_CACHE_LOCK() -> threading.Lock:
+    """Lazy-initialized lock to avoid Modal serialization issues."""
+    global _SKILLS_PROMPT_CACHE_LOCK
+    if _SKILLS_PROMPT_CACHE_LOCK is None:
+        _SKILLS_PROMPT_CACHE_LOCK = threading.Lock()
+    return _SKILLS_PROMPT_CACHE_LOCK
+
 _SKILLS_SNAPSHOT_VERSION = 1
 
 
@@ -395,7 +415,7 @@ def _skills_prompt_snapshot_path() -> Path:
 
 def clear_skills_system_prompt_cache(*, clear_snapshot: bool = False) -> None:
     """Drop the in-process skills prompt cache (and optionally the disk snapshot)."""
-    with _SKILLS_PROMPT_CACHE_LOCK:
+    with _get_SKILLS_PROMPT_CACHE_LOCK():
         _SKILLS_PROMPT_CACHE.clear()
     if clear_snapshot:
         try:
@@ -589,7 +609,7 @@ def build_skills_system_prompt(
         tuple(sorted(str(ts) for ts in (available_toolsets or set()))),
         _platform_hint,
     )
-    with _SKILLS_PROMPT_CACHE_LOCK:
+    with _get_SKILLS_PROMPT_CACHE_LOCK():
         cached = _SKILLS_PROMPT_CACHE.get(cache_key)
         if cached is not None:
             _SKILLS_PROMPT_CACHE.move_to_end(cache_key)
@@ -760,7 +780,7 @@ def build_skills_system_prompt(
         )
 
     # ── Store in LRU cache ────────────────────────────────────────────
-    with _SKILLS_PROMPT_CACHE_LOCK:
+    with _get_SKILLS_PROMPT_CACHE_LOCK():
         _SKILLS_PROMPT_CACHE[cache_key] = result
         _SKILLS_PROMPT_CACHE.move_to_end(cache_key)
         while len(_SKILLS_PROMPT_CACHE) > _SKILLS_PROMPT_CACHE_MAX:

@@ -170,21 +170,33 @@ Every installed skill in `~/.hermes/skills/` is automatically registered as a sl
 Set a predefined personality to change the agent's tone:
 
 ```
-/personality pirate
-/personality kawaii
+/personality ceo
+/personality cto
 /personality concise
 ```
 
-Built-in personalities include: `helpful`, `concise`, `technical`, `creative`, `teacher`, `kawaii`, `catgirl`, `pirate`, `shakespeare`, `surfer`, `noir`, `uwu`, `philosopher`, `hype`.
+Built-in personalities include: `board`, `ceo`, `grow`, `cto`, `staff`, `sev`, `helpful`, `concise`, `technical`, `creative`, `teacher`, `kawaii`, `catgirl`, `pirate`, `shakespeare`, `surfer`, `noir`, `uwu`, `philosopher`, `hype`.
+
+The startup-oriented presets are useful for fast mode switching:
+
+- `board` for strategy, resourcing, and stop/go decisions
+- `ceo` for default operating cadence and prioritization
+- `grow` for conversion, packaging, and productized UX
+- `cto` for implementation, reliability, and cost/perf work
+- `staff` for synthesis, coordination, and action tracking
+- `sev` for incidents, regressions, and recovery
 
 You can also define custom personalities in `~/.hermes/config.yaml`:
 
 ```yaml
-personalities:
-  helpful: "You are a helpful, friendly AI assistant."
-  kawaii: "You are a kawaii assistant! Use cute expressions..."
-  pirate: "Arrr! Ye be talkin' to Captain Hermes..."
-  # Add your own!
+agent:
+  personalities:
+    ceo:
+      description: "Startup operator mode"
+      system_prompt: "You operate like a startup CEO focused on priorities and execution."
+      tone: "clear and direct"
+      style: "compress problems into goals, owners, risks, and next actions"
+    pirate: "Arrr! Ye be talkin' to Captain Hermes..."
 ```
 
 ## Multi-line Input

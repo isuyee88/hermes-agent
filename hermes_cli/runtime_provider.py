@@ -9,6 +9,13 @@ from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_CLOUDFLARE_AI_GATEWAY_BASE_URL = (
+    "https://gateway.ai.cloudflare.com/v1/"
+    "d1215a30b84b673ef0367010b0e78c10/affiliate-manager"
+)
+DEFAULT_CLOUDFLARE_AI_GATEWAY_PROVIDER_ALLOWLIST = {"openrouter", "nvidia"}
+DIRECT_RUNTIME_PROVIDER_BYPASS = frozenset({"custom", "local", "copilot-acp"})
+
 from hermes_cli import auth as auth_mod
 from agent.credential_pool import CredentialPool, PooledCredential, get_custom_provider_pool_key, load_pool
 from hermes_cli.auth import (
@@ -31,6 +38,116 @@ from hermes_constants import OPENROUTER_BASE_URL
 
 def _normalize_custom_provider_name(value: str) -> str:
     return value.strip().lower().replace(" ", "-")
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = str(os.getenv(name, "") or "").strip().lower()
+    if not raw:
+        return default
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _normalize_cloudflare_ai_gateway_base_url(raw_url: str) -> str:
+    base_url = str(raw_url or "").strip().rstrip("/")
+    if not base_url:
+        return ""
+
+    lower = base_url.lower()
+    if lower.endswith("/chat/completions"):
+        base_url = base_url[: -len("/chat/completions")]
+        lower = base_url.lower()
+    if lower.endswith("/v1/chat/completions"):
+        base_url = base_url[: -len("/v1/chat/completions")]
+        lower = base_url.lower()
+    if not lower.endswith("/compat"):
+        base_url = f"{base_url}/compat"
+    return base_url.rstrip("/")
+
+
+def _cloudflare_ai_gateway_base_url() -> str:
+    return _normalize_cloudflare_ai_gateway_base_url(
+        os.getenv("CLOUDFLARE_AI_GATEWAY_BASE_URL", DEFAULT_CLOUDFLARE_AI_GATEWAY_BASE_URL)
+    )
+
+
+def _cloudflare_ai_gateway_provider_allowlist() -> set[str]:
+    raw = str(os.getenv("HERMES_CLOUDFLARE_AI_GATEWAY_PROVIDERS", "") or "").strip()
+    if not raw:
+        return set(DEFAULT_CLOUDFLARE_AI_GATEWAY_PROVIDER_ALLOWLIST)
+    return {
+        item.strip().lower()
+        for item in raw.split(",")
+        if item.strip()
+    }
+
+
+def _should_route_via_cloudflare_ai_gateway(
+    provider: str,
+    *,
+    api_mode: str,
+    requested_provider: str = "",
+) -> bool:
+    if not _env_flag("HERMES_INFERENCE_USE_CLOUDFLARE_AI_GATEWAY", default=True):
+        return False
+    if not _cloudflare_ai_gateway_base_url():
+        return False
+    normalized_provider = str(provider or "").strip().lower()
+    normalized_requested = str(requested_provider or "").strip().lower()
+    if (
+        normalized_provider in DIRECT_RUNTIME_PROVIDER_BYPASS
+        or normalized_requested in DIRECT_RUNTIME_PROVIDER_BYPASS
+        or normalized_requested.startswith("custom:")
+    ):
+        return False
+    if normalized_provider in _cloudflare_ai_gateway_provider_allowlist():
+        return True
+    if api_mode in {"chat_completions", "codex_responses", "anthropic_messages"}:
+        return bool(normalized_provider)
+    return False
+
+
+def _resolve_cloudflare_ai_gateway_api_key(*candidates: Any) -> str:
+    ordered = [
+        os.getenv("CLOUDFLARE_API_TOKEN", ""),
+        os.getenv("CLOUDFLARE_AI_GATEWAY_API_KEY", ""),
+        os.getenv("AI_GATEWAY_API_KEY", ""),
+        *candidates,
+    ]
+    api_key = next(
+        (str(candidate or "").strip() for candidate in ordered if has_usable_secret(candidate)),
+        "",
+    )
+    return api_key or "no-key-required"
+
+
+def _finalize_runtime_provider_resolution(
+    runtime: Dict[str, Any],
+    *,
+    requested_provider: str,
+) -> Dict[str, Any]:
+    resolved = dict(runtime or {})
+    if requested_provider and not resolved.get("requested_provider"):
+        resolved["requested_provider"] = requested_provider
+
+    provider = str(resolved.get("provider") or requested_provider or "").strip().lower()
+    api_mode = str(resolved.get("api_mode") or "").strip().lower() or "chat_completions"
+    if not _should_route_via_cloudflare_ai_gateway(
+        provider,
+        api_mode=api_mode,
+        requested_provider=requested_provider,
+    ):
+        return resolved
+
+    source = str(resolved.get("source") or "").strip()
+    resolved["provider"] = provider
+    resolved["upstream_provider"] = provider
+    resolved["base_url"] = _cloudflare_ai_gateway_base_url()
+    resolved["api_key"] = _resolve_cloudflare_ai_gateway_api_key(resolved.get("api_key", ""))
+    resolved["api_mode"] = "chat_completions"
+    resolved["gateway_transport"] = True
+    if not source.startswith("cloudflare-ai-gateway"):
+        resolved["source"] = f"cloudflare-ai-gateway:{source}" if source else "cloudflare-ai-gateway"
+    return resolved
 
 
 def _detect_api_mode_for_url(base_url: str) -> Optional[str]:
@@ -435,6 +552,14 @@ def _resolve_openrouter_runtime(
     if effective_provider == "custom" and not api_key and not _is_openrouter_url:
         api_key = "no-key-required"
 
+    if not explicit_base_url and _should_route_via_cloudflare_ai_gateway(
+        effective_provider,
+        api_mode=_parse_api_mode(model_cfg.get("api_mode")) or _detect_api_mode_for_url(base_url) or "chat_completions",
+    ):
+        base_url = _cloudflare_ai_gateway_base_url()
+        api_key = _resolve_cloudflare_ai_gateway_api_key(api_key)
+        source = "cloudflare-ai-gateway"
+
     return {
         "provider": effective_provider,
         "api_mode": _parse_api_mode(model_cfg.get("api_mode"))
@@ -594,7 +719,10 @@ def resolve_runtime_provider(
     )
     if custom_runtime:
         custom_runtime["requested_provider"] = requested_provider
-        return custom_runtime
+        return _finalize_runtime_provider_resolution(
+            custom_runtime,
+            requested_provider=requested_provider,
+        )
 
     provider = resolve_provider(
         requested_provider,
@@ -610,7 +738,10 @@ def resolve_runtime_provider(
         explicit_base_url=explicit_base_url,
     )
     if explicit_runtime:
-        return explicit_runtime
+        return _finalize_runtime_provider_resolution(
+            explicit_runtime,
+            requested_provider=requested_provider,
+        )
 
     should_use_pool = provider != "openrouter"
     if provider == "openrouter":
@@ -631,6 +762,12 @@ def resolve_runtime_provider(
             and not has_custom_endpoint
             and not has_runtime_override
         )
+        if _env_flag("HERMES_INFERENCE_USE_CLOUDFLARE_AI_GATEWAY", default=True):
+            if provider in _cloudflare_ai_gateway_provider_allowlist() and _cloudflare_ai_gateway_base_url():
+                should_use_pool = False
+    elif _env_flag("HERMES_INFERENCE_USE_CLOUDFLARE_AI_GATEWAY", default=True):
+        if provider in _cloudflare_ai_gateway_provider_allowlist() and _cloudflare_ai_gateway_base_url():
+            should_use_pool = False
 
     try:
         pool = load_pool(provider) if should_use_pool else None
@@ -645,12 +782,15 @@ def resolve_runtime_provider(
                 or getattr(entry, "access_token", "")
             )
         if entry is not None and pool_api_key:
-            return _resolve_runtime_from_pool_entry(
-                provider=provider,
-                entry=entry,
+            return _finalize_runtime_provider_resolution(
+                _resolve_runtime_from_pool_entry(
+                    provider=provider,
+                    entry=entry,
+                    requested_provider=requested_provider,
+                    model_cfg=model_cfg,
+                    pool=pool,
+                ),
                 requested_provider=requested_provider,
-                model_cfg=model_cfg,
-                pool=pool,
             )
 
     if provider == "nous":
@@ -659,7 +799,7 @@ def resolve_runtime_provider(
                 min_key_ttl_seconds=max(60, int(os.getenv("HERMES_NOUS_MIN_KEY_TTL_SECONDS", "1800"))),
                 timeout_seconds=float(os.getenv("HERMES_NOUS_TIMEOUT_SECONDS", "15")),
             )
-            return {
+            return _finalize_runtime_provider_resolution({
                 "provider": "nous",
                 "api_mode": "chat_completions",
                 "base_url": creds.get("base_url", "").rstrip("/"),
@@ -667,7 +807,7 @@ def resolve_runtime_provider(
                 "source": creds.get("source", "portal"),
                 "expires_at": creds.get("expires_at"),
                 "requested_provider": requested_provider,
-            }
+            }, requested_provider=requested_provider)
         except AuthError:
             if requested_provider != "auto":
                 raise
@@ -679,7 +819,7 @@ def resolve_runtime_provider(
     if provider == "openai-codex":
         try:
             creds = resolve_codex_runtime_credentials()
-            return {
+            return _finalize_runtime_provider_resolution({
                 "provider": "openai-codex",
                 "api_mode": "codex_responses",
                 "base_url": creds.get("base_url", "").rstrip("/"),
@@ -687,7 +827,7 @@ def resolve_runtime_provider(
                 "source": creds.get("source", "hermes-auth-store"),
                 "last_refresh": creds.get("last_refresh"),
                 "requested_provider": requested_provider,
-            }
+            }, requested_provider=requested_provider)
         except AuthError:
             if requested_provider != "auto":
                 raise
@@ -699,7 +839,7 @@ def resolve_runtime_provider(
     if provider == "qwen-oauth":
         try:
             creds = resolve_qwen_runtime_credentials()
-            return {
+            return _finalize_runtime_provider_resolution({
                 "provider": "qwen-oauth",
                 "api_mode": "chat_completions",
                 "base_url": creds.get("base_url", "").rstrip("/"),
@@ -707,7 +847,7 @@ def resolve_runtime_provider(
                 "source": creds.get("source", "qwen-cli"),
                 "expires_at_ms": creds.get("expires_at_ms"),
                 "requested_provider": requested_provider,
-            }
+            }, requested_provider=requested_provider)
         except AuthError:
             if requested_provider != "auto":
                 raise
@@ -716,7 +856,7 @@ def resolve_runtime_provider(
 
     if provider == "copilot-acp":
         creds = resolve_external_process_provider_credentials(provider)
-        return {
+        return _finalize_runtime_provider_resolution({
             "provider": "copilot-acp",
             "api_mode": "chat_completions",
             "base_url": creds.get("base_url", "").rstrip("/"),
@@ -725,7 +865,7 @@ def resolve_runtime_provider(
             "args": list(creds.get("args") or []),
             "source": creds.get("source", "process"),
             "requested_provider": requested_provider,
-        }
+        }, requested_provider=requested_provider)
 
     # Anthropic (native Messages API)
     if provider == "anthropic":
@@ -744,19 +884,20 @@ def resolve_runtime_provider(
         if cfg_provider == "anthropic":
             cfg_base_url = (model_cfg.get("base_url") or "").strip().rstrip("/")
         base_url = cfg_base_url or "https://api.anthropic.com"
-        return {
+        return _finalize_runtime_provider_resolution({
             "provider": "anthropic",
             "api_mode": "anthropic_messages",
             "base_url": base_url,
             "api_key": token,
             "source": "env",
             "requested_provider": requested_provider,
-        }
+        }, requested_provider=requested_provider)
 
     # API-key providers (z.ai/GLM, Kimi, MiniMax, MiniMax-CN)
     pconfig = PROVIDER_REGISTRY.get(provider)
     if pconfig and pconfig.auth_type == "api_key":
         creds = resolve_api_key_provider_credentials(provider)
+        api_key = creds.get("api_key", "")
         # Honour model.base_url from config.yaml when the configured provider
         # matches this provider — mirrors the Anthropic path above.  Without
         # this, users who set model.base_url to e.g. api.minimaxi.com/anthropic
@@ -785,14 +926,21 @@ def resolve_runtime_provider(
         # Strip trailing /v1 for OpenCode Anthropic models (see comment above).
         if api_mode == "anthropic_messages" and provider in ("opencode-zen", "opencode-go"):
             base_url = re.sub(r"/v1/?$", "", base_url)
-        return {
+
+        if not explicit_base_url and _should_route_via_cloudflare_ai_gateway(provider, api_mode=api_mode):
+            base_url = _cloudflare_ai_gateway_base_url()
+            api_key = _resolve_cloudflare_ai_gateway_api_key(creds.get("api_key", ""))
+            source = "cloudflare-ai-gateway"
+        else:
+            source = creds.get("source", "env")
+        return _finalize_runtime_provider_resolution({
             "provider": provider,
             "api_mode": api_mode,
             "base_url": base_url,
-            "api_key": creds.get("api_key", ""),
-            "source": creds.get("source", "env"),
+            "api_key": api_key,
+            "source": source,
             "requested_provider": requested_provider,
-        }
+        }, requested_provider=requested_provider)
 
     runtime = _resolve_openrouter_runtime(
         requested_provider=requested_provider,
@@ -800,7 +948,10 @@ def resolve_runtime_provider(
         explicit_base_url=explicit_base_url,
     )
     runtime["requested_provider"] = requested_provider
-    return runtime
+    return _finalize_runtime_provider_resolution(
+        runtime,
+        requested_provider=requested_provider,
+    )
 
 
 def format_runtime_provider_error(error: Exception) -> str:

@@ -85,6 +85,15 @@ Example deployment flow:
 modal secret create custom-secret \
   DEFAULT_MODEL=openrouter/free \
   OPENROUTER_API_KEY=... \
+  HERMES_INFERENCE_USE_CLOUDFLARE_AI_GATEWAY=true \
+  CLOUDFLARE_AI_GATEWAY_BASE_URL=https://gateway.ai.cloudflare.com/v1/d1215a30b84b673ef0367010b0e78c10/affiliate-manager \
+  HERMES_CLOUDFLARE_AI_GATEWAY_PROVIDERS=openrouter,nvidia \
+  CLOUDFLARE_AI_GATEWAY_ROUTE_GENERAL=affiliate-general \
+  CLOUDFLARE_AI_GATEWAY_ROUTE_CODING=affiliate-coding \
+  CLOUDFLARE_AI_GATEWAY_ROUTE_TOOLS=affiliate-tools \
+  CLOUDFLARE_AI_GATEWAY_ROUTE_CREATIVE=affiliate-general \
+  CLOUDFLARE_AI_GATEWAY_ROUTE_IMAGE=affiliate-general \
+  CLOUDFLARE_API_TOKEN=... \
   SUPERMEMORY_API_KEY=... \
   TELEGRAM_BOT_TOKEN=... \
   TELEGRAM_ALLOWED_USERS=123456789 \
@@ -96,6 +105,9 @@ modal secret create custom-secret \
 
 modal deploy modal_.py
 ```
+
+If you already fixed the gateway/account constants in the repo, the only Cloudflare
+secret you still need to supply at deploy time is `CLOUDFLARE_API_TOKEN`.
 
 If you omit `DEFAULT_MODEL`, this Modal entrypoint now defaults to
 `openrouter/free`, which uses OpenRouter's official Free Models Router. Override

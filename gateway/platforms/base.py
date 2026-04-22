@@ -6,10 +6,13 @@ and implement the required methods.
 """
 
 import asyncio
+import json
 import logging
 import os
 import random
 import re
+import time
+import threading
 import uuid
 from abc import ABC, abstractmethod
 from urllib.parse import urlsplit
@@ -34,6 +37,16 @@ GATEWAY_SECRET_CAPTURE_UNSUPPORTED_MESSAGE = (
     "Secure secret entry is not supported over messaging. "
     "Load this skill in the local CLI to be prompted, or add the key to ~/.hermes/.env manually."
 )
+
+_FEISHU_GATEWAY_TRACE_LOCK = None
+
+
+def _get_feishu_gateway_trace_lock_lock() -> threading.Lock:
+    """Lazy-initialized lock to avoid Modal serialization issues."""
+    global _FEISHU_GATEWAY_TRACE_LOCK
+    if _FEISHU_GATEWAY_TRACE_LOCK is None:
+        _FEISHU_GATEWAY_TRACE_LOCK = threading.Lock()
+    return _FEISHU_GATEWAY_TRACE_LOCK
 
 
 def _safe_url_for_log(url: str, max_len: int = 80) -> str:
@@ -71,6 +84,53 @@ def _safe_url_for_log(url: str, max_len: int = 80) -> str:
     if max_len <= 3:
         return "." * max_len
     return f"{safe[:max_len - 3]}..."
+
+
+def _extract_feishu_trace_value(container: Any, *path: str) -> str:
+    current = container
+    for key in path:
+        if current is None:
+            return ""
+        if isinstance(current, dict):
+            current = current.get(key)
+        else:
+            current = getattr(current, key, None)
+    return str(current or "").strip()
+
+
+def _append_feishu_gateway_trace(stage: str, event: "MessageEvent", **extra: Any) -> None:
+    source = getattr(event, "source", None)
+    if getattr(source, "platform", None) != Platform.FEISHU:
+        return
+
+    raw = getattr(event, "raw_message", None)
+    header = raw.get("header") if isinstance(raw, dict) else getattr(raw, "header", None)
+    message = raw.get("message") if isinstance(raw, dict) else getattr(raw, "message", None)
+    event_id = _extract_feishu_trace_value(header, "event_id") or _extract_feishu_trace_value(raw, "event_id")
+    event_type = _extract_feishu_trace_value(header, "event_type") or _extract_feishu_trace_value(raw, "event_type")
+    trace_row = {
+        "ts": int(time.time()),
+        "stage": stage,
+        "app_name": os.getenv("HERMES_MODAL_APP_NAME", "hermes-agent"),
+        "experiment_label": str(os.getenv("HERMES_FEISHU_PERF_EXPERIMENT_LABEL") or "").strip().lower() or "none",
+        "snapshot_profile": str(os.getenv("HERMES_FEISHU_PERF_SNAPSHOT_PROFILE") or "").strip().lower() or "none",
+        "event_id": event_id,
+        "event_type": event_type,
+        "chat_id": str(getattr(source, "chat_id", "") or "").strip(),
+        "actor_id": str(getattr(source, "user_id", "") or "").strip(),
+        "message_id": str(getattr(event, "message_id", "") or _extract_feishu_trace_value(message, "message_id")).strip(),
+    }
+    if extra:
+        trace_row.update(extra)
+
+    trace_path = Path(os.getenv("HERMES_MODAL_DATA_DIR", "/data/hermes")) / "feishu_trace.jsonl"
+    try:
+        with _get_feishu_gateway_trace_lock_lock():
+            trace_path.parent.mkdir(parents=True, exist_ok=True)
+            with trace_path.open("a", encoding="utf-8") as fp:
+                fp.write(json.dumps(trace_row, ensure_ascii=False) + "\n")
+    except Exception:
+        logger.debug("[Feishu] Failed to append gateway trace stage=%s", stage, exc_info=True)
 
 
 # ---------------------------------------------------------------------------
@@ -412,6 +472,7 @@ class MessageEvent:
     
     # Auto-loaded skill for topic/channel bindings (e.g., Telegram DM Topics)
     auto_skill: Optional[str] = None
+    ack_reaction_already_requested: bool = False
     
     # Internal flag — set for synthetic events (e.g. background process
     # completion notifications) that must bypass user authorization checks.
@@ -1360,6 +1421,7 @@ class BasePlatformAdapter(ABC):
             await self._run_processing_hook("on_processing_start", event)
 
             # Call the handler (this can take a while with tool calls)
+            handler_started_at = time.perf_counter()
             logger.info(
                 "[%s] Background task invoking handler session=%s message_id=%s",
                 self.name,
@@ -1367,15 +1429,25 @@ class BasePlatformAdapter(ABC):
                 getattr(event, "message_id", "") or "",
             )
             response = await self._message_handler(event)
+            handler_elapsed_ms = int((time.perf_counter() - handler_started_at) * 1000)
             response_len = len(response) if isinstance(response, str) else 0
-            logger.info(
+            logger.warning(
                 "[%s] Background task handler returned session=%s message_id=%s "
-                "has_response=%s response_len=%d",
+                "has_response=%s response_len=%d handler_elapsed_ms=%d",
                 self.name,
                 session_key,
                 getattr(event, "message_id", "") or "",
                 bool(response),
                 response_len,
+                handler_elapsed_ms,
+            )
+            _append_feishu_gateway_trace(
+                "gateway.handler.done",
+                event,
+                session_key=session_key,
+                handler_elapsed_ms=handler_elapsed_ms,
+                has_response=bool(response),
+                response_len=response_len,
             )
 
             # Send response if any.  A None/empty response is normal when
@@ -1449,22 +1521,34 @@ class BasePlatformAdapter(ABC):
                         getattr(event, "message_id", "") or "",
                         len(text_content),
                     )
+                    send_started_at = time.perf_counter()
                     result = await self._send_with_retry(
                         chat_id=event.source.chat_id,
                         content=text_content,
                         reply_to=event.message_id,
                         metadata=_thread_metadata,
                     )
+                    send_elapsed_ms = int((time.perf_counter() - send_started_at) * 1000)
                     _record_delivery(result)
-                    logger.info(
+                    logger.warning(
                         "[%s] Background task send complete session=%s message_id=%s "
-                        "success=%s send_message_id=%s error=%s",
+                        "success=%s send_message_id=%s error=%s send_elapsed_ms=%d",
                         self.name,
                         session_key,
                         getattr(event, "message_id", "") or "",
                         getattr(result, "success", False),
                         getattr(result, "message_id", None),
                         getattr(result, "error", None),
+                        send_elapsed_ms,
+                    )
+                    _append_feishu_gateway_trace(
+                        "gateway.send.done",
+                        event,
+                        session_key=session_key,
+                        send_success=bool(getattr(result, "success", False)),
+                        send_message_id=str(getattr(result, "message_id", None) or ""),
+                        send_error=str(getattr(result, "error", None) or ""),
+                        send_elapsed_ms=send_elapsed_ms,
                     )
 
                 # Human-like pacing delay between text and media

@@ -62,6 +62,39 @@ class TestSessionLifecycle:
         assert session["input_tokens"] == 300
         assert session["output_tokens"] == 150
 
+    def test_update_token_counts_persists_provider_metadata(self, db):
+        db.create_session(session_id="s1", source="cli")
+        db.update_token_counts(
+            "s1",
+            input_tokens=100,
+            output_tokens=40,
+            provider_generation_id="gen_123",
+            provider_request_id="req_456",
+            provider_async_request_id="async_789",
+            provider_http_status_code=202,
+            provider_response_model="google/gemma-4-31b-it",
+            provider_cache_discount_usd=0.0003,
+            provider_billed_cost_usd=0.0012,
+            provider_upstream_inference_cost_usd=0.0009,
+        )
+        db.update_token_counts(
+            "s1",
+            provider_generation_id="gen_124",
+            provider_cache_discount_usd=0.0002,
+            provider_billed_cost_usd=0.0008,
+            provider_upstream_inference_cost_usd=0.0005,
+        )
+
+        session = db.get_session("s1")
+        assert session["provider_generation_id"] == "gen_124"
+        assert session["provider_request_id"] == "req_456"
+        assert session["provider_async_request_id"] == "async_789"
+        assert session["provider_http_status_code"] == 202
+        assert session["provider_response_model"] == "google/gemma-4-31b-it"
+        assert session["provider_cache_discount_usd"] == pytest.approx(0.0005)
+        assert session["provider_billed_cost_usd"] == pytest.approx(0.0020)
+        assert session["provider_upstream_inference_cost_usd"] == pytest.approx(0.0014)
+
     def test_update_token_counts_backfills_model_when_null(self, db):
         db.create_session(session_id="s1", source="telegram")
         db.update_token_counts("s1", input_tokens=10, output_tokens=5, model="openai/gpt-5.4")
@@ -935,7 +968,7 @@ class TestSchemaInit:
     def test_schema_version(self, db):
         cursor = db._conn.execute("SELECT version FROM schema_version")
         version = cursor.fetchone()[0]
-        assert version == 6
+        assert version == 7
 
     def test_title_column_exists(self, db):
         """Verify the title column was created in the sessions table."""
@@ -996,12 +1029,14 @@ class TestSchemaInit:
 
         # Verify migration
         cursor = migrated_db._conn.execute("SELECT version FROM schema_version")
-        assert cursor.fetchone()[0] == 6
+        assert cursor.fetchone()[0] == 7
 
         # Verify title column exists and is NULL for existing sessions
         session = migrated_db.get_session("existing")
         assert session is not None
         assert session["title"] is None
+        assert session["provider_generation_id"] is None
+        assert session["provider_cache_discount_usd"] == 0
 
         # Verify we can set title on migrated session
         assert migrated_db.set_session_title("existing", "Migrated Title") is True

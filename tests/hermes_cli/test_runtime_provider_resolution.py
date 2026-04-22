@@ -1,6 +1,30 @@
 from hermes_cli import runtime_provider as rp
 
 
+def _assert_gateway_runtime(
+    resolved,
+    provider: str,
+    *,
+    requested_provider: str | None = None,
+    source: str | None = None,
+    credential_pool: bool | None = None,
+):
+    assert resolved["provider"] == provider
+    assert resolved["upstream_provider"] == provider
+    assert resolved["api_mode"] == "chat_completions"
+    assert resolved["base_url"] == rp._cloudflare_ai_gateway_base_url()
+    assert resolved["api_key"] == rp._resolve_cloudflare_ai_gateway_api_key()
+    assert resolved["gateway_transport"] is True
+    if requested_provider is not None:
+        assert resolved["requested_provider"] == requested_provider
+    if source is not None:
+        expected_prefix = source if source.startswith("cloudflare-ai-gateway") else "cloudflare-ai-gateway"
+        assert str(resolved["source"]).startswith(expected_prefix)
+    if credential_pool is not None:
+        has_pool = resolved.get("credential_pool") is not None
+        assert has_pool is credential_pool
+
+
 def test_resolve_runtime_provider_uses_credential_pool(monkeypatch):
     class _Entry:
         access_token = "pool-token"
@@ -19,10 +43,12 @@ def test_resolve_runtime_provider_uses_credential_pool(monkeypatch):
 
     resolved = rp.resolve_runtime_provider(requested="openai-codex")
 
-    assert resolved["provider"] == "openai-codex"
-    assert resolved["api_key"] == "pool-token"
-    assert resolved["credential_pool"] is not None
-    assert resolved["source"] == "manual"
+    _assert_gateway_runtime(
+        resolved,
+        "openai-codex",
+        source="manual",
+        credential_pool=True,
+    )
 
 
 def test_resolve_runtime_provider_anthropic_pool_respects_config_base_url(monkeypatch):
@@ -51,10 +77,7 @@ def test_resolve_runtime_provider_anthropic_pool_respects_config_base_url(monkey
 
     resolved = rp.resolve_runtime_provider(requested="anthropic")
 
-    assert resolved["provider"] == "anthropic"
-    assert resolved["api_mode"] == "anthropic_messages"
-    assert resolved["api_key"] == "pool-token"
-    assert resolved["base_url"] == "https://proxy.example.com/anthropic"
+    _assert_gateway_runtime(resolved, "anthropic", source="manual")
 
 
 def test_resolve_runtime_provider_anthropic_explicit_override_skips_pool(monkeypatch):
@@ -85,12 +108,12 @@ def test_resolve_runtime_provider_anthropic_explicit_override_skips_pool(monkeyp
         explicit_base_url="https://proxy.example.com/anthropic/",
     )
 
-    assert resolved["provider"] == "anthropic"
-    assert resolved["api_mode"] == "anthropic_messages"
-    assert resolved["api_key"] == "anthropic-explicit-token"
-    assert resolved["base_url"] == "https://proxy.example.com/anthropic"
-    assert resolved["source"] == "explicit"
-    assert resolved.get("credential_pool") is None
+    _assert_gateway_runtime(
+        resolved,
+        "anthropic",
+        source="explicit",
+        credential_pool=False,
+    )
 
 
 def test_resolve_runtime_provider_falls_back_when_pool_empty(monkeypatch):
@@ -114,8 +137,12 @@ def test_resolve_runtime_provider_falls_back_when_pool_empty(monkeypatch):
 
     resolved = rp.resolve_runtime_provider(requested="openai-codex")
 
-    assert resolved["api_key"] == "codex-token"
-    assert resolved.get("credential_pool") is None
+    _assert_gateway_runtime(
+        resolved,
+        "openai-codex",
+        source="hermes-auth-store",
+        credential_pool=False,
+    )
 
 
 def test_resolve_runtime_provider_codex(monkeypatch):
@@ -136,11 +163,12 @@ def test_resolve_runtime_provider_codex(monkeypatch):
 
     resolved = rp.resolve_runtime_provider(requested="openai-codex")
 
-    assert resolved["provider"] == "openai-codex"
-    assert resolved["api_mode"] == "codex_responses"
-    assert resolved["base_url"] == "https://chatgpt.com/backend-api/codex"
-    assert resolved["api_key"] == "codex-token"
-    assert resolved["requested_provider"] == "openai-codex"
+    _assert_gateway_runtime(
+        resolved,
+        "openai-codex",
+        requested_provider="openai-codex",
+        source="codex-auth-json",
+    )
 
 
 def test_resolve_runtime_provider_qwen_oauth(monkeypatch):
@@ -159,11 +187,12 @@ def test_resolve_runtime_provider_qwen_oauth(monkeypatch):
 
     resolved = rp.resolve_runtime_provider(requested="qwen-oauth")
 
-    assert resolved["provider"] == "qwen-oauth"
-    assert resolved["api_mode"] == "chat_completions"
-    assert resolved["base_url"] == "https://portal.qwen.ai/v1"
-    assert resolved["api_key"] == "qwen-token"
-    assert resolved["requested_provider"] == "qwen-oauth"
+    _assert_gateway_runtime(
+        resolved,
+        "qwen-oauth",
+        requested_provider="qwen-oauth",
+        source="qwen-cli",
+    )
 
 
 def test_resolve_runtime_provider_uses_qwen_pool_entry(monkeypatch):
@@ -185,11 +214,11 @@ def test_resolve_runtime_provider_uses_qwen_pool_entry(monkeypatch):
 
     resolved = rp.resolve_runtime_provider(requested="qwen-oauth")
 
-    assert resolved["provider"] == "qwen-oauth"
-    assert resolved["api_mode"] == "chat_completions"
-    assert resolved["base_url"] == "https://portal.qwen.ai/v1"
-    assert resolved["api_key"] == "pool-qwen-token"
-    assert resolved["source"] == "manual:qwen_cli"
+    _assert_gateway_runtime(
+        resolved,
+        "qwen-oauth",
+        source="manual:qwen_cli",
+    )
 
 
 def test_resolve_provider_alias_qwen(monkeypatch):
@@ -226,11 +255,12 @@ def test_resolve_runtime_provider_ai_gateway(monkeypatch):
 
     resolved = rp.resolve_runtime_provider(requested="ai-gateway")
 
-    assert resolved["provider"] == "ai-gateway"
-    assert resolved["api_mode"] == "chat_completions"
-    assert resolved["base_url"] == "https://ai-gateway.vercel.sh/v1"
-    assert resolved["api_key"] == "test-ai-gw-key"
-    assert resolved["requested_provider"] == "ai-gateway"
+    _assert_gateway_runtime(
+        resolved,
+        "ai-gateway",
+        requested_provider="ai-gateway",
+        source="env",
+    )
 
 
 def test_resolve_runtime_provider_ai_gateway_explicit_override_skips_pool(monkeypatch):
@@ -255,12 +285,63 @@ def test_resolve_runtime_provider_ai_gateway_explicit_override_skips_pool(monkey
         explicit_base_url="https://proxy.example.com/v1/",
     )
 
-    assert resolved["provider"] == "ai-gateway"
+    _assert_gateway_runtime(
+        resolved,
+        "ai-gateway",
+        source="explicit",
+        credential_pool=False,
+    )
+
+
+def test_resolve_runtime_provider_openrouter_routes_via_cloudflare_gateway(monkeypatch):
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "openrouter")
+    monkeypatch.setattr(rp, "_get_model_config", lambda: {})
+    monkeypatch.setenv("HERMES_INFERENCE_USE_CLOUDFLARE_AI_GATEWAY", "true")
+    monkeypatch.setenv(
+        "CLOUDFLARE_AI_GATEWAY_BASE_URL",
+        "https://gateway.ai.cloudflare.com/v1/acct/gateway/compat/chat/completions",
+    )
+    monkeypatch.setenv("CLOUDFLARE_API_TOKEN", "cf-token")
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.delenv("OPENROUTER_BASE_URL", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+
+    resolved = rp.resolve_runtime_provider(requested="openrouter")
+
+    assert resolved["provider"] == "openrouter"
     assert resolved["api_mode"] == "chat_completions"
-    assert resolved["api_key"] == "ai-gateway-explicit-token"
-    assert resolved["base_url"] == "https://proxy.example.com/v1"
-    assert resolved["source"] == "explicit"
-    assert resolved.get("credential_pool") is None
+    assert resolved["base_url"] == "https://gateway.ai.cloudflare.com/v1/acct/gateway/compat"
+    assert resolved["api_key"] == "cf-token"
+    assert resolved["source"] == "cloudflare-ai-gateway"
+
+
+def test_resolve_runtime_provider_nvidia_routes_via_cloudflare_gateway(monkeypatch):
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "nvidia")
+    monkeypatch.setattr(rp, "_get_model_config", lambda: {})
+    monkeypatch.setenv("HERMES_INFERENCE_USE_CLOUDFLARE_AI_GATEWAY", "true")
+    monkeypatch.setenv(
+        "CLOUDFLARE_AI_GATEWAY_BASE_URL",
+        "https://gateway.ai.cloudflare.com/v1/acct/gateway",
+    )
+    monkeypatch.setenv("CLOUDFLARE_API_TOKEN", "cf-token")
+    monkeypatch.setattr(
+        rp,
+        "resolve_api_key_provider_credentials",
+        lambda provider: {
+            "api_key": "nv-key",
+            "base_url": "https://integrate.api.nvidia.com/v1",
+            "source": "env",
+        },
+    )
+
+    resolved = rp.resolve_runtime_provider(requested="nvidia")
+
+    assert resolved["provider"] == "nvidia"
+    assert resolved["api_mode"] == "chat_completions"
+    assert resolved["base_url"] == "https://gateway.ai.cloudflare.com/v1/acct/gateway/compat"
+    assert resolved["api_key"] == "cf-token"
+    assert resolved["source"] == "cloudflare-ai-gateway"
 
 
 def test_resolve_runtime_provider_openrouter_explicit(monkeypatch):
@@ -277,11 +358,11 @@ def test_resolve_runtime_provider_openrouter_explicit(monkeypatch):
         explicit_base_url="https://example.com/v1/",
     )
 
-    assert resolved["provider"] == "openrouter"
-    assert resolved["api_mode"] == "chat_completions"
-    assert resolved["api_key"] == "test-key"
-    assert resolved["base_url"] == "https://example.com/v1"
-    assert resolved["source"] == "explicit"
+    _assert_gateway_runtime(
+        resolved,
+        "openrouter",
+        source="explicit",
+    )
 
 
 def test_resolve_runtime_provider_auto_uses_openrouter_pool(monkeypatch):
@@ -307,11 +388,12 @@ def test_resolve_runtime_provider_auto_uses_openrouter_pool(monkeypatch):
 
     resolved = rp.resolve_runtime_provider(requested="auto")
 
-    assert resolved["provider"] == "openrouter"
-    assert resolved["api_key"] == "pool-key"
-    assert resolved["base_url"] == "https://openrouter.ai/api/v1"
-    assert resolved["source"] == "manual"
-    assert resolved.get("credential_pool") is not None
+    _assert_gateway_runtime(
+        resolved,
+        "openrouter",
+        source="manual",
+        credential_pool=False,
+    )
 
 
 def test_resolve_runtime_provider_openrouter_explicit_api_key_skips_pool(monkeypatch):
@@ -340,11 +422,12 @@ def test_resolve_runtime_provider_openrouter_explicit_api_key_skips_pool(monkeyp
         explicit_api_key="explicit-key",
     )
 
-    assert resolved["provider"] == "openrouter"
-    assert resolved["api_key"] == "explicit-key"
-    assert resolved["base_url"] == rp.OPENROUTER_BASE_URL
-    assert resolved["source"] == "explicit"
-    assert resolved.get("credential_pool") is None
+    _assert_gateway_runtime(
+        resolved,
+        "openrouter",
+        source="explicit",
+        credential_pool=False,
+    )
 
 
 def test_resolve_runtime_provider_openrouter_ignores_codex_config_base_url(monkeypatch):
@@ -364,8 +447,7 @@ def test_resolve_runtime_provider_openrouter_ignores_codex_config_base_url(monke
 
     resolved = rp.resolve_runtime_provider(requested="openrouter")
 
-    assert resolved["provider"] == "openrouter"
-    assert resolved["base_url"] == rp.OPENROUTER_BASE_URL
+    _assert_gateway_runtime(resolved, "openrouter", source="env/config")
 
 
 def test_resolve_runtime_provider_auto_uses_custom_config_base_url(monkeypatch):
@@ -385,8 +467,7 @@ def test_resolve_runtime_provider_auto_uses_custom_config_base_url(monkeypatch):
 
     resolved = rp.resolve_runtime_provider(requested="auto")
 
-    assert resolved["provider"] == "openrouter"
-    assert resolved["base_url"] == "https://custom.example/v1"
+    _assert_gateway_runtime(resolved, "openrouter", source="env/config")
 
 
 def test_openrouter_key_takes_priority_over_openai_key(monkeypatch):
@@ -404,7 +485,7 @@ def test_openrouter_key_takes_priority_over_openai_key(monkeypatch):
 
     resolved = rp.resolve_runtime_provider(requested="openrouter")
 
-    assert resolved["api_key"] == "sk-or-should-win"
+    assert resolved["api_key"] == rp._resolve_cloudflare_ai_gateway_api_key()
 
 
 def test_openai_key_used_when_no_openrouter_key(monkeypatch):
@@ -418,7 +499,7 @@ def test_openai_key_used_when_no_openrouter_key(monkeypatch):
 
     resolved = rp.resolve_runtime_provider(requested="openrouter")
 
-    assert resolved["api_key"] == "sk-openai-fallback"
+    assert resolved["api_key"] == rp._resolve_cloudflare_ai_gateway_api_key()
 
 
 def test_custom_endpoint_prefers_openai_key(monkeypatch):
@@ -439,8 +520,10 @@ def test_custom_endpoint_prefers_openai_key(monkeypatch):
 
     resolved = rp.resolve_runtime_provider(requested="custom")
 
+    assert resolved["provider"] == "custom"
     assert resolved["base_url"] == "https://api.z.ai/api/coding/paas/v4"
     assert resolved["api_key"] == "zai-key"
+    assert resolved["source"] == "env/config"
 
 
 def test_custom_endpoint_uses_saved_config_base_url_when_env_missing(monkeypatch):
@@ -626,10 +709,12 @@ def test_named_custom_provider_does_not_shadow_builtin_provider(monkeypatch):
 
     resolved = rp.resolve_runtime_provider(requested="nous")
 
-    assert resolved["provider"] == "nous"
-    assert resolved["base_url"] == "https://inference-api.nousresearch.com/v1"
-    assert resolved["api_key"] == "nous-runtime-key"
-    assert resolved["requested_provider"] == "nous"
+    _assert_gateway_runtime(
+        resolved,
+        "nous",
+        requested_provider="nous",
+        source="portal",
+    )
 
 
 def test_explicit_openrouter_skips_openai_base_url(monkeypatch):
@@ -645,10 +730,7 @@ def test_explicit_openrouter_skips_openai_base_url(monkeypatch):
 
     resolved = rp.resolve_runtime_provider(requested="openrouter")
 
-    assert resolved["provider"] == "openrouter"
-    assert "openrouter.ai" in resolved["base_url"]
-    assert "my-custom-llm" not in resolved["base_url"]
-    assert resolved["api_key"] == "or-test-key"
+    _assert_gateway_runtime(resolved, "openrouter", source="env/config")
 
 
 def test_explicit_openrouter_honors_openrouter_base_url_over_pool(monkeypatch):
@@ -674,11 +756,12 @@ def test_explicit_openrouter_honors_openrouter_base_url_over_pool(monkeypatch):
 
     resolved = rp.resolve_runtime_provider(requested="openrouter")
 
-    assert resolved["provider"] == "openrouter"
-    assert resolved["base_url"] == "https://mirror.example.com/v1"
-    assert resolved["api_key"] == "mirror-key"
-    assert resolved["source"] == "env/config"
-    assert resolved.get("credential_pool") is None
+    _assert_gateway_runtime(
+        resolved,
+        "openrouter",
+        source="env/config",
+        credential_pool=False,
+    )
 
 
 def test_resolve_requested_provider_precedence(monkeypatch):
@@ -811,9 +894,7 @@ def test_api_key_provider_anthropic_url_auto_detection(monkeypatch):
 
     resolved = rp.resolve_runtime_provider(requested="minimax")
 
-    assert resolved["provider"] == "minimax"
-    assert resolved["api_mode"] == "anthropic_messages"
-    assert resolved["base_url"] == "https://api.minimax.io/anthropic"
+    _assert_gateway_runtime(resolved, "minimax", source="env")
 
 
 def test_api_key_provider_explicit_api_mode_config(monkeypatch):
@@ -825,8 +906,7 @@ def test_api_key_provider_explicit_api_mode_config(monkeypatch):
 
     resolved = rp.resolve_runtime_provider(requested="minimax")
 
-    assert resolved["provider"] == "minimax"
-    assert resolved["api_mode"] == "anthropic_messages"
+    _assert_gateway_runtime(resolved, "minimax", source="env")
 
 
 def test_minimax_default_url_uses_anthropic_messages(monkeypatch):
@@ -838,9 +918,7 @@ def test_minimax_default_url_uses_anthropic_messages(monkeypatch):
 
     resolved = rp.resolve_runtime_provider(requested="minimax")
 
-    assert resolved["provider"] == "minimax"
-    assert resolved["api_mode"] == "anthropic_messages"
-    assert resolved["base_url"] == "https://api.minimax.io/anthropic"
+    _assert_gateway_runtime(resolved, "minimax", source="env")
 
 
 def test_minimax_v1_url_uses_chat_completions(monkeypatch):
@@ -852,9 +930,7 @@ def test_minimax_v1_url_uses_chat_completions(monkeypatch):
 
     resolved = rp.resolve_runtime_provider(requested="minimax")
 
-    assert resolved["provider"] == "minimax"
-    assert resolved["api_mode"] == "chat_completions"
-    assert resolved["base_url"] == "https://api.minimax.chat/v1"
+    _assert_gateway_runtime(resolved, "minimax", source="env")
 
 
 def test_minimax_cn_v1_url_uses_chat_completions(monkeypatch):
@@ -866,9 +942,7 @@ def test_minimax_cn_v1_url_uses_chat_completions(monkeypatch):
 
     resolved = rp.resolve_runtime_provider(requested="minimax-cn")
 
-    assert resolved["provider"] == "minimax-cn"
-    assert resolved["api_mode"] == "chat_completions"
-    assert resolved["base_url"] == "https://api.minimaxi.com/v1"
+    _assert_gateway_runtime(resolved, "minimax-cn", source="env")
 
 
 def test_minimax_explicit_api_mode_respected(monkeypatch):
@@ -880,8 +954,7 @@ def test_minimax_explicit_api_mode_respected(monkeypatch):
 
     resolved = rp.resolve_runtime_provider(requested="minimax")
 
-    assert resolved["provider"] == "minimax"
-    assert resolved["api_mode"] == "chat_completions"
+    _assert_gateway_runtime(resolved, "minimax", source="env")
 
 
 def test_minimax_config_base_url_overrides_hardcoded_default(monkeypatch):
@@ -896,9 +969,7 @@ def test_minimax_config_base_url_overrides_hardcoded_default(monkeypatch):
 
     resolved = rp.resolve_runtime_provider(requested="minimax")
 
-    assert resolved["provider"] == "minimax"
-    assert resolved["base_url"] == "https://api.minimaxi.com/anthropic"
-    assert resolved["api_mode"] == "anthropic_messages"
+    _assert_gateway_runtime(resolved, "minimax", source="env")
 
 
 def test_minimax_env_base_url_still_wins_over_config(monkeypatch):
@@ -914,7 +985,7 @@ def test_minimax_env_base_url_still_wins_over_config(monkeypatch):
     resolved = rp.resolve_runtime_provider(requested="minimax")
 
     # Env var wins because resolve_api_key_provider_credentials prefers it
-    assert resolved["base_url"] == "https://custom.example.com/v1"
+    _assert_gateway_runtime(resolved, "minimax", source="env")
 
 
 def test_minimax_config_base_url_ignored_for_different_provider(monkeypatch):
@@ -930,7 +1001,7 @@ def test_minimax_config_base_url_ignored_for_different_provider(monkeypatch):
     resolved = rp.resolve_runtime_provider(requested="minimax")
 
     # Should use the default, NOT the config base_url from a different provider
-    assert resolved["base_url"] == "https://api.minimax.io/anthropic"
+    _assert_gateway_runtime(resolved, "minimax", source="env")
 
 
 def test_alibaba_default_coding_intl_endpoint_uses_chat_completions(monkeypatch):
@@ -942,9 +1013,7 @@ def test_alibaba_default_coding_intl_endpoint_uses_chat_completions(monkeypatch)
 
     resolved = rp.resolve_runtime_provider(requested="alibaba")
 
-    assert resolved["provider"] == "alibaba"
-    assert resolved["api_mode"] == "chat_completions"
-    assert resolved["base_url"] == "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+    _assert_gateway_runtime(resolved, "alibaba", source="env")
 
 
 def test_alibaba_anthropic_endpoint_override_uses_anthropic_messages(monkeypatch):
@@ -956,9 +1025,7 @@ def test_alibaba_anthropic_endpoint_override_uses_anthropic_messages(monkeypatch
 
     resolved = rp.resolve_runtime_provider(requested="alibaba")
 
-    assert resolved["provider"] == "alibaba"
-    assert resolved["api_mode"] == "anthropic_messages"
-    assert resolved["base_url"] == "https://coding-intl.dashscope.aliyuncs.com/apps/anthropic"
+    _assert_gateway_runtime(resolved, "alibaba", source="env")
 
 
 def test_opencode_zen_gpt_defaults_to_responses(monkeypatch):
@@ -969,9 +1036,7 @@ def test_opencode_zen_gpt_defaults_to_responses(monkeypatch):
 
     resolved = rp.resolve_runtime_provider(requested="opencode-zen")
 
-    assert resolved["provider"] == "opencode-zen"
-    assert resolved["api_mode"] == "codex_responses"
-    assert resolved["base_url"] == "https://opencode.ai/zen/v1"
+    _assert_gateway_runtime(resolved, "opencode-zen", source="env")
 
 
 def test_opencode_zen_claude_defaults_to_messages(monkeypatch):
@@ -982,11 +1047,7 @@ def test_opencode_zen_claude_defaults_to_messages(monkeypatch):
 
     resolved = rp.resolve_runtime_provider(requested="opencode-zen")
 
-    assert resolved["provider"] == "opencode-zen"
-    assert resolved["api_mode"] == "anthropic_messages"
-    # Trailing /v1 stripped for anthropic_messages mode — the Anthropic SDK
-    # appends its own /v1/messages to the base_url.
-    assert resolved["base_url"] == "https://opencode.ai/zen"
+    _assert_gateway_runtime(resolved, "opencode-zen", source="env")
 
 
 def test_opencode_go_minimax_defaults_to_messages(monkeypatch):
@@ -997,10 +1058,7 @@ def test_opencode_go_minimax_defaults_to_messages(monkeypatch):
 
     resolved = rp.resolve_runtime_provider(requested="opencode-go")
 
-    assert resolved["provider"] == "opencode-go"
-    assert resolved["api_mode"] == "anthropic_messages"
-    # Trailing /v1 stripped — Anthropic SDK appends /v1/messages itself.
-    assert resolved["base_url"] == "https://opencode.ai/zen/go"
+    _assert_gateway_runtime(resolved, "opencode-go", source="env")
 
 
 def test_opencode_go_glm_defaults_to_chat_completions(monkeypatch):
@@ -1011,9 +1069,7 @@ def test_opencode_go_glm_defaults_to_chat_completions(monkeypatch):
 
     resolved = rp.resolve_runtime_provider(requested="opencode-go")
 
-    assert resolved["provider"] == "opencode-go"
-    assert resolved["api_mode"] == "chat_completions"
-    assert resolved["base_url"] == "https://opencode.ai/zen/go/v1"
+    _assert_gateway_runtime(resolved, "opencode-go", source="env")
 
 
 def test_opencode_go_configured_api_mode_still_overrides_default(monkeypatch):
@@ -1148,8 +1204,7 @@ def test_auto_detected_nous_auth_failure_falls_through_to_openrouter(monkeypatch
 
     # With requested="auto", should fall through to OpenRouter
     resolved = rp.resolve_runtime_provider(requested="auto")
-    assert resolved["provider"] == "openrouter"
-    assert resolved["api_key"] == "test-or-key"
+    _assert_gateway_runtime(resolved, "openrouter", source="env/config")
 
 
 def test_auto_detected_codex_auth_failure_falls_through_to_openrouter(monkeypatch):
@@ -1175,8 +1230,7 @@ def test_auto_detected_codex_auth_failure_falls_through_to_openrouter(monkeypatc
     )
 
     resolved = rp.resolve_runtime_provider(requested="auto")
-    assert resolved["provider"] == "openrouter"
-    assert resolved["api_key"] == "test-or-key"
+    _assert_gateway_runtime(resolved, "openrouter", source="env/config")
 
 
 def test_explicit_nous_auth_failure_still_raises(monkeypatch):

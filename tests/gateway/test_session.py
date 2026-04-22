@@ -373,6 +373,7 @@ class TestBuildSessionContextPrompt:
 
         assert "Feishu workbench defaults" in prompt
         assert "Do not ask the user for a table link" in prompt
+        assert "call the native `feishu_bitable_*` tools" in prompt
         assert "`app_token_demo`" in prompt
         assert "`tbl_demo`" in prompt
 

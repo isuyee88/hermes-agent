@@ -36,6 +36,52 @@ def test_validate_bearer_token():
     assert module._validate_bearer_token(None, None) is True
 
 
+def test_validate_feishu_internal_bearer_token_accepts_secondary_app_derivation(monkeypatch):
+    module = _load_module()
+    monkeypatch.setenv("FEISHU_APP_ID2", "cli_secondary_app")
+    monkeypatch.setenv("FEISHU_APP_SECRET2", "secondary-secret-123")
+
+    settings = module.RuntimeSettings(
+        model="openrouter/free",
+        max_turns=16,
+        max_tokens=None,
+        provider="openrouter",
+        base_url="https://openrouter.ai/api/v1",
+        api_key="sk-or-test",
+        bearer_token=None,
+        feishu_internal_bearer_token="fi_primary",
+        telegram_bot_token=None,
+        telegram_webhook_secret=None,
+        telegram_webhook_url=None,
+        telegram_send_ack=False,
+        feishu_app_id="cli_primary_app",
+        feishu_app_secret="primary-secret-123",
+        feishu_domain="feishu",
+        feishu_connection_mode="webhook",
+        feishu_verification_token=None,
+        feishu_encrypt_key=None,
+        feishu_bitable_app_token=None,
+        feishu_bitable_table_id=None,
+        feishu_model_registry_mirror_enabled=False,
+        feishu_tool_capabilities=[],
+        feishu_default_workspace=None,
+        qq_app_id=None,
+        qq_app_secret=None,
+        nvidia_api_key=None,
+        nvidia_base_url="https://integrate.api.nvidia.com/v1",
+        enabled_toolsets=[],
+        disabled_toolsets=[],
+    )
+
+    secondary_token = module._derive_feishu_internal_bearer_token(
+        app_id="cli_secondary_app",
+        app_secret="secondary-secret-123",
+    )
+
+    assert module._validate_feishu_internal_bearer_token(f"Bearer {secondary_token}", settings) is True
+    assert module._validate_feishu_internal_bearer_token("Bearer wrong", settings) is False
+
+
 def test_extract_tool_names_handles_dict_payloads():
     module = _load_module()
     messages = [
@@ -92,6 +138,232 @@ def test_extract_feishu_trace_token_from_text_payload():
     assert module._extract_feishu_trace_token(payload) == "fev_123abc"
 
 
+def test_infer_feishu_internal_route_hint_prefers_fast_control_for_commands():
+    module = _load_module()
+
+    route_hint = module._infer_feishu_internal_route_hint(
+        {
+            "task_kind": "command",
+            "message_type": "command",
+            "text": "/model openai/gpt-4.1",
+        }
+    )
+
+    assert route_hint == "fast_control"
+
+
+def test_infer_feishu_internal_route_hint_marks_browser_requests():
+    module = _load_module()
+
+    route_hint = module._infer_feishu_internal_route_hint(
+        {
+            "task_kind": "text",
+            "message_type": "text",
+            "text": "请打开 https://example.com 并截图给我",
+        }
+    )
+
+    assert route_hint == "cf_browser_first"
+
+
+def test_extract_feishu_trace_context_preserves_gateway_classification_fields():
+    module = _load_module()
+
+    payload = {
+        "correlation_id": "feishu:chat:evt_123",
+        "session_key": "agent:main:feishu:group:chat:user",
+        "event_type": "im.message.receive_v1",
+        "event_id": "evt_123",
+        "message_id": "om_123",
+        "chat_id": "oc_123",
+        "route_hint": "modal_heavy_exec",
+        "task_kind": "text",
+        "request_class": "text_plain",
+        "route_family": "gateway_text",
+        "gateway_route_name": "affiliate-general",
+        "gateway_eligible": True,
+        "requires_tools": False,
+        "requires_browser": False,
+        "requires_media_hydration": False,
+        "requires_modal_runtime": False,
+        "content_modalities": ["text"],
+        "toolset": [],
+        "modality_profile": "text",
+        "reason_code": "plain_text_without_attachments_or_browser",
+        "site_category": "site_content",
+        "site_intent": "docs",
+        "target_domain": "developers.cloudflare.com",
+        "target_url": "https://developers.cloudflare.com/ai-gateway/",
+        "site_prefetch": {
+            "mode": "browser_markdown",
+            "status": "completed",
+        },
+        "site_prefetch_direct_navigation": True,
+        "site_prefetch_direct_mode": "content_direct",
+        "browser_target_domain": "developers.cloudflare.com",
+        "estimated_cost_usd": 0.0123,
+        "event": {
+            "message": {
+                "message_id": "om_from_event",
+                "chat_type": "group",
+            }
+        },
+    }
+
+    result = module._extract_feishu_trace_context(payload)
+
+    assert result["correlation_id"] == "feishu:chat:evt_123"
+    assert result["session_key"] == "agent:main:feishu:group:chat:user"
+    assert result["message_id"] == "om_123"
+    assert result["chat_id"] == "oc_123"
+    assert result["request_class"] == "text_plain"
+    assert result["route_family"] == "gateway_text"
+    assert result["gateway_route_name"] == "affiliate-general"
+    assert result["site_category"] == "site_content"
+    assert result["site_intent"] == "docs"
+    assert result["site_prefetch_mode"] == "browser_markdown"
+    assert result["site_prefetch_status"] == "completed"
+    assert result["site_prefetch_direct_navigation"] is True
+    assert result["site_prefetch_direct_mode"] == "content_direct"
+    assert result["browser_target_domain"] == "developers.cloudflare.com"
+    assert result["estimated_cost_usd"] == 0.0123
+
+
+def test_extract_feishu_trace_context_reads_site_prefetch_from_ingress_meta():
+    module = _load_module()
+
+    payload = {
+        "event_type": "im.message.receive_v1",
+        "event_id": "evt_ingress",
+        "message_id": "om_ingress",
+        "_hermes_ingress": {
+            "site_prefetch": {
+                "mode": "playwright_preflight",
+                "status": "completed",
+                "confidence": 0.8,
+            }
+        },
+        "event": {
+            "message": {
+                "message_id": "om_ingress",
+                "chat_type": "p2p",
+            }
+        },
+    }
+
+    result = module._extract_feishu_trace_context(payload)
+
+    assert result["site_prefetch_mode"] == "playwright_preflight"
+    assert result["site_prefetch_status"] == "completed"
+    assert result["site_prefetch_confidence"] == 0.8
+
+
+def test_build_feishu_internal_result_includes_action_plan_and_flags():
+    module = _load_module()
+
+    result = module._build_feishu_internal_result(
+        status="ok",
+        route_hint="fast_control",
+        execution_mode="control_complete",
+        session_state_before={"current_model": "a"},
+        session_state_after={"current_model": "b"},
+        send_plan=[{"kind": "text", "content": "hello"}],
+        final_response="hello",
+        reconcile_required=False,
+        browser_fallback_allowed=False,
+        action="dispatch_command",
+    )
+
+    assert result["route_hint"] == "fast_control"
+    assert result["execution_mode"] == "control_complete"
+    assert result["send_plan"][0]["kind"] == "text"
+    assert result["action_plan"][0]["content"] == "hello"
+    assert result["reconcile_required"] is False
+
+
+def test_build_feishu_internal_plan_marks_plain_text_as_external_exec_candidate():
+    module = _load_module()
+
+    result = module._build_feishu_internal_plan(
+        {
+            "task_kind": "text",
+            "message_type": "text",
+            "text": "请帮我总结一下这周的工作重点",
+            "attachment_refs": [],
+        },
+        session_state_before={
+            "current_model": "openrouter/free",
+            "current_provider": "openrouter",
+            "route_debug": {
+                "last_model": "openai/gpt-oss-20b:free",
+                "last_provider": "openrouter",
+            },
+        },
+    )
+
+    assert result["route_hint"] == "modal_heavy_exec"
+    assert result["execution_mode"] == "deferred_reconcile"
+    assert result["external_exec_candidate"] is True
+    assert result["reconcile_required"] is True
+    assert result["provider_plan"]["mode"] == "cloudflare_workflow_candidate"
+    assert result["provider_plan"]["model"] == "mistralai/mistral-small-3.1-24b-instruct"
+    assert result["provider_plan"]["session_model"] == "openrouter/free"
+    assert result["provider_plan"]["fallback_model"] == "deepseek/deepseek-chat-v3-0324"
+    assert result["provider_plan"]["fallback_provider"] == "openrouter"
+    assert result["provider_plan"]["request_timeout_ms"] == 18000
+    assert result["provider_plan"]["max_attempts"] == 2
+    assert result["provider_plan"]["cache_mode"] == "ttl"
+    assert result["provider_plan"]["cache_scope"] == "chat"
+    assert result["provider_plan"]["cache_ttl_seconds"] == 300
+
+
+def test_build_feishu_internal_plan_rewrites_free_llm_request_model_to_paid_exec_model():
+    module = _load_module()
+
+    result = module._build_feishu_internal_plan(
+        {
+            "task_kind": "text",
+            "message_type": "text",
+            "text": "please summarize this thread",
+            "attachment_refs": [],
+        },
+        session_state_before={
+            "current_model": "openrouter/free",
+            "current_provider": "openrouter",
+            "route_debug": {
+                "last_model": "openai/gpt-oss-20b:free",
+                "last_provider": "openrouter",
+            },
+        },
+        llm_request={
+            "model": "openrouter/free",
+            "messages": [{"role": "user", "content": "please summarize this thread"}],
+        },
+    )
+
+    assert result["external_exec_candidate"] is True
+    assert result["provider_plan"]["model"] == "mistralai/mistral-small-3.1-24b-instruct"
+    assert result["llm_request"]["model"] == "mistralai/mistral-small-3.1-24b-instruct"
+
+
+def test_build_feishu_internal_plan_keeps_browser_requests_in_modal_exec():
+    module = _load_module()
+
+    result = module._build_feishu_internal_plan(
+        {
+            "task_kind": "text",
+            "message_type": "text",
+            "text": "请打开 https://example.com 并截图给我",
+            "attachment_refs": [],
+        }
+    )
+
+    assert result["route_hint"] == "cf_browser_first"
+    assert result["execution_mode"] == "cf_browser_first"
+    assert result["external_exec_candidate"] is False
+    assert result["reconcile_required"] is False
+
+
 def test_extract_feishu_message_read_event_info():
     module = _load_module()
     payload = {
@@ -124,6 +396,46 @@ def test_extract_feishu_message_read_event_info():
     assert result["read_time"] == 1712970000
     assert result["message_id_list"] == ["om_1", "om_2"]
     assert result["message_count"] == 2
+
+
+def test_resolve_feishu_request_started_at_ms_prefers_valid_epoch_over_perf_counter():
+    module = _load_module()
+    payload = module._with_feishu_internal_meta(
+        {"event": {"message": {"message_id": "om_1"}}},
+        ack_reaction_requested_at_ms=1712970000000,
+    )
+
+    assert module._resolve_feishu_request_started_at_ms(payload, 123456789) == 1712970000000
+
+
+def test_resolve_feishu_request_started_at_ms_uses_explicit_valid_epoch():
+    module = _load_module()
+    payload = module._with_feishu_internal_meta(
+        {"event": {"message": {"message_id": "om_1"}}},
+        ack_reaction_requested_at_ms=1712970000000,
+    )
+
+    assert module._resolve_feishu_request_started_at_ms(payload, 1712971234567) == 1712971234567
+
+
+def test_extract_feishu_internal_request_meta_reads_gateway_headers():
+    module = _load_module()
+
+    result = module._extract_feishu_internal_request_meta(
+        {
+            "x-hermes-gateway-hop": "cloudflare-worker",
+            "x-hermes-gateway-script": "hermes-feishu-gateway",
+            "x-hermes-correlation-id": "feishu:chat:evt_1",
+            "x-hermes-event-id": "evt_1",
+            "x-hermes-session-key": "agent:main:feishu:dm:oc_1",
+        }
+    )
+
+    assert result["gateway_hop"] == "cloudflare-worker"
+    assert result["gateway_script"] == "hermes-feishu-gateway"
+    assert result["gateway_correlation_id"] == "feishu:chat:evt_1"
+    assert result["gateway_event_id"] == "evt_1"
+    assert result["gateway_session_key"] == "agent:main:feishu:dm:oc_1"
 
 
 def test_session_state_round_trip(tmp_path):
@@ -352,6 +664,131 @@ def test_sync_runtime_config_writes_official_config_path(tmp_path, monkeypatch):
     assert written_path == str(module.HERMES_HOME_DIR / "config.yaml")
 
 
+def test_config_modal_seeds_ceo_personality_defaults():
+    payload = yaml.safe_load((REPO_ROOT / "config.modal.yaml").read_text(encoding="utf-8"))
+
+    assert payload["agent"]["personalities"]["ceo"]["description"].startswith("CEO")
+    assert "Tone:" in payload["agent"]["system_prompt"]
+
+
+def test_config_modal_enables_startup_browser_and_toolset_defaults():
+    payload = yaml.safe_load((REPO_ROOT / "config.modal.yaml").read_text(encoding="utf-8"))
+
+    assert payload["browser"]["cloud_provider"] == "local"
+    assert payload["browser"]["command_timeout"] == 30
+    assert payload["skills"]["startup"] == ["affiliate-os", "browser-ops"]
+    assert payload["skills"]["platform_startup"]["cli"] == ["automation-os", "ceo-os"]
+    assert payload["skills"]["platform_startup"]["feishu"] == ["feishu-workbench", "affiliate-os", "browser-ops"]
+    assert payload["platform_toolsets"]["cli"] == ["founder-max", "feishu", "plugin_startup_ops"]
+    assert payload["platform_toolsets"]["feishu"] == ["collab-safe", "feishu"]
+    assert payload["platform_toolsets"]["api_server"] == ["cto-max", "plugin_startup_ops"]
+
+
+def test_config_modal_seeds_affiliate_operator_personalities():
+    payload = yaml.safe_load((REPO_ROOT / "config.modal.yaml").read_text(encoding="utf-8"))
+    personalities = payload["agent"]["personalities"]
+
+    for name in ("content", "seo", "ads", "bd", "ops", "finance"):
+        assert name in personalities
+        assert personalities[name]["description"]
+
+
+def test_runtime_bootstrap_debug_state_reports_startup_skills_and_project_plugins(
+    tmp_path, monkeypatch
+):
+    module = _load_module()
+    module.DATA_ROOT = tmp_path / "data"
+    module.SESSIONS_DIR = module.DATA_ROOT / "sessions"
+    module.UPDATES_PATH = module.DATA_ROOT / "telegram_updates.json"
+    module.HERMES_HOME_DIR = tmp_path / "home"
+
+    repo_root = tmp_path / "repo"
+    app_dir = repo_root / "hermes-agent"
+    app_dir.mkdir(parents=True)
+    plugin_dir = repo_root / ".hermes" / "plugins" / "repo_plugin"
+    plugin_dir.mkdir(parents=True)
+    (plugin_dir / "plugin.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "name": "repo_plugin",
+                "version": "0.1.0",
+                "description": "repo scoped plugin",
+                "provides_hooks": ["on_session_start"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (plugin_dir / "__init__.py").write_text(
+        'def register(ctx):\n    ctx.register_hook("on_session_start", lambda **kw: None)\n',
+        encoding="utf-8",
+    )
+
+    config_source = tmp_path / "config.modal.yaml"
+    config_source.write_text(
+        yaml.safe_dump(
+            {
+                "model": {"default": "openrouter/free"},
+                "agent": {
+                    "personality": "ceo",
+                    "personalities": {
+                        "ceo": {
+                            "description": "CEO operator",
+                            "system_prompt": "Run the company.",
+                        }
+                    },
+                },
+                "skills": {
+                    "startup": ["affiliate-os", "browser-ops"],
+                    "platform_startup": {
+                        "cli": ["automation-os", "ceo-os"],
+                        "feishu": ["affiliate-os", "browser-ops"],
+                    },
+                },
+                "plugins": {"enable_project": True},
+                "platform_toolsets": {
+                    "cli": ["founder-max", "plugin_startup_ops"],
+                    "feishu": ["collab-safe", "feishu"],
+                    "api_server": ["cto-max"],
+                },
+            },
+            sort_keys=False,
+            allow_unicode=True,
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("HERMES_MODAL_CONFIG_SOURCE", str(config_source))
+    monkeypatch.setenv("HERMES_MODAL_SYNC_CONFIG", "true")
+    monkeypatch.setenv("HERMES_HOME", str(module.HERMES_HOME_DIR))
+    monkeypatch.chdir(app_dir)
+
+    import hermes_cli.plugins as plugins_mod
+
+    plugins_mod._plugin_manager = None
+    try:
+        payload = module._build_runtime_bootstrap_debug_state(("cli", "feishu"))
+    finally:
+        plugins_mod._plugin_manager = None
+
+    assert payload["config_loaded"] is True
+    assert payload["agent"]["default_personality"] == "ceo"
+    assert "ceo" in payload["agent"]["available_personalities"]
+    assert payload["startup_skills"]["global"] == ["affiliate-os", "browser-ops"]
+    assert payload["startup_skills"]["platforms"]["cli"] == [
+        "affiliate-os",
+        "browser-ops",
+        "automation-os",
+        "ceo-os",
+    ]
+    assert payload["project_plugins"]["search_dir"].endswith(str(Path(".hermes") / "plugins"))
+    assert payload["project_plugins"]["search_dir_exists"] is True
+    assert any(plugin["name"] == "repo_plugin" and plugin["enabled"] for plugin in payload["plugins"]["loaded"])
+    assert payload["platform_toolsets"]["cli"]["configured_toolsets"] == ["founder-max", "plugin_startup_ops"]
+    assert payload["platform_toolsets"]["feishu"]["configured_toolsets"] == ["collab-safe", "feishu"]
+    assert "browser" in payload["platform_toolsets"]["cli"]["effective_toolsets"]
+    assert payload["platform_toolsets"]["cli"]["resolved_tool_count"] > 0
+
+
 def test_sync_runtime_config_preserves_existing_mcp_servers_without_feishu_injection(tmp_path, monkeypatch):
     module = _load_module()
     module.DATA_ROOT = tmp_path / "data"
@@ -499,6 +936,116 @@ def test_prepare_runtime_environment_syncs_supermemory_config(monkeypatch, tmp_p
     assert target.read_text(encoding="utf-8") == source.read_text(encoding="utf-8")
 
 
+def test_prepare_runtime_environment_syncs_bundled_skills_once(monkeypatch, tmp_path):
+    module = _load_module()
+    module.DATA_ROOT = tmp_path / "data"
+    module.SESSIONS_DIR = module.DATA_ROOT / "sessions"
+    module.UPDATES_PATH = module.DATA_ROOT / "telegram_updates.json"
+    module.HERMES_HOME_DIR = tmp_path / "home"
+    module._RUNTIME_SKILLS_SYNCED = False
+
+    sync_calls = []
+
+    def _fake_sync_skills(*, quiet: bool = False):
+        sync_calls.append({"quiet": quiet})
+        skills_dir = module.HERMES_HOME_DIR / "skills" / "productivity" / "feishu-workbench"
+        skills_dir.mkdir(parents=True, exist_ok=True)
+        (skills_dir / "SKILL.md").write_text("# test\n", encoding="utf-8")
+        return {"copied": ["feishu-workbench"]}
+
+    import types as _types
+
+    monkeypatch.setenv("HERMES_HOME", str(module.HERMES_HOME_DIR))
+    monkeypatch.setitem(sys.modules, "tools.skills_sync", _types.SimpleNamespace(sync_skills=_fake_sync_skills))
+
+    module._prepare_runtime_environment()
+    module._prepare_runtime_environment()
+
+    assert sync_calls == [{"quiet": True}]
+    assert (module.HERMES_HOME_DIR / "skills" / "productivity" / "feishu-workbench" / "SKILL.md").exists()
+
+
+def test_prepare_runtime_environment_keeps_feishu_skills_toolset_enabled_by_default(monkeypatch, tmp_path):
+    module = _load_module()
+    module.DATA_ROOT = tmp_path / "data"
+    module.SESSIONS_DIR = module.DATA_ROOT / "sessions"
+    module.UPDATES_PATH = module.DATA_ROOT / "telegram_updates.json"
+    module.HERMES_HOME_DIR = tmp_path / "home"
+    module._RUNTIME_SKILLS_SYNCED = True
+
+    monkeypatch.delenv("HERMES_FEISHU_DISABLED_TOOLSETS", raising=False)
+    monkeypatch.setenv("HERMES_HOME", str(module.HERMES_HOME_DIR))
+
+    module._prepare_runtime_environment()
+
+    assert "skills" not in os.environ["HERMES_FEISHU_DISABLED_TOOLSETS"].split(",")
+
+
+def test_resolve_camofox_launch_command_prefers_installed_binary(monkeypatch):
+    module = _load_module()
+
+    def _fake_which(name: str):
+        if name == "camofox-browser":
+            return "/usr/local/bin/camofox-browser"
+        return None
+
+    monkeypatch.setattr(module.shutil, "which", _fake_which)
+
+    assert module._resolve_camofox_launch_command() == ["/usr/local/bin/camofox-browser"]
+
+
+def test_resolve_camofox_launch_command_falls_back_to_npx(monkeypatch):
+    module = _load_module()
+    monkeypatch.setattr(module.shutil, "which", lambda _name: None)
+
+    assert module._resolve_camofox_launch_command() == ["npx", "--yes", "@askjo/camofox-browser"]
+
+
+def test_ensure_camofox_server_starts_local_process_when_needed(monkeypatch, tmp_path):
+    module = _load_module()
+    module.DATA_ROOT = tmp_path / "data"
+    module._CAMOFOX_SERVER_PROCESS = None
+
+    monkeypatch.setenv("CAMOFOX_URL", "http://127.0.0.1:9377")
+    monkeypatch.setattr(module, "_resolve_camofox_launch_command", lambda: ["camofox-browser"])
+
+    readiness_checks = iter([False, False, True])
+    monkeypatch.setattr(module, "_is_camofox_healthcheck_ready", lambda _url: next(readiness_checks))
+    monkeypatch.setattr(module.time, "sleep", lambda _seconds: None)
+
+    captured: dict[str, object] = {}
+
+    class _FakeProcess:
+        pid = 4321
+
+        def poll(self):
+            return None
+
+    def _fake_popen(cmd, cwd, env, stdin, stdout, stderr, start_new_session):
+        captured["cmd"] = cmd
+        captured["cwd"] = cwd
+        captured["env"] = env
+        return _FakeProcess()
+
+    monkeypatch.setattr(module.subprocess, "Popen", _fake_popen)
+
+    module._ensure_camofox_server()
+
+    assert captured["cmd"] == ["camofox-browser"]
+    assert captured["cwd"] == "/root"
+    assert captured["env"]["CAMOFOX_PORT"] == "9377"
+    assert (module.DATA_ROOT / "logs" / "camofox.log").exists()
+
+
+def test_ensure_camofox_server_skips_remote_url(monkeypatch):
+    module = _load_module()
+    module._CAMOFOX_SERVER_PROCESS = None
+    monkeypatch.setenv("CAMOFOX_URL", "https://browser.example.com")
+    monkeypatch.setattr(module.subprocess, "Popen", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("should not start")))
+
+    module._ensure_camofox_server()
+
+
 def test_runtime_settings_capture_qq_credentials(monkeypatch):
     module = _load_module()
     monkeypatch.setenv("QQ_APP_ID", "app-12345678")
@@ -536,6 +1083,23 @@ def test_runtime_settings_capture_feishu_credentials(monkeypatch):
     assert serialized["feishu_app_id"].startswith("cli_")
     assert serialized["feishu_app_secret"].startswith("feis")
     assert serialized["feishu_bitable_app_token"].startswith("bita")
+
+
+def test_runtime_settings_derive_feishu_internal_bearer(monkeypatch):
+    module = _load_module()
+    monkeypatch.delenv("HERMES_FEISHU_INTERNAL_BEARER_TOKEN", raising=False)
+    monkeypatch.delenv("WEBHOOK_SECRET", raising=False)
+    monkeypatch.delenv("HERMES_WEBHOOK_BEARER_TOKEN", raising=False)
+    monkeypatch.setenv("FEISHU_APP_ID", "cli_feishu_app")
+    monkeypatch.setenv("FEISHU_APP_SECRET", "feishu-secret-123")
+
+    settings = module.RuntimeSettings.from_env()
+
+    expected = module._derive_feishu_internal_bearer_token(
+        app_id="cli_feishu_app",
+        app_secret="feishu-secret-123",
+    )
+    assert settings.feishu_internal_bearer_token == expected
 
 
 def test_extract_feishu_queue_context_handles_menu_event():
@@ -586,6 +1150,26 @@ def test_extract_feishu_queue_context_handles_bot_entered_user_shape():
     warmup = module._extract_feishu_warmup_context(payload)
     assert warmup["lane"] == "chat_light"
     assert warmup["partition"] == "feishu:chat_light:oc_entered_chat"
+
+
+def test_build_feishu_internal_source_falls_back_to_raw_control_event_actor():
+    module = _load_module()
+
+    source = module._build_feishu_internal_source(
+        {
+            "chat_type": "group",
+            "raw_message": {
+                "event": {
+                    "context": {"open_chat_id": "oc_control_chat"},
+                    "operator": {"open_id": "ou_control_user"},
+                }
+            },
+        }
+    )
+
+    assert source.chat_id == "oc_control_chat"
+    assert source.user_id == "ou_control_user"
+    assert source.user_name == "ou_control_user"
 
 
 def test_classify_feishu_chat_lane_prefers_chat_light_for_short_text():
@@ -947,6 +1531,37 @@ def test_debug_feishu_runtime_uses_api_only_surface(monkeypatch):
     assert '"memory_snapshots": {' in source
 
 
+def test_feishu_platform_hint_explicitly_mentions_native_workspace_tools():
+    from agent.prompt_builder import PLATFORM_HINTS
+
+    hint = PLATFORM_HINTS["feishu"]
+
+    assert "feishu_*" in hint
+    assert "browser_*" in hint
+    assert "Docs" in hint
+    assert "Sheets" in hint
+    assert "Bitable" in hint
+    assert "instead of claiming that Feishu access is unavailable" in hint
+
+
+def test_chat_queue_memory_snapshot_disabled_by_default(monkeypatch):
+    monkeypatch.delenv("HERMES_MODAL_CHAT_QUEUE_MEMORY_SNAPSHOT_ENABLED", raising=False)
+    module = _load_module()
+
+    assert module.CHAT_QUEUE_MEMORY_SNAPSHOT_ENABLED is False
+
+
+def test_feishu_snapshot_defaults_are_cost_first(monkeypatch):
+    monkeypatch.delenv("HERMES_MODAL_WEB_APP_MEMORY_SNAPSHOT_ENABLED", raising=False)
+    monkeypatch.delenv("HERMES_MODAL_FEISHU_INGRESS_MEMORY_SNAPSHOT_ENABLED", raising=False)
+    monkeypatch.delenv("HERMES_MODAL_FEISHU_ACK_REACTION_MEMORY_SNAPSHOT_ENABLED", raising=False)
+    module = _load_module()
+
+    assert module.WEB_APP_MEMORY_SNAPSHOT_ENABLED is False
+    assert module.FEISHU_INGRESS_MEMORY_SNAPSHOT_ENABLED is False
+    assert module.FEISHU_ACK_REACTION_MEMORY_SNAPSHOT_ENABLED is False
+
+
 def test_feishu_model_registry_heartbeat_impl_respects_next_due(monkeypatch):
     module = _load_module()
     future_due = int(time.time()) + 120
@@ -1078,22 +1693,142 @@ def test_build_feishu_menu_manifest_contains_model_picker():
 
     assert payload["platform"] == "feishu"
     assert "model_picker" in payload["supported_event_keys"]
+    assert "personality_picker" in payload["supported_event_keys"]
+    assert "skill_combo_picker" in payload["supported_event_keys"]
+    assert "command_center" in payload["supported_event_keys"]
     assert payload["menu_items"][0]["event_key"] == "model_picker"
 
 
-def test_runtime_api_config_infers_openrouter_defaults(monkeypatch):
+def test_build_feishu_local_operator_cards_expose_personality_and_combo_actions():
+    module = _load_module()
+
+    personality_card = module._build_feishu_personality_card()
+    combo_card = module._build_feishu_skill_combo_card()
+    command_card = module._build_feishu_command_center_card()
+
+    personality_actions = [
+        action.get("value", {})
+        for element in personality_card["elements"]
+        if element.get("tag") == "action"
+        for action in element.get("actions", [])
+    ]
+    combo_actions = [
+        action.get("value", {})
+        for element in combo_card["elements"]
+        if element.get("tag") == "action"
+        for action in element.get("actions", [])
+    ]
+    command_actions = [
+        action.get("value", {})
+        for element in command_card["elements"]
+        if element.get("tag") == "action"
+        for action in element.get("actions", [])
+    ]
+
+    assert any(value.get("hermes_action") == "personality_set" for value in personality_actions)
+    assert any(value.get("hermes_action") == "skill_combo_apply" for value in combo_actions)
+    assert any(value.get("hermes_action") == "command_run" for value in command_actions)
+    assert any(value.get("hermes_action") == "registry_close_card" for value in personality_actions)
+    assert any(value.get("hermes_action") == "registry_close_card" for value in combo_actions)
+    assert any(value.get("hermes_action") == "registry_close_card" for value in command_actions)
+    assert any(value.get("command_text") == "/help" for value in command_actions)
+    assert any("`/browser [connect|disconnect|status]`" in element.get("content", "") for element in command_card["elements"] if element.get("tag") == "markdown")
+
+
+def test_runtime_api_config_defaults_to_cloudflare_gateway_for_openrouter(monkeypatch):
     module = _load_module()
     monkeypatch.delenv("HERMES_PROVIDER", raising=False)
     monkeypatch.delenv("HERMES_BASE_URL", raising=False)
     monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
     monkeypatch.delenv("OPENROUTER_BASE_URL", raising=False)
+    monkeypatch.delenv("CLOUDFLARE_API_TOKEN", raising=False)
+    monkeypatch.delenv("CLOUDFLARE_AI_GATEWAY_API_KEY", raising=False)
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
 
     provider, base_url, api_key = module._pick_runtime_api_config()
 
     assert provider == "openrouter"
-    assert base_url == "https://openrouter.ai/api/v1"
+    assert base_url == "https://gateway.ai.cloudflare.com/v1/d1215a30b84b673ef0367010b0e78c10/affiliate-manager/compat"
     assert api_key == "sk-or-test"
+
+
+def test_runtime_api_config_prefers_cloudflare_gateway_when_enabled(monkeypatch):
+    module = _load_module()
+    monkeypatch.delenv("HERMES_PROVIDER", raising=False)
+    monkeypatch.delenv("HERMES_BASE_URL", raising=False)
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.delenv("OPENROUTER_BASE_URL", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.setenv("HERMES_INFERENCE_USE_CLOUDFLARE_AI_GATEWAY", "true")
+    monkeypatch.setenv(
+        "CLOUDFLARE_AI_GATEWAY_BASE_URL",
+        "https://gateway.ai.cloudflare.com/v1/acct/gateway/compat/chat/completions",
+    )
+    monkeypatch.setenv("CLOUDFLARE_API_TOKEN", "cf-token")
+
+    provider, base_url, api_key = module._pick_runtime_api_config()
+
+    assert provider == "openrouter"
+    assert base_url == "https://gateway.ai.cloudflare.com/v1/acct/gateway/compat"
+    assert api_key == "cf-token"
+
+
+def test_runtime_api_config_ignores_direct_openrouter_base_url_for_gateway_providers(monkeypatch):
+    module = _load_module()
+    monkeypatch.delenv("HERMES_PROVIDER", raising=False)
+    monkeypatch.setenv("HERMES_BASE_URL", "https://openrouter.ai/api/v1")
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.delenv("CLOUDFLARE_API_TOKEN", raising=False)
+    monkeypatch.delenv("CLOUDFLARE_AI_GATEWAY_API_KEY", raising=False)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
+    monkeypatch.setenv(
+        "CLOUDFLARE_AI_GATEWAY_BASE_URL",
+        "https://gateway.ai.cloudflare.com/v1/acct/gateway/compat/chat/completions",
+    )
+
+    provider, base_url, api_key = module._pick_runtime_api_config()
+
+    assert provider == "openrouter"
+    assert base_url == "https://gateway.ai.cloudflare.com/v1/acct/gateway/compat"
+    assert api_key == "sk-or-test"
+
+
+def test_runtime_api_config_routes_remote_providers_through_cloudflare_gateway(monkeypatch):
+    module = _load_module()
+    monkeypatch.setenv("HERMES_PROVIDER", "anthropic")
+    monkeypatch.setenv("HERMES_BASE_URL", "https://api.anthropic.com")
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.delenv("OPENROUTER_BASE_URL", raising=False)
+    monkeypatch.setenv(
+        "CLOUDFLARE_AI_GATEWAY_BASE_URL",
+        "https://gateway.ai.cloudflare.com/v1/acct/gateway/compat/chat/completions",
+    )
+    monkeypatch.setenv("CLOUDFLARE_API_TOKEN", "cf-token")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "anthropic-test")
+
+    provider, base_url, api_key = module._pick_runtime_api_config()
+
+    assert provider == "anthropic"
+    assert base_url == "https://gateway.ai.cloudflare.com/v1/acct/gateway/compat"
+    assert api_key == "cf-token"
+
+
+def test_runtime_api_config_keeps_bypass_providers_direct(monkeypatch):
+    module = _load_module()
+    monkeypatch.setenv("HERMES_PROVIDER", "custom")
+    monkeypatch.setenv("HERMES_BASE_URL", "https://example.com/v1")
+    monkeypatch.setenv("HERMES_API_KEY", "custom-key")
+    monkeypatch.setenv(
+        "CLOUDFLARE_AI_GATEWAY_BASE_URL",
+        "https://gateway.ai.cloudflare.com/v1/acct/gateway/compat/chat/completions",
+    )
+    monkeypatch.setenv("CLOUDFLARE_API_TOKEN", "cf-token")
+
+    provider, base_url, api_key = module._pick_runtime_api_config()
+
+    assert provider == "custom"
+    assert base_url == "https://example.com/v1"
+    assert api_key == "custom-key"
 
 
 def test_desired_telegram_webhook_url_prefers_explicit_env(monkeypatch):
@@ -1298,6 +2033,192 @@ def test_session_route_lease_sticky_hit(monkeypatch, tmp_path):
     assert seen["trace_metadata"]["route_selection"] == "sticky_hit"
 
 
+def test_candidate_routes_from_state_prefers_runtime_binding(monkeypatch):
+    module = _load_module()
+    monkeypatch.setattr(
+        module,
+        "_resolve_provider_runtime_binding",
+        lambda provider_name: {
+            "provider": provider_name,
+            "base_url": "https://gateway.ai.cloudflare.com/v1/acct/gw/compat",
+            "api_key": "cf-token",
+            "api_mode": "chat_completions",
+        } if provider_name == "openrouter" else None,
+    )
+
+    routes = module._candidate_routes_from_state(
+        {
+            "providers": {
+                "openrouter": {
+                    "base_url": "https://openrouter.ai/api/v1",
+                    "candidates": ["openrouter/free"],
+                }
+            }
+        }
+    )
+
+    assert routes[0]["provider"] == "openrouter"
+    assert routes[0]["base_url"] == "https://gateway.ai.cloudflare.com/v1/acct/gw/compat"
+    assert routes[0]["api_key"] == "cf-token"
+
+
+def test_route_from_settings_prefers_runtime_binding_for_remote_providers(monkeypatch):
+    module = _load_module()
+    monkeypatch.setattr(
+        module,
+        "_resolve_provider_runtime_binding",
+        lambda provider_name: {
+            "provider": provider_name,
+            "base_url": "https://gateway.ai.cloudflare.com/v1/acct/gw/compat",
+            "api_key": "cf-token",
+            "api_mode": "chat_completions",
+        } if provider_name == "anthropic" else None,
+    )
+    settings = types.SimpleNamespace(
+        provider="anthropic",
+        base_url="https://api.anthropic.com",
+        api_key="anthropic-key",
+        model="claude-3-7-sonnet",
+    )
+
+    route = module._route_from_settings(settings, "claude-3-7-sonnet")
+
+    assert route["provider"] == "anthropic"
+    assert route["base_url"] == "https://gateway.ai.cloudflare.com/v1/acct/gw/compat"
+    assert route["api_key"] == "cf-token"
+
+
+def test_candidate_routes_from_state_skips_direct_provider_routes_without_runtime_binding(monkeypatch):
+    module = _load_module()
+    monkeypatch.setattr(module, "_resolve_provider_runtime_binding", lambda provider_name: None)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
+
+    routes = module._candidate_routes_from_state(
+        {
+            "providers": {
+                "openrouter": {
+                    "base_url": "https://openrouter.ai/api/v1",
+                    "candidates": ["openrouter/free"],
+                }
+            }
+        }
+    )
+
+    assert routes == []
+
+
+def test_hydrate_route_from_lease_prefers_runtime_binding(monkeypatch):
+    module = _load_module()
+    monkeypatch.setattr(
+        module,
+        "_resolve_provider_runtime_binding",
+        lambda provider_name: {
+            "provider": provider_name,
+            "base_url": "https://gateway.ai.cloudflare.com/v1/acct/gw/compat",
+            "api_key": "cf-token",
+            "api_mode": "chat_completions",
+        } if provider_name == "nvidia" else None,
+    )
+    settings = types.SimpleNamespace(provider="openrouter", api_key="sk-or-test")
+
+    hydrated = module._hydrate_route_from_lease(
+        settings,
+        {
+            "provider": "nvidia",
+            "model": "nvidia/nemotron-3-super-120b-a12b",
+            "base_url": "https://integrate.api.nvidia.com/v1",
+            "lease_expires_at": 9999999999,
+        },
+    )
+
+    assert hydrated["provider"] == "nvidia"
+    assert hydrated["base_url"] == "https://gateway.ai.cloudflare.com/v1/acct/gw/compat"
+    assert hydrated["api_key"] == "cf-token"
+
+
+def test_hydrate_route_from_lease_prefers_runtime_binding_for_gateway_remote_provider(monkeypatch):
+    module = _load_module()
+    monkeypatch.setattr(
+        module,
+        "_resolve_provider_runtime_binding",
+        lambda provider_name: {
+            "provider": provider_name,
+            "base_url": "https://gateway.ai.cloudflare.com/v1/acct/gw/compat",
+            "api_key": "cf-token",
+            "api_mode": "chat_completions",
+        } if provider_name == "anthropic" else None,
+    )
+    settings = types.SimpleNamespace(provider="openrouter", api_key="sk-or-test")
+
+    hydrated = module._hydrate_route_from_lease(
+        settings,
+        {
+            "provider": "anthropic",
+            "model": "claude-3-7-sonnet",
+            "base_url": "https://gateway.ai.cloudflare.com/v1/acct/gw/compat",
+            "lease_expires_at": 9999999999,
+        },
+    )
+
+    assert hydrated["provider"] == "anthropic"
+    assert hydrated["base_url"] == "https://gateway.ai.cloudflare.com/v1/acct/gw/compat"
+    assert hydrated["api_key"] == "cf-token"
+
+
+def test_route_api_key_source_uses_cloudflare_token_for_gateway_routes():
+    module = _load_module()
+
+    assert (
+        module._route_api_key_source(
+            "anthropic",
+            "https://gateway.ai.cloudflare.com/v1/acct/gw/compat",
+        )
+        == "CLOUDFLARE_API_TOKEN"
+    )
+
+
+def test_probe_provider_request_metadata_impl_uses_runtime_binding_and_model_alias(monkeypatch):
+    module = _load_module()
+    monkeypatch.setattr(
+        module,
+        "_resolve_provider_runtime_binding",
+        lambda provider_name: {
+            "provider": provider_name,
+            "base_url": "https://gateway.ai.cloudflare.com/v1/acct/gw/compat",
+            "api_key": "cf-token",
+            "api_mode": "chat_completions",
+        } if provider_name == "openrouter" else None,
+    )
+
+    seen = {}
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            seen.update(kwargs)
+
+        def run_conversation(self, *_args, **_kwargs):
+            return {
+                "final_response": "ok",
+                "completed": True,
+                "provider_usage": {"response_model": "openrouter/free"},
+                "provider_usage_totals": {},
+            }
+
+    monkeypatch.setitem(sys.modules, "run_agent", types.SimpleNamespace(AIAgent=FakeAgent))
+
+    result = module._probe_provider_request_metadata_impl(
+        provider_name="openrouter",
+        model="openrouter/free",
+        prompt="reply with ok",
+        max_tokens=32,
+    )
+
+    assert seen["base_url"] == "https://gateway.ai.cloudflare.com/v1/acct/gw/compat"
+    assert seen["api_key"] == "cf-token"
+    assert seen["provider"] == "openrouter"
+    assert result["cloudflare_ai_gateway"] is True
+
+
 def test_explicit_model_override_updates_route_lease(monkeypatch, tmp_path):
     module = _load_module()
     module.DATA_ROOT = tmp_path / "data"
@@ -1367,11 +2288,21 @@ def test_sync_runtime_config_materializes_dynamic_free_route(monkeypatch, tmp_pa
     module.HERMES_HOME_DIR = tmp_path / "home"
 
     source = tmp_path / "config.modal.yaml"
-    source.write_text("model:\n  default: openrouter/free\n", encoding="utf-8")
+    source.write_text("model:\n  default: free\n", encoding="utf-8")
     monkeypatch.setenv("HERMES_MODAL_CONFIG_SOURCE", str(source))
     monkeypatch.setenv("HERMES_MODAL_SYNC_CONFIG", "true")
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
     monkeypatch.setenv("NVIDIA_API_KEY", "nvapi-test")
+    monkeypatch.setattr(
+        module,
+        "_resolve_provider_runtime_binding",
+        lambda provider_name: {
+            "provider": provider_name,
+            "base_url": "https://gateway.ai.cloudflare.com/v1/acct/gw/compat",
+            "api_key": "cf-token" if provider_name == "openrouter" else "nvapi-test",
+            "api_mode": "chat_completions",
+        } if provider_name in {"openrouter", "nvidia"} else None,
+    )
 
     monkeypatch.setattr(
         module,
@@ -1397,6 +2328,7 @@ def test_sync_runtime_config_materializes_dynamic_free_route(monkeypatch, tmp_pa
     target_text = (module.HERMES_HOME_DIR / "config.yaml").read_text(encoding="utf-8")
     assert "default: moonshotai/kimi-k2:free" in target_text
     assert "provider: openrouter" in target_text
+    assert "base_url: https://gateway.ai.cloudflare.com/v1/acct/gw/compat" in target_text
     assert "fallback_providers:" in target_text
     assert "provider: custom" in target_text
     assert "model: meta/llama-3.1-8b-instruct" in target_text
@@ -1616,6 +2548,11 @@ def test_run_agent_task_includes_provider_usage_metadata(monkeypatch, tmp_path):
                     "cost": 0.0012,
                     "upstream_inference_cost": 0.0009,
                     "cache_discount": 0.0003,
+                    "provider_request_id": "req_456",
+                    "provider_http_status_code": 202,
+                    "provider_async_poll_supported": True,
+                    "provider_async_request_id": "nv_req_789",
+                    "provider_async_poll_url": "https://integrate.api.nvidia.com/v1/status/nv_req_789",
                 },
                 "provider_usage_totals": {
                     "billed_cost_usd": 0.0012,
@@ -1630,6 +2567,8 @@ def test_run_agent_task_includes_provider_usage_metadata(monkeypatch, tmp_path):
 
     assert result["provider_usage"]["generation_id"] == "gen_123"
     assert result["provider_usage_totals"]["billed_cost_usd"] == 0.0012
+    assert result["provider_usage"]["provider_async_request_id"] == "nv_req_789"
+    assert result["provider_usage"]["provider_async_poll_supported"] is True
 
 
 def test_run_agent_task_pins_response_model_into_route_lease(monkeypatch, tmp_path):
@@ -1728,6 +2667,7 @@ def test_maybe_sync_telegram_webhook_skips_redundant_set(monkeypatch, tmp_path):
         base_url="https://openrouter.ai/api/v1",
         api_key="sk-or-test",
         bearer_token=None,
+        feishu_internal_bearer_token=None,
         telegram_bot_token="123456789:ABCdef_ghi-JKLmnopQRSTUvwxYZ",
         telegram_webhook_secret="secret",
         telegram_webhook_url="https://example.com/telegram/webhook",
@@ -1792,6 +2732,7 @@ def test_maybe_sync_telegram_webhook_respects_429_backoff(monkeypatch, tmp_path)
         base_url="https://openrouter.ai/api/v1",
         api_key="sk-or-test",
         bearer_token=None,
+        feishu_internal_bearer_token=None,
         telegram_bot_token="123456789:ABCdef_ghi-JKLmnopQRSTUvwxYZ",
         telegram_webhook_secret="secret",
         telegram_webhook_url="https://example.com/telegram/webhook",
@@ -2007,7 +2948,7 @@ def test_feishu_message_webhook_uses_inline_enqueue_and_direct_worker_spawn(monk
     module.HERMES_HOME_DIR = tmp_path / "home"
     module.CHAT_QUEUE_CLAIMS_PATH = module.DATA_ROOT / "chat_queue_claims.json"
     module._ensure_runtime_dirs()
-    handled = {"enqueued": None, "spawned": None, "ack_reaction_spawned": False}
+    handled = {"enqueued": None, "spawned": None, "ack_reaction_inline": False}
     monkeypatch.setenv("FEISHU_APP_ID", "cli_feishu_app")
     monkeypatch.setenv("FEISHU_APP_SECRET", "feishu-secret-123")
     payload = {
@@ -2036,17 +2977,18 @@ def test_feishu_message_webhook_uses_inline_enqueue_and_direct_worker_spawn(monk
         handled["spawned"] = kwargs
         return {"status": "scheduled", **kwargs}
 
-    async def _fake_spawn_ack_reaction(*, payload, request_started_at=None):
-        handled["ack_reaction_spawned"] = request_started_at is not None
+    async def _fake_inline_ack_reaction(*, payload, request_started_at_ms=None):
+        handled["ack_reaction_inline"] = request_started_at_ms is not None
         return {
-            "status": "scheduled",
-            "reason": "process_feishu_ack_reaction_spawned",
-            "schedule_elapsed_ms": 12,
+            "status": "ok",
+            "reason": "inline",
+            "total_elapsed_ms": 12,
             "message_id": payload["event"]["message"]["message_id"],
         }
 
     monkeypatch.setattr(module, "_parse_feishu_webhook_request", _fake_parse)
     monkeypatch.setattr(module, "_mark_feishu_event_seen", lambda _event_id: True)
+    monkeypatch.setattr(module, "DEFAULT_FEISHU_ACK_REACTION_MODE", "inline")
     monkeypatch.setattr(
         module,
         "process_feishu_event",
@@ -2055,14 +2997,14 @@ def test_feishu_message_webhook_uses_inline_enqueue_and_direct_worker_spawn(monk
     )
     monkeypatch.setattr(module, "_enqueue_chat_event_async", _fake_enqueue_async)
     monkeypatch.setattr(module, "_spawn_chat_queue_worker_optimistic_async", _fake_spawn_async)
-    monkeypatch.setattr(module, "_spawn_feishu_ack_reaction_async", _fake_spawn_ack_reaction)
+    monkeypatch.setattr(module, "_add_feishu_ack_reaction_inline_async", _fake_inline_ack_reaction)
 
     client = TestClient(module.create_web_app())
     response = client.post("/feishu/webhook", json=payload)
 
     assert response.status_code == 200
     assert response.json() == {"code": 0, "msg": "accepted"}
-    assert handled["ack_reaction_spawned"] is True
+    assert handled["ack_reaction_inline"] is True
     assert handled["enqueued"]["partition"] == "feishu:chat_light:unknown"
     assert handled["spawned"]["partition"] == "feishu:chat_light:unknown"
 
@@ -2088,15 +3030,20 @@ def test_add_feishu_ack_reaction_from_payload_records_success(monkeypatch):
     module = _load_module()
     traces = []
     fake_client = types.SimpleNamespace(
-        request_json=lambda method, path, json_body=None: {
+        request_json=lambda method, path, json_body=None, **kwargs: {
             "reaction_id": "reaction-om_ack_bg",
             "method": method,
             "path": path,
             "json_body": json_body,
+            "kwargs": kwargs,
         }
     )
 
-    monkeypatch.setitem(sys.modules, "tools.feishu_api", types.SimpleNamespace(build_feishu_client=lambda: fake_client))
+    monkeypatch.setitem(
+        sys.modules,
+        "tools.feishu_api",
+        types.SimpleNamespace(build_feishu_client=lambda **kwargs: fake_client),
+    )
     monkeypatch.setattr(module, "_append_feishu_trace", lambda stage, payload, **extra: traces.append((stage, extra)))
 
     result = module._add_feishu_ack_reaction_from_payload(
@@ -3145,6 +4092,257 @@ def test_validate_feishu_message_ingress_impl_builds_signed_message_request(monk
     assert "x-lark-signature" in captured["headers"]
 
 
+def test_append_feishu_trace_includes_experiment_metadata(monkeypatch, tmp_path):
+    module = _load_module()
+    module.DATA_ROOT = tmp_path / "data"
+    module.SESSIONS_DIR = module.DATA_ROOT / "sessions"
+    module.UPDATES_PATH = module.DATA_ROOT / "telegram_updates.json"
+    module.FEISHU_TRACE_PATH = module.DATA_ROOT / "feishu_trace.jsonl"
+    module.HERMES_HOME_DIR = tmp_path / "home"
+    module._ensure_runtime_dirs()
+
+    monkeypatch.setattr(module, "APP_NAME", "hermes-agent-ab")
+    monkeypatch.setattr(module, "WEB_APP_MEMORY_SNAPSHOT_ENABLED", True)
+    monkeypatch.setattr(module, "FEISHU_INGRESS_MEMORY_SNAPSHOT_ENABLED", True)
+    monkeypatch.setattr(module, "FEISHU_ACK_REACTION_MEMORY_SNAPSHOT_ENABLED", False)
+    monkeypatch.setattr(module, "CHAT_QUEUE_MEMORY_SNAPSHOT_ENABLED", False)
+    monkeypatch.setenv("HERMES_FEISHU_PERF_EXPERIMENT_LABEL", "current")
+
+    payload = {
+        "header": {"event_type": "im.message.receive_v1", "event_id": "evt_meta_1"},
+        "event": {"message": {"message_id": "om_meta_1", "chat_id": "oc_meta_1", "chat_type": "p2p"}},
+    }
+
+    module._append_feishu_trace("webhook.accepted", payload, ack_elapsed_ms=123)
+    rows = module._read_feishu_trace(limit=10)
+
+    assert rows[-1]["app_name"] == "hermes-agent-ab"
+    assert rows[-1]["experiment_label"] == "current"
+    assert rows[-1]["snapshot_profile"] == "web1_ingress1_ack0_chat0"
+    assert rows[-1]["snapshot_flags"]["web_app_enabled"] is True
+    assert rows[-1]["snapshot_flags"]["chat_queue_enabled"] is False
+
+
+def test_append_feishu_trace_captures_route_observability_fields(monkeypatch, tmp_path):
+    module = _load_module()
+    module.DATA_ROOT = tmp_path / "data"
+    module.SESSIONS_DIR = module.DATA_ROOT / "sessions"
+    module.UPDATES_PATH = module.DATA_ROOT / "telegram_updates.json"
+    module.FEISHU_TRACE_PATH = module.DATA_ROOT / "feishu_trace.jsonl"
+    module.HERMES_HOME_DIR = tmp_path / "home"
+    module._ensure_runtime_dirs()
+
+    monkeypatch.setenv("HERMES_FEISHU_PERF_EXPERIMENT_LABEL", "current")
+
+    payload = {
+        "header": {"event_type": "im.message.message_read_v1", "event_id": "evt_meta_read"},
+        "event": {
+            "reader": {"reader_id": {"open_id": "ou_reader_meta"}, "read_time": "1712971234"},
+            "message_id_list": ["om_read_meta_1", "om_read_meta_2"],
+        },
+        "_hermes_gateway_meta": {
+            "route_version": "cf_route_policy_v1",
+            "provider_alias": "openrouter",
+            "cache_eligible": False,
+            "cache_status": "bypass",
+            "capability_match": True,
+            "preferred_model_selected": True,
+            "model_catalog_version": "catalog-2026-04-19",
+            "feedback_score_before": 82.5,
+            "feedback_score_after": 91.0,
+            "gateway_error_class": "rate_limited",
+            "misroute_detected": False,
+        },
+        "fallback_reason": "rate_exhausted",
+    }
+
+    module._append_feishu_trace("webhook.message_read", payload)
+    rows = module._read_feishu_trace(limit=10)
+    row = rows[-1]
+
+    assert row["message_id"] == "om_read_meta_1"
+    assert row["route_version"] == "cf_route_policy_v1"
+    assert row["provider_alias"] == "openrouter"
+    assert row["cache_eligible"] is False
+    assert row["cache_status"] == "bypass"
+    assert row["capability_match"] is True
+    assert row["preferred_model_selected"] is True
+    assert row["model_catalog_version"] == "catalog-2026-04-19"
+    assert row["feedback_score_before"] == 82.5
+    assert row["feedback_score_after"] == 91.0
+    assert row["gateway_error_class"] == "rate_limited"
+    assert row["fallback_reason"] == "rate_exhausted"
+
+
+def test_internal_agent_exec_normalizes_gateway_error_class():
+    from internal.feishu.executor import _normalize_gateway_error_class
+
+    assert _normalize_gateway_error_class("auth_or_secret_missing") == "provider_permission_denied"
+    assert _normalize_gateway_error_class("provider_model_invalid") == "provider_model_not_found"
+    assert _normalize_gateway_error_class("rate_exhausted") == "rate_limited"
+    assert _normalize_gateway_error_class("provider_timeout") == "timeout"
+    assert _normalize_gateway_error_class("config_hard_fail") == "payload_incompatible"
+    assert _normalize_gateway_error_class("provider_http_error") == "upstream_5xx"
+    assert _normalize_gateway_error_class("misrouted_request_class") == "misrouted_request_class"
+    assert _normalize_gateway_error_class("", error_text="model catalog stale after sync") == "catalog_stale"
+
+
+def test_build_feishu_perf_summary_from_rows_aggregates_window_metrics():
+    module = _load_module()
+    now_ts = int(time.time())
+    rows = [
+        {
+            "ts": now_ts - 10,
+            "stage": "webhook.ack",
+            "event_type": "im.message.receive_v1",
+            "event_id": "evt_1",
+            "app_name": "hermes-agent",
+            "experiment_label": "current",
+            "snapshot_profile": "web1_ingress1_ack1_chat0",
+            "ack_kind": "queued_message",
+            "ingress_strategy": "spawn_process_feishu_message_inline",
+            "route_hint": "cf_browser_first",
+            "route_version": "cf_route_policy_v1",
+            "request_class": "text_plain",
+            "site_category": "site_content",
+            "site_intent": "docs",
+            "target_domain": "developers.cloudflare.com",
+            "site_skill_name": "site.cloudflare-developers-docs",
+            "site_prefetch_mode": "browser_markdown",
+            "site_prefetch_status": "completed",
+            "site_prefetch_direct_navigation": True,
+            "modal_avoided": True,
+            "browser_backend_selected": "local",
+            "provider_alias": "openrouter",
+            "fallback_reason": "plain_text_without_attachments_or_browser",
+            "gateway_error_class": "none",
+            "cache_status": "hit",
+            "cache_eligible": True,
+            "capability_match": True,
+            "preferred_model_selected": True,
+            "model_catalog_version": "catalog-2026-04-19",
+            "feedback_score_before": 82.5,
+            "feedback_score_after": 91.0,
+            "ai_call_count": 1,
+            "ack_elapsed_ms": 300,
+            "phase_timings": {"dedupe_elapsed_ms": 12, "ack_reaction_schedule_elapsed_ms": 40},
+        },
+        {
+            "ts": now_ts - 10,
+            "stage": "feishu.site_prefetch.cache_hit",
+            "event_type": "im.message.receive_v1",
+            "event_id": "evt_1",
+            "app_name": "hermes-agent",
+            "experiment_label": "current",
+            "snapshot_profile": "web1_ingress1_ack1_chat0",
+        },
+        {
+            "ts": now_ts - 10,
+            "stage": "webhook.response_sent",
+            "event_type": "im.message.receive_v1",
+            "event_id": "evt_1",
+            "app_name": "hermes-agent",
+            "experiment_label": "current",
+            "snapshot_profile": "web1_ingress1_ack1_chat0",
+            "ack_kind": "queued_message",
+            "response_elapsed_ms": 320,
+        },
+        {
+            "ts": now_ts - 9,
+            "stage": "dispatch.done",
+            "event_type": "im.message.receive_v1",
+            "event_id": "evt_1",
+            "app_name": "hermes-agent",
+            "experiment_label": "current",
+            "snapshot_profile": "web1_ingress1_ack1_chat0",
+            "phase_timings": {"message_handle_elapsed_ms": 900, "background_tasks_elapsed_ms": 4100},
+        },
+        {
+            "ts": now_ts - 8,
+            "stage": "inline_message.done",
+            "event_type": "im.message.receive_v1",
+            "event_id": "evt_1",
+            "app_name": "hermes-agent",
+            "experiment_label": "current",
+            "snapshot_profile": "web1_ingress1_ack1_chat0",
+            "worker_boot_id": "boot-1",
+            "container_reused": True,
+            "inline_elapsed_ms": 5100,
+            "execution_mode": "inline_to_background",
+            "handoff_reason": "must_ai_default",
+        },
+        {
+            "ts": now_ts - 8,
+            "stage": "background_exec.done",
+            "event_type": "im.message.receive_v1",
+            "event_id": "evt_1",
+            "app_name": "hermes-agent",
+            "experiment_label": "current",
+            "snapshot_profile": "web1_ingress1_ack1_chat0",
+            "worker_boot_id": "boot-bg-1",
+            "container_reused": False,
+            "worker_elapsed_ms": 4900,
+            "background_send_elapsed_ms": 4100,
+            "execution_mode": "inline_to_background",
+            "handoff_reason": "must_ai_default",
+        },
+        {
+            "ts": now_ts - 7,
+            "stage": "webhook.ack",
+            "event_type": "im.message.receive_v1",
+            "event_id": "evt_2",
+            "app_name": "hermes-agent",
+            "experiment_label": "current",
+            "snapshot_profile": "web1_ingress1_ack1_chat0",
+            "ack_kind": "duplicate",
+            "ack_elapsed_ms": 50,
+        },
+    ]
+
+    result = module._build_feishu_perf_summary_from_rows(
+        rows,
+        since_seconds=60,
+        event_type="im.message.receive_v1",
+        experiment_label="current",
+    )
+
+    assert result["event_count"] == 1
+    assert result["duplicate_only_event_count"] == 1
+    assert result["metrics"]["ack_elapsed_ms"]["avg"] == 300.0
+    assert result["metrics"]["response_elapsed_ms"]["avg"] == 320.0
+    assert result["metrics"]["message_handle_elapsed_ms"]["avg"] == 900.0
+    assert result["metrics"]["inline_elapsed_ms"]["avg"] == 5100.0
+    assert result["metrics"]["background_exec_elapsed_ms"]["avg"] == 4900.0
+    assert result["metrics"]["background_send_elapsed_ms"]["avg"] == 4100.0
+    assert result["by_experiment_label"]["current"] == 1
+    assert result["by_execution_mode"]["inline_to_background"] == 1
+    assert result["by_handoff_reason"]["must_ai_default"] == 1
+    assert result["by_snapshot_profile"]["web1_ingress1_ack1_chat0"] == 1
+    assert result["by_route_hint"]["cf_browser_first"] == 1
+    assert result["by_route_version"]["cf_route_policy_v1"] == 1
+    assert result["by_request_class"]["text_plain"] == 1
+    assert result["by_provider_alias"]["openrouter"] == 1
+    assert result["by_fallback_reason"]["plain_text_without_attachments_or_browser"] == 1
+    assert result["by_cache_status"]["hit"] == 1
+    assert result["by_model_catalog_version"]["catalog-2026-04-19"] == 1
+    assert result["by_site_category"]["site_content"] == 1
+    assert result["by_site_intent"]["docs"] == 1
+    assert result["by_target_domain"]["developers.cloudflare.com"] == 1
+    assert result["by_site_skill_name"]["site.cloudflare-developers-docs"] == 1
+    assert result["by_site_prefetch_mode"]["browser_markdown"] == 1
+    assert result["by_site_prefetch_status"]["completed"] == 1
+    assert result["modal_avoided_by_site_prefetch"] == 1
+    assert result["site_prefetch_cache_hit_rate"] == 1.0
+    assert result["site_prefetch_direct_navigation_success_rate"] == 1.0
+    assert result["local_browser_success_rate"] == 1.0
+    assert result["cloud_escalation_rate"] == 0.0
+    assert result["metrics"]["ai_call_count"]["avg"] == 1.0
+    assert result["metrics"]["feedback_score_after"]["avg"] == 91.0
+    assert result["per_domain_success_rate"]["developers.cloudflare.com"]["success_rate"] == 1.0
+    assert result["per_domain_cost"]["developers.cloudflare.com"] == 0.0
+    assert result["events"][0]["site_prefetch_mode"] == "browser_markdown"
+
+
 def test_validate_feishu_native_delivery_impl_generates_and_sends_assets(monkeypatch, tmp_path):
     module = _load_module()
     module.DATA_ROOT = tmp_path / "data"
@@ -3378,7 +4576,8 @@ def test_modal_source_supports_project_plugins_and_api_only_feishu_runtime():
     assert 'scaledown_window=DEFAULT_CHAT_QUEUE_SCALEDOWN_WINDOW_SECONDS' in source
     assert 'enable_memory_snapshot=FEISHU_INGRESS_MEMORY_SNAPSHOT_ENABLED' in source
     assert 'enable_memory_snapshot=CHAT_QUEUE_MEMORY_SNAPSHOT_ENABLED' in source
-    assert '@modal.enter(snap=True)' in source
+    assert '@modal.enter(snap=FEISHU_INGRESS_MEMORY_SNAPSHOT_ENABLED)' in source
+    assert '@modal.enter(snap=CHAT_QUEUE_MEMORY_SNAPSHOT_ENABLED)' in source
     assert 'phase_timings=' in source
     assert 'handoff_wait_elapsed_ms' in source
     assert 'handoff_schedule_wait_elapsed_ms' in source

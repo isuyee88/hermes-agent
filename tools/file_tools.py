@@ -125,7 +125,7 @@ def _is_expected_write_exception(exc: Exception) -> bool:
     return False
 
 
-_file_ops_lock = threading.Lock()
+_file_ops_lock = None
 _file_ops_cache: dict = {}
 
 # Track files read per task to detect re-read loops and deduplicate reads.
@@ -143,8 +143,22 @@ _file_ops_cache: dict = {}
 #                      external changes between the agent's read and write.
 #                      Updated after successful writes so consecutive edits
 #                      by the same task don't trigger false warnings.
-_read_tracker_lock = threading.Lock()
+_read_tracker_lock = None
 _read_tracker: dict = {}
+
+
+def _get_file_ops_lock() -> threading.Lock:
+    global _file_ops_lock
+    if _file_ops_lock is None:
+        _file_ops_lock = threading.Lock()
+    return _file_ops_lock
+
+
+def _get_read_tracker_lock() -> threading.Lock:
+    global _read_tracker_lock
+    if _read_tracker_lock is None:
+        _read_tracker_lock = threading.Lock()
+    return _read_tracker_lock
 
 
 def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
@@ -167,7 +181,7 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
 
     # Fast path: check cache -- but also verify the underlying environment
     # is still alive (it may have been killed by the cleanup thread).
-    with _file_ops_lock:
+    with _get_file_ops_lock():
         cached = _file_ops_cache.get(task_id)
     if cached is not None:
         with _env_lock:
@@ -176,7 +190,7 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
                 return cached
             else:
                 # Environment was cleaned up -- invalidate stale cache entry
-                with _file_ops_lock:
+                with _get_file_ops_lock():
                     _file_ops_cache.pop(task_id, None)
 
     # Need to ensure the environment exists before building file_ops.
@@ -263,14 +277,14 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
 
     # Build file_ops from the (guaranteed live) environment and cache it
     file_ops = ShellFileOperations(terminal_env)
-    with _file_ops_lock:
+    with _get_file_ops_lock():
         _file_ops_cache[task_id] = file_ops
     return file_ops
 
 
 def clear_file_ops_cache(task_id: str = None):
     """Clear the file operations cache."""
-    with _file_ops_lock:
+    with _get_file_ops_lock():
         if task_id:
             _file_ops_cache.pop(task_id, None)
         else:
@@ -331,7 +345,7 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
         # instead of re-sending the same content.  Saves context tokens.
         resolved_str = str(_resolved)
         dedup_key = (resolved_str, offset, limit)
-        with _read_tracker_lock:
+        with _get_read_tracker_lock():
             task_data = _read_tracker.setdefault(task_id, {
                 "last_key": None, "consecutive": 0,
                 "read_history": set(), "dedup": {},
@@ -401,7 +415,7 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
 
         # ── Track for consecutive-loop detection ──────────────────────
         read_key = ("read", path, offset, limit)
-        with _read_tracker_lock:
+        with _get_read_tracker_lock():
             # Ensure "dedup" key exists (backward compat with old tracker state)
             if "dedup" not in task_data:
                 task_data["dedup"] = {}
@@ -453,7 +467,7 @@ def get_read_files_summary(task_id: str = "default") -> list:
     Used by context compression to preserve file-read history across
     compression boundaries.
     """
-    with _read_tracker_lock:
+    with _get_read_tracker_lock():
         task_data = _read_tracker.get(task_id, {})
         read_history = task_data.get("read_history", set())
         seen_paths: dict = {}
@@ -474,7 +488,7 @@ def clear_read_tracker(task_id: str = None):
     Should be called when a session is destroyed to prevent memory leaks
     in long-running gateway processes.
     """
-    with _read_tracker_lock:
+    with _get_read_tracker_lock():
         if task_id:
             _read_tracker.pop(task_id, None)
         else:
@@ -492,7 +506,7 @@ def reset_file_dedup(task_id: str = None):
 
     Call with a task_id to clear just that task, or without to clear all.
     """
-    with _read_tracker_lock:
+    with _get_read_tracker_lock():
         if task_id:
             task_data = _read_tracker.get(task_id)
             if task_data and "dedup" in task_data:
@@ -512,7 +526,7 @@ def notify_other_tool_call(task_id: str = "default"):
     anything else in between (write, patch, terminal, etc.) the counter
     resets and the next read is treated as fresh.
     """
-    with _read_tracker_lock:
+    with _get_read_tracker_lock():
         task_data = _read_tracker.get(task_id)
         if task_data:
             task_data["last_key"] = None
@@ -531,7 +545,7 @@ def _update_read_timestamp(filepath: str, task_id: str) -> None:
         current_mtime = os.path.getmtime(resolved)
     except (OSError, ValueError):
         return
-    with _read_tracker_lock:
+    with _get_read_tracker_lock():
         task_data = _read_tracker.get(task_id)
         if task_data is not None:
             task_data.setdefault("read_timestamps", {})[resolved] = current_mtime
@@ -548,7 +562,7 @@ def _check_file_staleness(filepath: str, task_id: str) -> str | None:
         resolved = str(Path(filepath).expanduser().resolve())
     except (OSError, ValueError):
         return None
-    with _read_tracker_lock:
+    with _get_read_tracker_lock():
         task_data = _read_tracker.get(task_id)
         if not task_data:
             return None
@@ -667,7 +681,7 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
             limit,
             offset,
         )
-        with _read_tracker_lock:
+        with _get_read_tracker_lock():
             task_data = _read_tracker.setdefault(task_id, {
                 "last_key": None, "consecutive": 0, "read_history": set(),
             })

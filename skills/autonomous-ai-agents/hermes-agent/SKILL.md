@@ -318,6 +318,27 @@ Edit with `hermes config edit` or `hermes config set section.key value`.
 | `security` | `tirith_enabled`, `website_blocklist` |
 | `delegation` | `model`, `provider`, `max_iterations` (50) |
 | `smart_model_routing` | `enabled`, `cheap_model` |
+
+### Organization personalities
+
+Hermes also supports named operating modes through `agent.personalities` and `/personality`.
+
+- `board` — 董事长 / 投委会视角，做方向、投入、停损判断
+- `ceo` — 默认操盘视角，管目标、优先级、推进与结果
+- `grow` — 增长视角，管分发、转化、留存与包装
+- `cto` — 技术交付视角，管实现、性能、稳定性、成本
+- `staff` — 参谋长视角，管对齐、整理、同步、闭环
+- `sev` — 事故指挥视角，管止血、分诊、恢复与复盘
+
+For organization-heavy workflows, pair them with the matching skills under `skills/organization/`:
+
+- `board-review`
+- `ceo-os`
+- `growth-os`
+- `ship`
+- `gov`
+- `tacit`
+- `retro`
 | `checkpoints` | `enabled`, `max_snapshots` (50) |
 
 Full config reference: https://hermes-agent.nousresearch.com/docs/user-guide/configuration

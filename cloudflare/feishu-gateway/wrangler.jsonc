@@ -1,0 +1,120 @@
+{
+  "$schema": "https://developers.cloudflare.com/workers/wrangler/config-schema.json",
+  "name": "hermes-feishu-gateway",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-04-14",
+  "compatibility_flags": [
+    "nodejs_compat"
+  ],
+  "browser": {
+    "binding": "BROWSER"
+  },
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1,
+    "logs": {
+      "enabled": true,
+      "head_sampling_rate": 1,
+      "invocation_logs": true,
+      "persist": true
+    },
+    "traces": {
+      "enabled": true,
+      "head_sampling_rate": 1,
+      "persist": true
+    }
+  },
+  "logpush": true,
+  "vars": {
+    "HONEYCOMB_DATASET": "hermes-feishu-gateway",
+    "FEISHU_API_BASE": "https://open.feishu.cn",
+    "FEISHU_ACK_REACTION_EMOJI": "OK",
+    "MODAL_INTERNAL_BASE_URL": "https://isuyee88--hermes-agent-web-handler.modal.run",
+    "HERMES_MODEL_CATALOG_SYNC_ENABLED": "true",
+    "HERMES_MODEL_CATALOG_SYNC_PROVIDERS": "openrouter,nvidia",
+    "HERMES_MODEL_CATALOG_ROUTE_PUBLISH_ENABLED": "true",
+    "HERMES_MODEL_CATALOG_ROUTE_MAX_MODELS": "4",
+    "HERMES_MODEL_CATALOG_MIN_HEALTH_SCORE": "45",
+    "HERMES_MODEL_CATALOG_MAX_NEGATIVE_FEEDBACK_COUNT": "3",
+    "HERMES_MODEL_CATALOG_MAX_AUTH_ERROR_COUNT": "1",
+    "HERMES_MODEL_CATALOG_MAX_MODEL_NOT_FOUND_COUNT": "1",
+    "HERMES_MODEL_CATALOG_MAX_RATE_LIMIT_COUNT": "3",
+    "HERMES_MODEL_CATALOG_RATE_LIMIT_COOLDOWN_SECONDS": "900",
+    "HERMES_CF_DYNAMIC_ROUTE_EXECUTION_ENABLED": "true",
+    "HERMES_CF_PROVIDER_ROUTE_LIMITS_JSON": "{\"openrouter\":{\"limit\":45,\"interval\":60,\"technique\":\"sliding\",\"key\":\"metadata.gateway_route_name\"},\"nvidia\":{\"limit\":20,\"interval\":60,\"technique\":\"sliding\",\"key\":\"metadata.gateway_route_name\"}}",
+    "HERMES_CF_GATEWAY_PROVIDER_SLUGS_JSON": "{\"nvidia\":\"nvidia\"}",
+    "HERMES_MODEL_CATALOG_QUEUE_ENABLED": "true",
+    "HERMES_MODEL_CATALOG_QUEUE_DELAY_SECONDS": "3600",
+    "HERMES_MODEL_CATALOG_QUEUE_RETRY_DELAY_SECONDS": "300",
+    "HERMES_MODEL_CATALOG_QUEUE_HARD_RETRY_DELAY_SECONDS": "21600",
+    "HERMES_MODEL_CATALOG_QUEUE_LEASE_SECONDS": "900",
+    "FEISHU_MODEL_REGISTRY_MIRROR_ENABLED": "true",
+    "FEISHU_MODEL_REGISTRY_MAX_MUTATIONS_PER_RUN": "25",
+    "FEISHU_MODEL_REGISTRY_STALE_DELETE_AFTER_SECONDS": "86400",
+    "FEISHU_MODEL_REGISTRY_CONTINUE_DELAY_SECONDS": "15",
+    "FEISHU_BITABLE_TABLE_NAME": "Hermes Model Registry Mirror",
+    "HERMES_CF_TEXT_PLAIN_ROUTE_NAME": "affiliate-general",
+    "HERMES_CF_TEXT_CODING_ROUTE_NAME": "affiliate-coding"
+  },
+  "d1_databases": [
+    {
+      "binding": "MODEL_CATALOG_DB",
+      "database_name": "hermes-model-catalog",
+      "database_id": "783a29b3-47e5-41f7-aadd-3f284765ac79"
+    }
+  ],
+  "analytics_engine_datasets": [
+    {
+      "binding": "FEISHU_GATEWAY_ANALYTICS",
+      "dataset": "hermes_feishu_gateway_events"
+    }
+  ],
+  "queues": {
+    "producers": [
+      {
+        "binding": "MODEL_CATALOG_QUEUE",
+        "queue": "hermes-model-catalog-heartbeat"
+      }
+    ],
+    "consumers": [
+      {
+        "queue": "hermes-model-catalog-heartbeat",
+        "max_batch_size": 1,
+        "max_batch_timeout": 5
+      }
+    ]
+  },
+  "workflows": [
+    {
+      "binding": "FEISHU_AGENT_WORKFLOW",
+      "name": "hermes-feishu-agent-workflow",
+      "class_name": "FeishuAgentWorkflow"
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "FEISHU_RECONCILE_QUEUE",
+        "class_name": "FeishuReconcileQueue"
+      },
+      {
+        "name": "SITE_PREFETCH_CACHE",
+        "class_name": "SitePrefetchCache"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": [
+        "FeishuReconcileQueue"
+      ]
+    },
+    {
+      "tag": "v2",
+      "new_sqlite_classes": [
+        "SitePrefetchCache"
+      ]
+    }
+  ]
+}

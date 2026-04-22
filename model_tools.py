@@ -36,8 +36,24 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 
 _tool_loop = None          # persistent loop for the main (CLI) thread
-_tool_loop_lock = threading.Lock()
-_worker_thread_local = threading.local()  # per-worker-thread persistent loops
+_tool_loop_lock = None     # lazy-initialized lock
+_worker_thread_local = None  # lazy-initialized thread-local storage
+
+
+def _get_tool_loop_lock():
+    """Lazy-initialized lock to avoid Modal serialization issues."""
+    global _tool_loop_lock
+    if _tool_loop_lock is None:
+        _tool_loop_lock = threading.Lock()
+    return _tool_loop_lock
+
+
+def _get_worker_thread_local():
+    """Lazy-initialized thread-local storage to avoid Modal serialization issues."""
+    global _worker_thread_local
+    if _worker_thread_local is None:
+        _worker_thread_local = threading.local()
+    return _worker_thread_local
 
 
 def _get_tool_loop():
@@ -49,7 +65,7 @@ def _get_tool_loop():
     close their transport on a dead loop during garbage collection.
     """
     global _tool_loop
-    with _tool_loop_lock:
+    with _get_tool_loop_lock():
         if _tool_loop is None or _tool_loop.is_closed():
             _tool_loop = asyncio.new_event_loop()
         return _tool_loop
@@ -69,11 +85,12 @@ def _get_worker_loop():
     By keeping the loop alive for the thread's lifetime, cached clients
     stay valid and their cleanup runs on a live loop.
     """
-    loop = getattr(_worker_thread_local, 'loop', None)
+    worker_local = _get_worker_thread_local()
+    loop = getattr(worker_local, 'loop', None)
     if loop is None or loop.is_closed():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        _worker_thread_local.loop = loop
+        worker_local.loop = loop
     return loop
 
 
@@ -156,6 +173,7 @@ def _discover_tools():
         "tools.process_registry",
         "tools.send_message_tool",
         "tools.feishu_tools",
+        "tools.feishu_kpi_tools",
         # "tools.honcho_tools",  # Removed — Honcho is now a memory provider plugin
         "tools.homeassistant_tool",
     ]

@@ -22,6 +22,15 @@ def test_get_platform_tools_uses_default_when_platform_not_configured():
     assert enabled
 
 
+def test_get_platform_tools_includes_native_feishu_toolset_for_default_platform():
+    config = {}
+
+    enabled = _get_platform_tools(config, "feishu")
+
+    assert "feishu" in enabled
+    assert "skills" in enabled
+
+
 def test_get_platform_tools_preserves_explicit_empty_selection():
     config = {"platform_toolsets": {"cli": []}}
 

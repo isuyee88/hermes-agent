@@ -748,3 +748,22 @@ class TestAdversarialEdgeCases:
         )
         result = classify_api_error(e, provider="openrouter")
         assert result.reason == FailoverReason.model_not_found
+
+    def test_cloudflare_gateway_provider_failure_is_retryable(self):
+        e = MockAPIError(
+            "HTTP 400: Error code: 400",
+            status_code=400,
+            body={
+                "success": False,
+                "result": [],
+                "messages": [],
+                "error": {
+                    "code": 2005,
+                    "message": "Failed to get response from provider",
+                },
+            },
+        )
+        result = classify_api_error(e, provider="openrouter")
+        assert result.reason == FailoverReason.server_error
+        assert result.retryable is True
+        assert result.should_fallback is True

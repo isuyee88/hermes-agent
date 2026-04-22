@@ -615,13 +615,21 @@ def transcribe_recording(wav_path: str, model: Optional[str] = None) -> Dict[str
 
 # Global reference to the active playback process so it can be interrupted.
 _active_playback: Optional[subprocess.Popen] = None
-_playback_lock = threading.Lock()
+_playback_lock = None
+
+
+def _get_playback_lock_lock() -> threading.Lock:
+    """Lazy-initialized lock to avoid Modal serialization issues."""
+    global _playback_lock
+    if _playback_lock is None:
+        _playback_lock = threading.Lock()
+    return _playback_lock
 
 
 def stop_playback() -> None:
     """Interrupt the currently playing audio (if any)."""
     global _active_playback
-    with _playback_lock:
+    with _get_playback_lock_lock():
         proc = _active_playback
         _active_playback = None
     if proc and proc.poll() is None:
@@ -695,21 +703,21 @@ def play_audio_file(file_path: str) -> bool:
         if exe:
             try:
                 proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                with _playback_lock:
+                with _get_playback_lock_lock():
                     _active_playback = proc
                 proc.wait(timeout=300)
-                with _playback_lock:
+                with _get_playback_lock_lock():
                     _active_playback = None
                 return True
             except subprocess.TimeoutExpired:
                 logger.warning("System player %s timed out, killing process", cmd[0])
                 proc.kill()
                 proc.wait()
-                with _playback_lock:
+                with _get_playback_lock_lock():
                     _active_playback = None
             except Exception as e:
                 logger.debug("System player %s failed: %s", cmd[0], e)
-                with _playback_lock:
+                with _get_playback_lock_lock():
                     _active_playback = None
 
     logger.warning("No audio player available for %s", file_path)

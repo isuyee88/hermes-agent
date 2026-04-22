@@ -46,6 +46,18 @@ def _make_event(text: str) -> MessageEvent:
     )
 
 
+def _make_telegram_event(text: str) -> MessageEvent:
+    return MessageEvent(
+        text=text,
+        source=SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="123",
+            chat_type="dm",
+            user_id="user-1",
+        ),
+    )
+
+
 @pytest.mark.asyncio
 async def test_provider_command_filters_to_openrouter_and_nvidia(monkeypatch):
     import hermes_cli.models as cli_models
@@ -458,4 +470,42 @@ def test_switch_model_with_runtime_fallback_recovers_known_provider(monkeypatch)
     assert result.success is True
     assert result.target_provider == "nvidia"
     assert result.new_model == "qwen/qwq-32b"
-    assert result.base_url == "https://integrate.api.nvidia.com/v1"
+    assert result.base_url == "https://gateway.ai.cloudflare.com/v1/d1215a30b84b673ef0367010b0e78c10/affiliate-manager/compat"
+
+
+@pytest.mark.asyncio
+async def test_non_feishu_model_switch_command_keeps_dynamic_routing(monkeypatch):
+    import hermes_cli.model_switch as model_switch
+
+    runner = _make_runner()
+    event = _make_telegram_event("/model qwen/qwq-32b --provider nvidia")
+
+    monkeypatch.setattr(
+        model_switch,
+        "switch_model",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("switch_model should not run")),
+    )
+
+    text = await runner._handle_model_command(event)
+
+    assert "Manual model lock is only supported in Feishu." in text
+    assert runner._session_model_overrides == {}
+
+
+@pytest.mark.asyncio
+async def test_feishu_model_switch_command_rejects_global_persist(monkeypatch):
+    import hermes_cli.model_switch as model_switch
+
+    runner = _make_runner()
+    event = _make_event("/model qwen/qwq-32b --provider nvidia --global")
+
+    monkeypatch.setattr(
+        model_switch,
+        "switch_model",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("switch_model should not run")),
+    )
+
+    text = await runner._handle_model_command(event)
+
+    assert "`/model --global` is disabled in chat." in text
+    assert runner._session_model_overrides == {}

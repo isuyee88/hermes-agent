@@ -101,7 +101,15 @@ def _get_apptainer_cache_dir() -> Path:
     return cache_path
 
 
-_sif_build_lock = threading.Lock()
+_sif_build_lock = None
+
+
+def _get_sif_build_lock_lock() -> threading.Lock:
+    """Lazy-initialized lock to avoid Modal serialization issues."""
+    global _sif_build_lock
+    if _sif_build_lock is None:
+        _sif_build_lock = threading.Lock()
+    return _sif_build_lock
 
 
 def _get_or_build_sif(image: str, executable: str = "apptainer") -> str:
@@ -117,7 +125,7 @@ def _get_or_build_sif(image: str, executable: str = "apptainer") -> str:
     if sif_path.exists():
         return str(sif_path)
 
-    with _sif_build_lock:
+    with _get_sif_build_lock_lock():
         if sif_path.exists():
             return str(sif_path)
 

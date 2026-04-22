@@ -102,6 +102,7 @@ from gateway.platforms.base import (
 )
 from gateway.status import acquire_scoped_lock, release_scoped_lock
 from hermes_constants import get_hermes_home
+from internal.feishu.trace import build_message_read_correlation_trace_extras, correlate_message_read_event
 
 logger = logging.getLogger(__name__)
 
@@ -3314,11 +3315,69 @@ class FeishuAdapter(BasePlatformAdapter):
             self._mark_message_processed(message_id)
 
     def _on_message_read_event(self, data: P2ImMessageMessageReadV1) -> None:
-        """Ignore read-receipt events that Hermes does not act on."""
+        """Correlate read receipts back to inbound sessions and reply deliveries."""
         event = getattr(data, "event", None)
-        message = getattr(event, "message", None)
-        message_id = getattr(message, "message_id", None) or ""
-        logger.debug("[Feishu] Ignoring message_read event: %s", message_id)
+        reader = getattr(event, "reader", None)
+        reader_id = getattr(reader, "reader_id", None)
+        raw_message_ids = getattr(event, "message_id_list", None)
+        if isinstance(raw_message_ids, list):
+            message_id_list = [str(item or "").strip() for item in raw_message_ids if str(item or "").strip()]
+        else:
+            message_id_list = []
+
+        def _first_non_empty(*values: Any) -> str:
+            for value in values:
+                text = str(value or "").strip()
+                if text:
+                    return text
+            return ""
+
+        read_event = {
+            "event_type": str(getattr(getattr(data, "header", None), "event_type", None) or "").strip(),
+            "event_id": str(getattr(getattr(data, "header", None), "event_id", None) or "").strip(),
+            "reader_open_id": _first_non_empty(
+                getattr(reader_id, "open_id", None),
+                getattr(reader, "open_id", None),
+                getattr(event, "open_id", None),
+            ),
+            "reader_user_id": _first_non_empty(
+                getattr(reader_id, "user_id", None),
+                getattr(reader, "user_id", None),
+                getattr(event, "user_id", None),
+            ),
+            "reader_union_id": _first_non_empty(
+                getattr(reader_id, "union_id", None),
+                getattr(reader, "union_id", None),
+            ),
+            "tenant_key": _first_non_empty(
+                getattr(reader, "tenant_key", None),
+                getattr(event, "tenant_key", None),
+            ),
+            "read_time": int(getattr(reader, "read_time", None) or getattr(event, "read_time", None) or 0),
+            "message_id_list": message_id_list,
+            "message_count": len(message_id_list),
+        }
+        correlation = correlate_message_read_event(read_event)
+        if correlation.get("matches"):
+            for match in correlation.get("matches") or []:
+                extras = build_message_read_correlation_trace_extras(read_event, match)
+                logger.warning(
+                    "[Feishu] message_read correlated event_id=%s read_message_id=%s matched_kind=%s session=%s inbound_message_id=%s reply_send_message_id=%s reader_open_id=%s",
+                    read_event["event_id"] or "none",
+                    extras.get("read_message_id") or "none",
+                    extras.get("matched_kind") or "unknown",
+                    extras.get("session_key") or "none",
+                    extras.get("inbound_message_id") or "none",
+                    extras.get("reply_send_message_id") or "none",
+                    extras.get("reader_open_id") or "none",
+                )
+            return
+        logger.warning(
+            "[Feishu] message_read unmatched event_id=%s reader_open_id=%s message_ids=%s",
+            read_event["event_id"] or "none",
+            read_event["reader_open_id"] or "none",
+            ",".join(message_id_list) or "none",
+        )
 
     def _on_bot_added_to_chat(self, data: Any) -> None:
         """Handle bot being added to a group chat."""
@@ -3477,6 +3536,7 @@ class FeishuAdapter(BasePlatformAdapter):
         chat_id = str(getattr(context, "open_chat_id", "") or "")
         operator = getattr(event, "operator", None)
         open_id = str(getattr(operator, "open_id", "") or "")
+        event_chat_type = self._extract_card_action_event_chat_type(event)
         if not chat_id or not open_id:
             logger.debug("[Feishu] Card action missing chat_id or operator open_id, dropping")
             return
@@ -3507,8 +3567,40 @@ class FeishuAdapter(BasePlatformAdapter):
                         open_id=open_id,
                         model_id=model_id,
                         provider_slug=provider_slug,
+                        event_chat_type=event_chat_type,
                     )
                     return
+            if str(hermes_action) == "personality_set":
+                personality_name = str(action_value.get("personality") or "").strip().lower() or "none"
+                await self._dispatch_synthetic_command(
+                    chat_id=chat_id,
+                    open_id=open_id,
+                    command_text=f"/personality {personality_name}",
+                    event_chat_type=event_chat_type,
+                )
+                return
+            if str(hermes_action) == "command_run":
+                command_text = str(action_value.get("command_text") or "").strip()
+                if command_text:
+                    await self._dispatch_synthetic_command(
+                        chat_id=chat_id,
+                        open_id=open_id,
+                        command_text=command_text,
+                        event_chat_type=event_chat_type,
+                    )
+                return
+            if str(hermes_action) == "skill_combo_apply":
+                combo_label = str(action_value.get("combo_label") or action_value.get("combo_id") or "技能组合").strip()
+                skills = action_value.get("skills") if isinstance(action_value.get("skills"), list) else []
+                suggested_personality = str(action_value.get("suggested_personality") or "").strip().lower()
+                await self._dispatch_skill_combo_activation(
+                    chat_id=chat_id,
+                    open_id=open_id,
+                    combo_label=combo_label,
+                    skills=[str(skill) for skill in skills],
+                    suggested_personality=suggested_personality,
+                )
+                return
 
             approval_id = action_value.get("approval_id")
             state = self._approval_state.pop(approval_id, None)
@@ -3565,7 +3657,7 @@ class FeishuAdapter(BasePlatformAdapter):
         source = self.build_source(
             chat_id=chat_id,
             chat_name=chat_info.get("name") or chat_id or "Feishu Chat",
-            chat_type=self._resolve_source_chat_type(chat_info=chat_info, event_chat_type="group"),
+            chat_type=self._resolve_source_chat_type(chat_info=chat_info, event_chat_type=event_chat_type),
             user_id=sender_profile["user_id"],
             user_name=sender_profile["user_name"],
             thread_id=None,
@@ -3605,6 +3697,7 @@ class FeishuAdapter(BasePlatformAdapter):
         open_id: str,
         model_id: str,
         provider_slug: str,
+        event_chat_type: str = "group",
     ) -> None:
         sender_id = SimpleNamespace(open_id=open_id, user_id=None, union_id=None)
         sender_profile = await self._resolve_sender_profile(sender_id)
@@ -3612,7 +3705,7 @@ class FeishuAdapter(BasePlatformAdapter):
         source = self.build_source(
             chat_id=chat_id,
             chat_name=chat_info.get("name") or chat_id or "Feishu Chat",
-            chat_type=self._resolve_source_chat_type(chat_info=chat_info, event_chat_type="p2p"),
+            chat_type=self._resolve_source_chat_type(chat_info=chat_info, event_chat_type=event_chat_type),
             user_id=sender_profile["user_id"],
             user_name=sender_profile["user_name"],
             thread_id=None,
@@ -3634,6 +3727,130 @@ class FeishuAdapter(BasePlatformAdapter):
         )
         await self._handle_message_with_guards(synthetic_event)
 
+    @staticmethod
+    def _extract_card_action_event_chat_type(event: Any) -> str:
+        chat = getattr(event, "chat", None)
+        for candidate in (
+            getattr(chat, "chat_type", None),
+            getattr(getattr(event, "context", None), "chat_type", None),
+            getattr(getattr(event, "context", None), "open_chat_type", None),
+        ):
+            normalized = str(candidate or "").strip().lower()
+            if normalized:
+                return normalized
+        return "group"
+
+    async def _build_synthetic_source(
+        self,
+        *,
+        chat_id: str,
+        open_id: str,
+        event_chat_type: str = "group",
+    ) -> Any:
+        sender_id = SimpleNamespace(open_id=open_id, user_id=None, union_id=None)
+        sender_profile = await self._resolve_sender_profile(sender_id)
+        chat_info = await self.get_chat_info(chat_id)
+        return self.build_source(
+            chat_id=chat_id,
+            chat_name=chat_info.get("name") or chat_id or "Feishu Chat",
+            chat_type=self._resolve_source_chat_type(chat_info=chat_info, event_chat_type=event_chat_type),
+            user_id=sender_profile["user_id"],
+            user_name=sender_profile["user_name"],
+            thread_id=None,
+            user_id_alt=sender_profile["user_id_alt"],
+        )
+
+    async def _dispatch_synthetic_command(
+        self,
+        *,
+        chat_id: str,
+        open_id: str,
+        command_text: str,
+        event_chat_type: str = "group",
+    ) -> None:
+        source = await self._build_synthetic_source(
+            chat_id=chat_id,
+            open_id=open_id,
+            event_chat_type=event_chat_type,
+        )
+        synthetic_event = MessageEvent(
+            text=str(command_text or "").strip(),
+            message_type=MessageType.COMMAND,
+            source=source,
+            raw_message=None,
+            message_id=None,
+            timestamp=datetime.now(),
+        )
+        logger.info(
+            "[Feishu] Dispatching synthetic command %s chat=%s",
+            _trim_log_field(command_text, limit=96),
+            chat_id,
+        )
+        await self._handle_message_with_guards(synthetic_event)
+
+    async def _dispatch_skill_combo_activation(
+        self,
+        *,
+        chat_id: str,
+        open_id: str,
+        combo_label: str,
+        skills: List[str],
+        suggested_personality: str = "",
+    ) -> None:
+        normalized_skills = []
+        seen: set[str] = set()
+        for item in skills or []:
+            skill_name = str(item or "").strip()
+            if not skill_name or skill_name in seen:
+                continue
+            seen.add(skill_name)
+            normalized_skills.append(skill_name)
+
+        user_instruction = (
+            f"请切换到「{combo_label or '技能组合'}」工作模式。"
+            "先用中文 3 行内确认已加载的技能、适用场景和下一步协作方式。"
+        )
+        if suggested_personality:
+            user_instruction += f" 如需更匹配的风格，建议配合 `/personality {suggested_personality}`。"
+
+        try:
+            from agent.skill_commands import build_session_start_skills_message
+
+            skill_message, loaded_skills, missing_skills = build_session_start_skills_message(
+                normalized_skills,
+                user_instruction=user_instruction,
+            )
+        except Exception:
+            skill_message = ""
+            loaded_skills = []
+            missing_skills = normalized_skills
+
+        text = skill_message.strip() if skill_message else user_instruction
+        if missing_skills:
+            text += f"\n\n[Missing skills: {', '.join(missing_skills)}]"
+        if loaded_skills:
+            logger.info(
+                "[Feishu] Dispatching skill combo %s skills=%s chat=%s",
+                combo_label or "combo",
+                ",".join(loaded_skills),
+                chat_id,
+            )
+
+        source = await self._build_synthetic_source(
+            chat_id=chat_id,
+            open_id=open_id,
+            event_chat_type="group",
+        )
+        synthetic_event = MessageEvent(
+            text=text,
+            message_type=MessageType.TEXT,
+            source=source,
+            raw_message=None,
+            message_id=None,
+            timestamp=datetime.now(),
+        )
+        await self._handle_message_with_guards(synthetic_event)
+
     # =========================================================================
     # Per-chat serialization and typing indicator
     # =========================================================================
@@ -3645,6 +3862,26 @@ class FeishuAdapter(BasePlatformAdapter):
             lock = asyncio.Lock()
             self._chat_locks[chat_id] = lock
         return lock
+
+    @staticmethod
+    def _extract_ingress_meta(raw_message: Any) -> Dict[str, Any]:
+        if raw_message is None:
+            return {}
+        if isinstance(raw_message, dict):
+            value = raw_message.get("_hermes_ingress")
+            return dict(value) if isinstance(value, dict) else {}
+        value = getattr(raw_message, "_hermes_ingress", None)
+        if isinstance(value, SimpleNamespace):
+            return dict(vars(value))
+        if isinstance(value, dict):
+            return dict(value)
+        return {}
+
+    def _should_skip_local_ack_reaction(self, event: MessageEvent) -> bool:
+        if bool(getattr(event, "ack_reaction_already_requested", False)):
+            return True
+        ingress_meta = self._extract_ingress_meta(getattr(event, "raw_message", None))
+        return bool(ingress_meta.get("ack_reaction_requested_at_ms"))
 
     async def _handle_message_with_guards(self, event: MessageEvent) -> None:
         """Dispatch a single event through the agent pipeline with per-chat serialization
@@ -3664,7 +3901,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 getattr(event, "message_id", "") or "",
             )
             message_id = event.message_id
-            if message_id:
+            if message_id and not self._should_skip_local_ack_reaction(event):
                 await self._add_ack_reaction(message_id)
             await self.handle_message(event)
 
@@ -3691,7 +3928,13 @@ class FeishuAdapter(BasePlatformAdapter):
             response = await asyncio.to_thread(self._client.im.v1.message_reaction.create, request)
             if response and getattr(response, "success", lambda: False)():
                 data = getattr(response, "data", None)
-                return getattr(data, "reaction_id", None)
+                reaction_id = getattr(data, "reaction_id", None)
+                logger.warning(
+                    "[Feishu] ack reaction added message_id=%s reaction_id=%s",
+                    message_id,
+                    reaction_id or "",
+                )
+                return reaction_id
             logger.warning(
                 "[Feishu] Failed to add ack reaction to %s: code=%s msg=%s",
                 message_id,
@@ -3796,6 +4039,9 @@ class FeishuAdapter(BasePlatformAdapter):
             media_types=media_types,
             reply_to_message_id=reply_to_message_id,
             reply_to_text=reply_to_text,
+            ack_reaction_already_requested=bool(
+                self._extract_ingress_meta(data).get("ack_reaction_requested_at_ms")
+            ),
             timestamp=datetime.now(),
         )
         await self._dispatch_inbound_event(normalized)
@@ -3803,6 +4049,11 @@ class FeishuAdapter(BasePlatformAdapter):
     async def _dispatch_inbound_event(self, event: MessageEvent) -> None:
         """Apply Feishu-specific burst protection before entering the base adapter."""
         if event.message_type == MessageType.TEXT and not event.is_command():
+            if bool(getattr(event, "ack_reaction_already_requested", False)) and (
+                str(getattr(event.source, "chat_type", "") or "").strip().lower() in {"dm", "p2p", "private"}
+            ):
+                await self._handle_message_with_guards(event)
+                return
             await self._enqueue_text_event(event)
             return
         if self._should_batch_media_event(event):

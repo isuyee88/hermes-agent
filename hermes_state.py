@@ -31,7 +31,7 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -64,6 +64,14 @@ CREATE TABLE IF NOT EXISTS sessions (
     cost_status TEXT,
     cost_source TEXT,
     pricing_version TEXT,
+    provider_generation_id TEXT,
+    provider_request_id TEXT,
+    provider_async_request_id TEXT,
+    provider_http_status_code INTEGER,
+    provider_response_model TEXT,
+    provider_cache_discount_usd REAL DEFAULT 0,
+    provider_billed_cost_usd REAL DEFAULT 0,
+    provider_upstream_inference_cost_usd REAL DEFAULT 0,
     title TEXT,
     FOREIGN KEY (parent_session_id) REFERENCES sessions(id)
 );
@@ -329,6 +337,24 @@ class SessionDB:
                     except sqlite3.OperationalError:
                         pass  # Column already exists
                 cursor.execute("UPDATE schema_version SET version = 6")
+            if current_version < 7:
+                new_columns = [
+                    ("provider_generation_id", "TEXT"),
+                    ("provider_request_id", "TEXT"),
+                    ("provider_async_request_id", "TEXT"),
+                    ("provider_http_status_code", "INTEGER"),
+                    ("provider_response_model", "TEXT"),
+                    ("provider_cache_discount_usd", "REAL DEFAULT 0"),
+                    ("provider_billed_cost_usd", "REAL DEFAULT 0"),
+                    ("provider_upstream_inference_cost_usd", "REAL DEFAULT 0"),
+                ]
+                for name, column_type in new_columns:
+                    try:
+                        safe_name = name.replace('"', '""')
+                        cursor.execute(f'ALTER TABLE sessions ADD COLUMN "{safe_name}" {column_type}')
+                    except sqlite3.OperationalError:
+                        pass
+                cursor.execute("UPDATE schema_version SET version = 7")
 
         # Unique title index — always ensure it exists (safe to run after migrations
         # since the title column is guaranteed to exist at this point)
@@ -426,6 +452,14 @@ class SessionDB:
         billing_provider: Optional[str] = None,
         billing_base_url: Optional[str] = None,
         billing_mode: Optional[str] = None,
+        provider_generation_id: Optional[str] = None,
+        provider_request_id: Optional[str] = None,
+        provider_async_request_id: Optional[str] = None,
+        provider_http_status_code: Optional[int] = None,
+        provider_response_model: Optional[str] = None,
+        provider_cache_discount_usd: Optional[float] = None,
+        provider_billed_cost_usd: Optional[float] = None,
+        provider_upstream_inference_cost_usd: Optional[float] = None,
         absolute: bool = False,
     ) -> None:
         """Update token counters and backfill model if not already set.
@@ -455,6 +489,23 @@ class SessionDB:
                    billing_provider = COALESCE(billing_provider, ?),
                    billing_base_url = COALESCE(billing_base_url, ?),
                    billing_mode = COALESCE(billing_mode, ?),
+                   provider_generation_id = COALESCE(?, provider_generation_id),
+                   provider_request_id = COALESCE(?, provider_request_id),
+                   provider_async_request_id = COALESCE(?, provider_async_request_id),
+                   provider_http_status_code = COALESCE(?, provider_http_status_code),
+                   provider_response_model = COALESCE(?, provider_response_model),
+                   provider_cache_discount_usd = CASE
+                       WHEN ? IS NULL THEN provider_cache_discount_usd
+                       ELSE ?
+                   END,
+                   provider_billed_cost_usd = CASE
+                       WHEN ? IS NULL THEN provider_billed_cost_usd
+                       ELSE ?
+                   END,
+                   provider_upstream_inference_cost_usd = CASE
+                       WHEN ? IS NULL THEN provider_upstream_inference_cost_usd
+                       ELSE ?
+                   END,
                    model = COALESCE(model, ?)
                    WHERE id = ?"""
         else:
@@ -475,6 +526,23 @@ class SessionDB:
                    billing_provider = COALESCE(billing_provider, ?),
                    billing_base_url = COALESCE(billing_base_url, ?),
                    billing_mode = COALESCE(billing_mode, ?),
+                   provider_generation_id = COALESCE(?, provider_generation_id),
+                   provider_request_id = COALESCE(?, provider_request_id),
+                   provider_async_request_id = COALESCE(?, provider_async_request_id),
+                   provider_http_status_code = COALESCE(?, provider_http_status_code),
+                   provider_response_model = COALESCE(?, provider_response_model),
+                   provider_cache_discount_usd = CASE
+                       WHEN ? IS NULL THEN provider_cache_discount_usd
+                       ELSE COALESCE(provider_cache_discount_usd, 0) + ?
+                   END,
+                   provider_billed_cost_usd = CASE
+                       WHEN ? IS NULL THEN provider_billed_cost_usd
+                       ELSE COALESCE(provider_billed_cost_usd, 0) + ?
+                   END,
+                   provider_upstream_inference_cost_usd = CASE
+                       WHEN ? IS NULL THEN provider_upstream_inference_cost_usd
+                       ELSE COALESCE(provider_upstream_inference_cost_usd, 0) + ?
+                   END,
                    model = COALESCE(model, ?)
                    WHERE id = ?"""
         params = (
@@ -492,6 +560,17 @@ class SessionDB:
             billing_provider,
             billing_base_url,
             billing_mode,
+            provider_generation_id,
+            provider_request_id,
+            provider_async_request_id,
+            provider_http_status_code,
+            provider_response_model,
+            provider_cache_discount_usd,
+            provider_cache_discount_usd,
+            provider_billed_cost_usd,
+            provider_billed_cost_usd,
+            provider_upstream_inference_cost_usd,
+            provider_upstream_inference_cost_usd,
             model,
             session_id,
         )
@@ -537,6 +616,14 @@ class SessionDB:
         billing_provider: Optional[str] = None,
         billing_base_url: Optional[str] = None,
         billing_mode: Optional[str] = None,
+        provider_generation_id: Optional[str] = None,
+        provider_request_id: Optional[str] = None,
+        provider_async_request_id: Optional[str] = None,
+        provider_http_status_code: Optional[int] = None,
+        provider_response_model: Optional[str] = None,
+        provider_cache_discount_usd: Optional[float] = None,
+        provider_billed_cost_usd: Optional[float] = None,
+        provider_upstream_inference_cost_usd: Optional[float] = None,
     ) -> None:
         """Set token counters to absolute values (not increment).
 
@@ -563,6 +650,23 @@ class SessionDB:
                    billing_provider = COALESCE(billing_provider, ?),
                    billing_base_url = COALESCE(billing_base_url, ?),
                    billing_mode = COALESCE(billing_mode, ?),
+                   provider_generation_id = COALESCE(?, provider_generation_id),
+                   provider_request_id = COALESCE(?, provider_request_id),
+                   provider_async_request_id = COALESCE(?, provider_async_request_id),
+                   provider_http_status_code = COALESCE(?, provider_http_status_code),
+                   provider_response_model = COALESCE(?, provider_response_model),
+                   provider_cache_discount_usd = CASE
+                       WHEN ? IS NULL THEN provider_cache_discount_usd
+                       ELSE ?
+                   END,
+                   provider_billed_cost_usd = CASE
+                       WHEN ? IS NULL THEN provider_billed_cost_usd
+                       ELSE ?
+                   END,
+                   provider_upstream_inference_cost_usd = CASE
+                       WHEN ? IS NULL THEN provider_upstream_inference_cost_usd
+                       ELSE ?
+                   END,
                    model = COALESCE(model, ?)
                    WHERE id = ?""",
                 (
@@ -580,6 +684,17 @@ class SessionDB:
                     billing_provider,
                     billing_base_url,
                     billing_mode,
+                    provider_generation_id,
+                    provider_request_id,
+                    provider_async_request_id,
+                    provider_http_status_code,
+                    provider_response_model,
+                    provider_cache_discount_usd,
+                    provider_cache_discount_usd,
+                    provider_billed_cost_usd,
+                    provider_billed_cost_usd,
+                    provider_upstream_inference_cost_usd,
+                    provider_upstream_inference_cost_usd,
                     model,
                     session_id,
                 ),

@@ -98,7 +98,15 @@ _INSTALL_FAILED = False  # sentinel: distinct from "not yet tried"
 _install_failure_reason: str = ""  # reason tag when _resolved_path is _INSTALL_FAILED
 
 # Background install thread coordination
-_install_lock = threading.Lock()
+_install_lock = None
+
+
+def _get_install_lock_lock() -> threading.Lock:
+    """Lazy-initialized lock to avoid Modal serialization issues."""
+    global _install_lock
+    if _install_lock is None:
+        _install_lock = threading.Lock()
+    return _install_lock
 _install_thread: threading.Thread | None = None
 
 # Disk-persistent failure marker — avoids retry across process restarts
@@ -478,7 +486,7 @@ def _resolve_tirith_path(configured_path: str) -> str:
 def _background_install(*, log_failures: bool = True):
     """Background thread target: download and install tirith."""
     global _resolved_path, _install_failure_reason
-    with _install_lock:
+    with _get_install_lock_lock():
         # Double-check after acquiring lock (another thread may have resolved)
         if _resolved_path is not None:
             return

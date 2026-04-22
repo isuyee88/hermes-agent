@@ -1,6 +1,5 @@
-"""Tests for the central tool registry."""
-
 import json
+import threading
 
 from tools.registry import ToolRegistry
 
@@ -48,12 +47,8 @@ class TestRegisterAndDispatch:
 class TestGetDefinitions:
     def test_returns_openai_format(self):
         reg = ToolRegistry()
-        reg.register(
-            name="t1", toolset="s1", schema=_make_schema("t1"), handler=_dummy_handler
-        )
-        reg.register(
-            name="t2", toolset="s1", schema=_make_schema("t2"), handler=_dummy_handler
-        )
+        reg.register(name="t1", toolset="s1", schema=_make_schema("t1"), handler=_dummy_handler)
+        reg.register(name="t2", toolset="s1", schema=_make_schema("t2"), handler=_dummy_handler)
 
         defs = reg.get_definitions({"t1", "t2"})
         assert len(defs) == 2
@@ -120,9 +115,7 @@ class TestUnknownToolDispatch:
 class TestToolsetAvailability:
     def test_no_check_fn_is_available(self):
         reg = ToolRegistry()
-        reg.register(
-            name="t", toolset="free", schema=_make_schema(), handler=_dummy_handler
-        )
+        reg.register(name="t", toolset="free", schema=_make_schema(), handler=_dummy_handler)
         assert reg.is_toolset_available("free") is True
 
     def test_check_fn_controls_availability(self):
@@ -159,13 +152,23 @@ class TestToolsetAvailability:
 
     def test_get_all_tool_names(self):
         reg = ToolRegistry()
-        reg.register(
-            name="z_tool", toolset="s", schema=_make_schema(), handler=_dummy_handler
-        )
-        reg.register(
-            name="a_tool", toolset="s", schema=_make_schema(), handler=_dummy_handler
-        )
+        reg.register(name="z_tool", toolset="s", schema=_make_schema(), handler=_dummy_handler)
+        reg.register(name="a_tool", toolset="s", schema=_make_schema(), handler=_dummy_handler)
         assert reg.get_all_tool_names() == ["a_tool", "z_tool"]
+
+    def test_get_registered_toolset_names(self):
+        reg = ToolRegistry()
+        reg.register(name="first", toolset="zeta", schema=_make_schema(), handler=_dummy_handler)
+        reg.register(name="second", toolset="alpha", schema=_make_schema(), handler=_dummy_handler)
+        reg.register(name="third", toolset="alpha", schema=_make_schema(), handler=_dummy_handler)
+        assert reg.get_registered_toolset_names() == ["alpha", "zeta"]
+
+    def test_get_tool_names_for_toolset(self):
+        reg = ToolRegistry()
+        reg.register(name="z_tool", toolset="grouped", schema=_make_schema(), handler=_dummy_handler)
+        reg.register(name="a_tool", toolset="grouped", schema=_make_schema(), handler=_dummy_handler)
+        reg.register(name="other_tool", toolset="other", schema=_make_schema(), handler=_dummy_handler)
+        assert reg.get_tool_names_for_toolset("grouped") == ["a_tool", "z_tool"]
 
     def test_handler_exception_returns_error(self):
         reg = ToolRegistry()
@@ -173,17 +176,13 @@ class TestToolsetAvailability:
         def bad_handler(args, **kw):
             raise RuntimeError("boom")
 
-        reg.register(
-            name="bad", toolset="s", schema=_make_schema(), handler=bad_handler
-        )
+        reg.register(name="bad", toolset="s", schema=_make_schema(), handler=bad_handler)
         result = json.loads(reg.dispatch("bad", {}))
         assert "error" in result
         assert "RuntimeError" in result["error"]
 
 
 class TestCheckFnExceptionHandling:
-    """Verify that a raising check_fn is caught rather than crashing."""
-
     def test_is_toolset_available_catches_exception(self):
         reg = ToolRegistry()
         reg.register(
@@ -191,9 +190,8 @@ class TestCheckFnExceptionHandling:
             toolset="broken",
             schema=_make_schema(),
             handler=_dummy_handler,
-            check_fn=lambda: 1 / 0,  # ZeroDivisionError
+            check_fn=lambda: 1 / 0,
         )
-        # Should return False, not raise
         assert reg.is_toolset_available("broken") is False
 
     def test_check_toolset_requirements_survives_raising_check(self):
@@ -260,45 +258,68 @@ class TestCheckFnExceptionHandling:
 
 
 class TestEmojiMetadata:
-    """Verify per-tool emoji registration and lookup."""
-
     def test_emoji_stored_on_entry(self):
         reg = ToolRegistry()
         reg.register(
-            name="t", toolset="s", schema=_make_schema(),
-            handler=_dummy_handler, emoji="🔥",
+            name="t",
+            toolset="s",
+            schema=_make_schema(),
+            handler=_dummy_handler,
+            emoji="\U0001f525",
         )
-        assert reg._tools["t"].emoji == "🔥"
+        assert reg._tools["t"].emoji == "\U0001f525"
 
     def test_get_emoji_returns_registered(self):
         reg = ToolRegistry()
         reg.register(
-            name="t", toolset="s", schema=_make_schema(),
-            handler=_dummy_handler, emoji="🎯",
+            name="t",
+            toolset="s",
+            schema=_make_schema(),
+            handler=_dummy_handler,
+            emoji="\U0001f3af",
         )
-        assert reg.get_emoji("t") == "🎯"
+        assert reg.get_emoji("t") == "\U0001f3af"
 
     def test_get_emoji_returns_default_when_unset(self):
         reg = ToolRegistry()
-        reg.register(
-            name="t", toolset="s", schema=_make_schema(),
-            handler=_dummy_handler,
-        )
-        assert reg.get_emoji("t") == "⚡"
-        assert reg.get_emoji("t", default="🔧") == "🔧"
+        reg.register(name="t", toolset="s", schema=_make_schema(), handler=_dummy_handler)
+        assert reg.get_emoji("t") == "\u26a1"
+        assert reg.get_emoji("t", default="\U0001f527") == "\U0001f527"
 
     def test_get_emoji_returns_default_for_unknown_tool(self):
         reg = ToolRegistry()
-        assert reg.get_emoji("nonexistent") == "⚡"
-        assert reg.get_emoji("nonexistent", default="❓") == "❓"
+        assert reg.get_emoji("nonexistent") == "\u26a1"
+        assert reg.get_emoji("nonexistent", default="\u2753") == "\u2753"
 
     def test_emoji_empty_string_treated_as_unset(self):
         reg = ToolRegistry()
         reg.register(
-            name="t", toolset="s", schema=_make_schema(),
-            handler=_dummy_handler, emoji="",
+            name="t",
+            toolset="s",
+            schema=_make_schema(),
+            handler=_dummy_handler,
+            emoji="",
         )
-        assert reg.get_emoji("t") == "⚡"
+        assert reg.get_emoji("t") == "\u26a1"
+
+
+class TestEntryLookup:
+    def test_get_entry_returns_registered_entry(self):
+        reg = ToolRegistry()
+        reg.register(
+            name="alpha",
+            toolset="core",
+            schema=_make_schema("alpha"),
+            handler=_dummy_handler,
+        )
+        entry = reg.get_entry("alpha")
+        assert entry is not None
+        assert entry.name == "alpha"
+        assert entry.toolset == "core"
+
+    def test_get_entry_returns_none_for_unknown_tool(self):
+        reg = ToolRegistry()
+        assert reg.get_entry("missing") is None
 
 
 class TestSecretCaptureResultContract:
@@ -309,3 +330,141 @@ class TestSecretCaptureResultContract:
             "validated": False,
         }
         assert "secret" not in json.dumps(result).lower()
+
+
+class TestThreadSafety:
+    def test_get_available_toolsets_uses_coherent_snapshot(self, monkeypatch):
+        reg = ToolRegistry()
+        reg.register(
+            name="alpha",
+            toolset="gated",
+            schema=_make_schema("alpha"),
+            handler=_dummy_handler,
+            check_fn=lambda: False,
+        )
+
+        entries, toolset_checks = reg._snapshot_state()
+
+        def snapshot_then_mutate():
+            reg.deregister("alpha")
+            return entries, toolset_checks
+
+        monkeypatch.setattr(reg, "_snapshot_state", snapshot_then_mutate)
+
+        toolsets = reg.get_available_toolsets()
+        assert toolsets["gated"]["available"] is False
+        assert toolsets["gated"]["tools"] == ["alpha"]
+
+    def test_check_tool_availability_tolerates_concurrent_register(self):
+        reg = ToolRegistry()
+        check_started = threading.Event()
+        writer_done = threading.Event()
+        errors = []
+        result_holder = {}
+        writer_completed_during_check = {}
+
+        def blocking_check():
+            check_started.set()
+            writer_completed_during_check["value"] = writer_done.wait(timeout=1)
+            return True
+
+        reg.register(
+            name="alpha",
+            toolset="gated",
+            schema=_make_schema("alpha"),
+            handler=_dummy_handler,
+            check_fn=blocking_check,
+        )
+        reg.register(
+            name="beta",
+            toolset="plain",
+            schema=_make_schema("beta"),
+            handler=_dummy_handler,
+        )
+
+        def reader():
+            try:
+                result_holder["value"] = reg.check_tool_availability()
+            except Exception as exc:
+                errors.append(exc)
+
+        def writer():
+            assert check_started.wait(timeout=1)
+            reg.register(
+                name="gamma",
+                toolset="new",
+                schema=_make_schema("gamma"),
+                handler=_dummy_handler,
+            )
+            writer_done.set()
+
+        reader_thread = threading.Thread(target=reader)
+        writer_thread = threading.Thread(target=writer)
+        reader_thread.start()
+        writer_thread.start()
+        reader_thread.join(timeout=2)
+        writer_thread.join(timeout=2)
+
+        assert not reader_thread.is_alive()
+        assert not writer_thread.is_alive()
+        assert writer_completed_during_check["value"] is True
+        assert errors == []
+
+        available, unavailable = result_holder["value"]
+        assert "gated" in available
+        assert "plain" in available
+        assert unavailable == []
+
+    def test_get_available_toolsets_tolerates_concurrent_deregister(self):
+        reg = ToolRegistry()
+        check_started = threading.Event()
+        writer_done = threading.Event()
+        errors = []
+        result_holder = {}
+        writer_completed_during_check = {}
+
+        def blocking_check():
+            check_started.set()
+            writer_completed_during_check["value"] = writer_done.wait(timeout=1)
+            return True
+
+        reg.register(
+            name="alpha",
+            toolset="gated",
+            schema=_make_schema("alpha"),
+            handler=_dummy_handler,
+            check_fn=blocking_check,
+        )
+        reg.register(
+            name="beta",
+            toolset="plain",
+            schema=_make_schema("beta"),
+            handler=_dummy_handler,
+        )
+
+        def reader():
+            try:
+                result_holder["value"] = reg.get_available_toolsets()
+            except Exception as exc:
+                errors.append(exc)
+
+        def writer():
+            assert check_started.wait(timeout=1)
+            reg.deregister("beta")
+            writer_done.set()
+
+        reader_thread = threading.Thread(target=reader)
+        writer_thread = threading.Thread(target=writer)
+        reader_thread.start()
+        writer_thread.start()
+        reader_thread.join(timeout=2)
+        writer_thread.join(timeout=2)
+
+        assert not reader_thread.is_alive()
+        assert not writer_thread.is_alive()
+        assert writer_completed_during_check["value"] is True
+        assert errors == []
+
+        toolsets = result_holder["value"]
+        assert "gated" in toolsets
+        assert toolsets["gated"]["available"] is True

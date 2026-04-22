@@ -18,9 +18,11 @@
   },
   "homepage": "https://github.com/NousResearch/Hermes-Agent#readme",
   "dependencies": {
-    "agent-browser": "^0.13.0",
     "@askjo/camoufox-browser": "^1.0.0",
-    "playwright-core": "^1.58.0"
+    "agent-browser": "^0.13.0",
+    "playwright-core": "^1.58.0",
+    "puppeteer-core": "^24.41.0",
+    "ws": "^8.20.0"
   },
   "engines": {
     "node": ">=18.0.0"

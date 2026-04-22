@@ -44,14 +44,22 @@ _MIN_OUTPUT_LEN = 20
 # brv binary resolution (cached, thread-safe)
 # ---------------------------------------------------------------------------
 
-_brv_path_lock = threading.Lock()
+_brv_path_lock = None
+
+
+def _get_brv_path_lock_lock() -> threading.Lock:
+    """Lazy-initialized lock to avoid Modal serialization issues."""
+    global _brv_path_lock
+    if _brv_path_lock is None:
+        _brv_path_lock = threading.Lock()
+    return _brv_path_lock
 _cached_brv_path: Optional[str] = None
 
 
 def _resolve_brv_path() -> Optional[str]:
     """Find the brv binary on PATH or well-known install locations."""
     global _cached_brv_path
-    with _brv_path_lock:
+    with _get_brv_path_lock_lock():
         if _cached_brv_path is not None:
             return _cached_brv_path if _cached_brv_path != "" else None
 
@@ -68,7 +76,7 @@ def _resolve_brv_path() -> Optional[str]:
                 found = str(c)
                 break
 
-    with _brv_path_lock:
+    with _get_brv_path_lock_lock():
         if _cached_brv_path is not None:
             return _cached_brv_path if _cached_brv_path != "" else None
         _cached_brv_path = found or ""
@@ -106,7 +114,7 @@ def _run_brv(args: List[str], timeout: int = _QUERY_TIMEOUT,
         return {"success": False, "error": f"brv timed out after {timeout}s"}
     except FileNotFoundError:
         global _cached_brv_path
-        with _brv_path_lock:
+        with _get_brv_path_lock_lock():
             _cached_brv_path = None
         return {"success": False, "error": "brv CLI not found"}
     except Exception as e:

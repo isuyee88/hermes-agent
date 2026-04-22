@@ -307,6 +307,42 @@ def test_browser_use_managed_gateway_preserves_pending_idempotency_key_for_in_pr
     assert first_headers["X-Idempotency-Key"] == second_headers["X-Idempotency-Key"]
 
 
+def test_browser_backend_plan_stays_local_for_content_domain():
+    _install_fake_tools_package()
+    browser_tool = _load_tool_module("tools.browser_tool", "browser_tool.py")
+
+    class _Provider:
+        def provider_name(self):
+            return "browserbase"
+
+    with patch.object(browser_tool, "_get_cloud_provider", return_value=_Provider()):
+        plan = browser_tool._resolve_browser_backend_plan(
+            target_url="https://developers.cloudflare.com/workers/",
+        )
+
+    assert plan["selected_backend"] == "local"
+    assert plan["browser_strategy"] == "local_preferred"
+    assert plan["site_skill_name"] == "site.cloudflare-developers-docs"
+
+
+def test_browser_backend_plan_escalates_for_cloud_required_domain():
+    _install_fake_tools_package()
+    browser_tool = _load_tool_module("tools.browser_tool", "browser_tool.py")
+
+    class _Provider:
+        def provider_name(self):
+            return "browserbase"
+
+    with patch.object(browser_tool, "_get_cloud_provider", return_value=_Provider()):
+        plan = browser_tool._resolve_browser_backend_plan(
+            target_url="https://dashboard.stripe.com/login",
+        )
+
+    assert plan["selected_backend"] == "cloud"
+    assert plan["selected_reason"] == "domain_strategy_cloud_required"
+    assert plan["browser_strategy"] == "cloud_required"
+
+
 def test_browser_use_managed_gateway_uses_new_idempotency_key_for_a_new_session_after_success():
     _install_fake_tools_package()
     env = os.environ.copy()

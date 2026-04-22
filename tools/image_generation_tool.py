@@ -84,7 +84,16 @@ VALID_ACCELERATION_MODES = ["none", "regular", "high"]
 _debug = DebugSession("image_tools", env_var="IMAGE_TOOLS_DEBUG")
 _managed_fal_client = None
 _managed_fal_client_config = None
-_managed_fal_client_lock = threading.Lock()
+_managed_fal_client_lock = None
+
+
+def _get_managed_fal_client_lock() -> threading.Lock:
+    """Lazy-initialized lock to avoid Modal serialization issues."""
+    global _managed_fal_client_lock
+    if _managed_fal_client_lock is None:
+        _managed_fal_client_lock = threading.Lock()
+    return _managed_fal_client_lock
+
 
 
 def _resolve_managed_fal_gateway():
@@ -188,7 +197,7 @@ def _get_managed_fal_client(managed_gateway):
         managed_gateway.gateway_origin.rstrip("/"),
         managed_gateway.nous_user_token,
     )
-    with _managed_fal_client_lock:
+    with _get_managed_fal_client_lock():
         if _managed_fal_client is not None and _managed_fal_client_config == client_config:
             return _managed_fal_client
 

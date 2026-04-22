@@ -534,11 +534,25 @@ Important: cloud sandboxes may be cleaned up, idled out, or recreated between tu
 # Global state for environment lifecycle management
 _active_environments: Dict[str, Any] = {}
 _last_activity: Dict[str, float] = {}
-_env_lock = threading.Lock()
+_env_lock = None
 _creation_locks: Dict[str, threading.Lock] = {}  # Per-task locks for sandbox creation
-_creation_locks_lock = threading.Lock()  # Protects _creation_locks dict itself
+_creation_locks_lock = None  # Protects _creation_locks dict itself
 _cleanup_thread = None
 _cleanup_running = False
+
+
+def _get_env_lock() -> threading.Lock:
+    global _env_lock
+    if _env_lock is None:
+        _env_lock = threading.Lock()
+    return _env_lock
+
+
+def _get_creation_locks_lock() -> threading.Lock:
+    global _creation_locks_lock
+    if _creation_locks_lock is None:
+        _creation_locks_lock = threading.Lock()
+    return _creation_locks_lock
 
 # Per-task environment overrides registry.
 # Allows environments (e.g., TerminalBench2Env) to specify a custom Docker/Modal
@@ -833,7 +847,7 @@ def _cleanup_inactive_envs(lifetime_seconds: int = 300):
     # terminal/file tool call waiting on _env_lock.
     envs_to_stop = []  # list of (task_id, env) pairs
 
-    with _env_lock:
+    with _get_env_lock():
         for task_id, last_time in list(_last_activity.items()):
             if current_time - last_time > lifetime_seconds:
                 env = _active_environments.pop(task_id, None)
@@ -842,7 +856,7 @@ def _cleanup_inactive_envs(lifetime_seconds: int = 300):
                     envs_to_stop.append((task_id, env))
 
         # Also purge per-task creation locks for cleaned-up tasks
-        with _creation_locks_lock:
+        with _get_creation_locks_lock():
             for task_id, _ in envs_to_stop:
                 _creation_locks.pop(task_id, None)
 
@@ -894,7 +908,7 @@ def _start_cleanup_thread():
     """Start the background cleanup thread if not already running."""
     global _cleanup_thread, _cleanup_running
 
-    with _env_lock:
+    with _get_env_lock():
         if _cleanup_thread is None or not _cleanup_thread.is_alive():
             _cleanup_running = True
             _cleanup_thread = threading.Thread(target=_cleanup_thread_worker, daemon=True)
@@ -914,7 +928,7 @@ def _stop_cleanup_thread():
 
 def get_active_env(task_id: str):
     """Return the active BaseEnvironment for *task_id*, or None."""
-    with _env_lock:
+    with _get_env_lock():
         return _active_environments.get(task_id)
 
 
@@ -993,12 +1007,12 @@ def cleanup_vm(task_id: str):
     # actual (potentially slow) env.cleanup() call to outside the lock
     # so other tool calls aren't blocked.
     env = None
-    with _env_lock:
+    with _get_env_lock():
         env = _active_environments.pop(task_id, None)
         _last_activity.pop(task_id, None)
 
     # Clean up per-task creation lock
-    with _creation_locks_lock:
+    with _get_creation_locks_lock():
         _creation_locks.pop(task_id, None)
 
     # Invalidate stale file_ops cache entry
@@ -1200,7 +1214,7 @@ def terminal_tool(
         # Use a per-task creation lock so concurrent tool calls for the same
         # task_id wait for the first one to finish creating the sandbox,
         # instead of each creating their own (wasting Modal resources).
-        with _env_lock:
+        with _get_env_lock():
             if effective_task_id in _active_environments:
                 _last_activity[effective_task_id] = time.time()
                 env = _active_environments[effective_task_id]
@@ -1210,14 +1224,14 @@ def terminal_tool(
 
         if needs_creation:
             # Per-task lock: only one thread creates the sandbox, others wait
-            with _creation_locks_lock:
+            with _get_creation_locks_lock():
                 if effective_task_id not in _creation_locks:
                     _creation_locks[effective_task_id] = threading.Lock()
                 task_lock = _creation_locks[effective_task_id]
 
             with task_lock:
                 # Double-check after acquiring the per-task lock
-                with _env_lock:
+                with _get_env_lock():
                     if effective_task_id in _active_environments:
                         _last_activity[effective_task_id] = time.time()
                         env = _active_environments[effective_task_id]
@@ -1275,7 +1289,7 @@ def terminal_tool(
                             "status": "disabled"
                         }, ensure_ascii=False)
 
-                    with _env_lock:
+                    with _get_env_lock():
                         _active_environments[effective_task_id] = new_env
                         _last_activity[effective_task_id] = time.time()
                         env = new_env

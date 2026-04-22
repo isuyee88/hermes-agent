@@ -82,6 +82,28 @@ These expand to multiple core toolsets, providing a convenient shorthand for com
 | `debugging` | `patch`, `process`, `read_file`, `search_files`, `terminal`, `web_extract`, `web_search`, `write_file` | Debug sessions — file access, terminal, and web research without browser or delegation overhead. |
 | `safe` | `image_generate`, `mixture_of_agents`, `vision_analyze`, `web_extract`, `web_search` | Read-only research and media generation. No file writes, no terminal access, no code execution. Good for untrusted or constrained environments. |
 
+## Role Presets
+
+These presets are tuned for startup and affiliate-team workflows where Hermes needs both reasoning and execution surfaces:
+
+| Toolset | Highlights | Best for |
+|---------|------------|----------|
+| `founder-max` | Browser, terminal, file, code execution, delegation, messaging | Founder / CEO work, cross-functional execution, high-agency operator loops |
+| `growth-max` | Browser, web, vision, image generation, messaging | Funnel review, growth experiments, landing-page walkthroughs |
+| `content-max` | Browser, web, vision, image generation | Editorial research, repurposing, creative QA |
+| `seo-max` | Browser, web, file, memory | SERP research, site inspection, on-page reviews |
+| `ads-max` | Browser, web, vision, image generation | Paid acquisition diagnosis, creative iteration |
+| `bd-max` | Browser, web, messaging, memory | Partner research, outreach, follow-up planning |
+| `ops-max` | Browser, messaging, cronjob, memory | Publishing flows, handoffs, recurring operating loops |
+| `finance-max` | File, code execution, web, memory | ROI review, reconciliations, profitability analysis |
+| `cto-max` | `founder-max` + `debugging` | Technical leadership, implementation, verification |
+| `collab-safe` | Browser, web, messaging, memory; no terminal/file mutation | High-capability messaging surfaces such as Feishu or API control rooms |
+
+Project-specific note:
+
+- If collaboration backends are central to your operation, layer native integration toolsets on top of role presets instead of bloating the preset itself.
+- Example: `cli: [founder-max, feishu]` keeps the startup operator preset generic while giving your project full Feishu workspace reach.
+
 ## Platform Toolsets
 
 Platform toolsets define the complete tool configuration for a deployment target. Most messaging platforms use the same set as `hermes-cli`:

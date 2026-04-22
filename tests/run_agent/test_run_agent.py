@@ -259,6 +259,45 @@ class TestStripThinkBlocks:
         assert "visible" in result
 
 
+class TestRepairToolCall:
+    def test_repairs_streaming_channel_suffix(self):
+        with (
+            patch(
+                "run_agent.get_tool_definitions",
+                return_value=_make_tool_defs("feishu_message_send"),
+            ),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+        ):
+            agent = AIAgent(
+                api_key="test-key",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+        assert (
+            agent._repair_tool_call("feishu_message_send<|channel|>commentary")
+            == "feishu_message_send"
+        )
+
+    def test_repairs_normalized_suffix_after_marker_cleanup(self):
+        with (
+            patch(
+                "run_agent.get_tool_definitions",
+                return_value=_make_tool_defs("browser_back"),
+            ),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+        ):
+            agent = AIAgent(
+                api_key="test-key",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+        assert agent._repair_tool_call("browser-back_final") == "browser_back"
+
+
 class TestExtractReasoning:
     def test_reasoning_field(self, agent):
         msg = _mock_assistant_msg(reasoning="thinking hard")
@@ -844,6 +883,215 @@ class TestBuildApiKwargs:
         assert "user" not in kwargs
         assert "session_id" not in kwargs.get("extra_body", {})
         assert "trace" not in kwargs.get("extra_body", {})
+
+    def test_cloudflare_ai_gateway_dynamic_route_headers_for_coding(self, agent, monkeypatch):
+        monkeypatch.setenv("CLOUDFLARE_AI_GATEWAY_ROUTE_MODE", "dynamic_by_task_kind")
+        monkeypatch.setenv("CLOUDFLARE_AI_GATEWAY_ROUTE_CODING", "affiliate-coding")
+        monkeypatch.setenv("CLOUDFLARE_AI_GATEWAY_CACHE_MODE", "smart")
+        monkeypatch.setenv("CLOUDFLARE_AI_GATEWAY_REQUEST_TIMEOUT_MS", "9000")
+        monkeypatch.setenv("CLOUDFLARE_AI_GATEWAY_MAX_ATTEMPTS", "2")
+        agent.base_url = "https://gateway.ai.cloudflare.com/v1/account/gateway/compat"
+        agent._base_url_lower = agent.base_url.lower()
+        agent.model = "google-ai-studio/gemini-2.5-pro"
+        agent._trace_session_key = "feishu:oc_test_chat"
+        agent._trace_metadata = {
+            "correlation_id": "feishu:oc_test:evt_123",
+            "chat_id": "oc_test",
+            "message_id": "om_test",
+        }
+
+        kwargs = agent._build_api_kwargs([{"role": "user", "content": "请修复这段 Python 代码的报错并解释原因"}])
+
+        assert kwargs["model"] == "dynamic/affiliate-coding"
+        assert kwargs["extra_headers"]["cf-aig-skip-cache"] == "true"
+        assert kwargs["extra_headers"]["cf-aig-request-timeout"] == "9000"
+        assert kwargs["extra_headers"]["cf-aig-max-attempts"] == "2"
+        metadata = json.loads(kwargs["extra_headers"]["cf-aig-metadata"])
+        assert metadata["correlation_id"] == "feishu:oc_test:evt_123"
+        assert metadata["task_kind"] == "coding"
+        assert metadata["hermes_request"] == "google-ai-studio/gemini-2.5-pro=>dynamic/affiliate-coding"
+
+    def test_cloudflare_ai_gateway_general_route_uses_cache_ttl(self, agent, monkeypatch):
+        monkeypatch.setenv("CLOUDFLARE_AI_GATEWAY_ROUTE_MODE", "dynamic_by_task_kind")
+        monkeypatch.setenv("CLOUDFLARE_AI_GATEWAY_ROUTE_GENERAL", "affiliate-general")
+        monkeypatch.setenv("CLOUDFLARE_AI_GATEWAY_CACHE_MODE", "smart")
+        monkeypatch.setenv("CLOUDFLARE_AI_GATEWAY_CACHE_TTL_SECONDS", "180")
+        agent.base_url = "https://gateway.ai.cloudflare.com/v1/account/gateway/compat"
+        agent._base_url_lower = agent.base_url.lower()
+        agent.model = "openrouter/openai/gpt-4.1-mini"
+        agent.tools = []
+        agent._trace_session_key = "feishu:oc_test_chat"
+        agent._trace_metadata = {"chat_id": "oc_test"}
+
+        kwargs = agent._build_api_kwargs([{"role": "user", "content": "请简要总结今天的工作重点"}])
+
+        assert kwargs["model"] == "dynamic/affiliate-general"
+        assert kwargs["extra_headers"]["cf-aig-cache-ttl"] == "180"
+        assert "cf-aig-skip-cache" not in kwargs["extra_headers"]
+        metadata = json.loads(kwargs["extra_headers"]["cf-aig-metadata"])
+        assert metadata["hermes_request"] == "openrouter/openai/gpt-4.1-mini=>dynamic/affiliate-general"
+        assert metadata["session_id"] == "feishu:oc_test_chat"
+        assert metadata["task_kind"] == "general"
+
+    def test_cloudflare_ai_gateway_prompt_hash_cache_key_optional(self, agent, monkeypatch):
+        monkeypatch.setenv("CLOUDFLARE_AI_GATEWAY_CACHE_MODE", "smart")
+        monkeypatch.setenv("CLOUDFLARE_AI_GATEWAY_USE_PROMPT_CACHE_KEY", "true")
+        agent.base_url = "https://gateway.ai.cloudflare.com/v1/account/gateway/compat"
+        agent._base_url_lower = agent.base_url.lower()
+        agent.model = "openrouter/openai/gpt-4.1-mini"
+        agent.tools = []
+
+        kwargs = agent._build_api_kwargs([{"role": "user", "content": "What is a webhook acknowledgment?"}])
+
+        assert kwargs["extra_headers"]["cf-aig-cache-key"].startswith("hermes:general:")
+
+    def test_cloudflare_ai_gateway_metadata_derives_correlation_from_session_and_message(self, agent, monkeypatch):
+        monkeypatch.setenv("CLOUDFLARE_AI_GATEWAY_CACHE_MODE", "smart")
+        agent.base_url = "https://gateway.ai.cloudflare.com/v1/account/gateway/compat"
+        agent._base_url_lower = agent.base_url.lower()
+        agent.model = "openrouter/openai/gpt-4.1-mini"
+        agent.tools = []
+        agent._trace_session_key = "feishu:oc_test_chat"
+        agent._trace_metadata = {"message_id": "om_test"}
+
+        kwargs = agent._build_api_kwargs([{"role": "user", "content": "Summarize the release notes."}])
+
+        metadata = json.loads(kwargs["extra_headers"]["cf-aig-metadata"])
+        assert metadata["correlation_id"] == "feishu:oc_test_chat:om_test"
+        assert metadata["hermes_request"] == "openrouter/openai/gpt-4.1-mini"
+
+    def test_cloudflare_ai_gateway_metadata_caps_at_five_entries(self, agent, monkeypatch):
+        monkeypatch.delenv("CLOUDFLARE_AI_GATEWAY_ROUTE_MODE", raising=False)
+        agent.base_url = "https://gateway.ai.cloudflare.com/v1/account/gateway/compat"
+        agent._base_url_lower = agent.base_url.lower()
+        agent.model = "openrouter/free"
+        agent.tools = [
+            {"type": "function", "function": {"name": "browser_back"}},
+            {"type": "function", "function": {"name": "read_file"}},
+        ]
+        agent._trace_session_key = "feishu:oc_test_chat"
+        agent._trace_metadata = {
+            "correlation_id": "feishu:oc_test:evt_123",
+            "chat_id": "oc_test",
+            "message_id": "om_test",
+        }
+
+        kwargs = agent._build_api_kwargs([{"role": "user", "content": "Open the site and inspect it."}])
+
+        metadata = json.loads(kwargs["extra_headers"]["cf-aig-metadata"])
+        assert len(metadata) <= 5
+        assert metadata["correlation_id"] == "feishu:oc_test:evt_123"
+        assert metadata["task_kind"] == "general"
+        assert metadata["hermes_request"] == "openrouter/free=>dynamic/affiliate-tools"
+        assert metadata["tools_required"] is True
+        assert "tool_names" in metadata
+        assert "chat_id" not in metadata
+        assert "message_id" not in metadata
+        assert "session_id" not in metadata
+
+    def test_cloudflare_ai_gateway_defaults_to_metadata_only(self, agent, monkeypatch):
+        monkeypatch.delenv("CLOUDFLARE_AI_GATEWAY_ROUTE_MODE", raising=False)
+        monkeypatch.setenv("CLOUDFLARE_AI_GATEWAY_ROUTE_GENERAL", "affiliate-general")
+        agent.base_url = "https://gateway.ai.cloudflare.com/v1/account/gateway/compat"
+        agent._base_url_lower = agent.base_url.lower()
+        agent.model = "openrouter/openai/gpt-4.1-mini"
+        agent.tools = []
+        agent._trace_metadata = {"chat_id": "oc_test"}
+
+        kwargs = agent._build_api_kwargs([{"role": "user", "content": "Summarize the release notes."}])
+
+        assert kwargs["model"] == "openrouter/openai/gpt-4.1-mini"
+        metadata = json.loads(kwargs["extra_headers"]["cf-aig-metadata"])
+        assert metadata["task_kind"] == "general"
+
+    def test_cloudflare_ai_gateway_metadata_only_uses_dynamic_route_for_tools(self, agent, monkeypatch):
+        monkeypatch.delenv("CLOUDFLARE_AI_GATEWAY_ROUTE_MODE", raising=False)
+        monkeypatch.setenv("CLOUDFLARE_AI_GATEWAY_ROUTE_TOOLS", "affiliate-tools")
+        agent.base_url = "https://gateway.ai.cloudflare.com/v1/account/gateway/compat"
+        agent._base_url_lower = agent.base_url.lower()
+        agent.model = "openrouter/free"
+        agent.tools = [{"type": "function", "function": {"name": "browser_back"}}]
+        agent._trace_metadata = {"chat_id": "oc_test"}
+
+        kwargs = agent._build_api_kwargs([{"role": "user", "content": "Open the site and inspect it."}])
+
+        assert kwargs["model"] == "dynamic/affiliate-tools"
+        metadata = json.loads(kwargs["extra_headers"]["cf-aig-metadata"])
+        assert metadata["tools_required"] == "true"
+        assert "browser_back" in metadata["tool_names"]
+
+    def test_cloudflare_ai_gateway_metadata_only_defaults_tools_route(self, agent, monkeypatch):
+        monkeypatch.delenv("CLOUDFLARE_AI_GATEWAY_ROUTE_MODE", raising=False)
+        monkeypatch.delenv("CLOUDFLARE_AI_GATEWAY_ROUTE_TOOLS", raising=False)
+        monkeypatch.delenv("CLOUDFLARE_AI_GATEWAY_ROUTE_NAME", raising=False)
+        agent.base_url = "https://gateway.ai.cloudflare.com/v1/account/gateway/compat"
+        agent._base_url_lower = agent.base_url.lower()
+        agent.model = "openrouter/free"
+        agent.tools = [{"type": "function", "function": {"name": "browser_back"}}]
+
+        kwargs = agent._build_api_kwargs([{"role": "user", "content": "Open the site and inspect it."}])
+
+        assert kwargs["model"] == "dynamic/affiliate-tools"
+
+    def test_cloudflare_ai_gateway_metadata_only_routes_image_tools_to_image_lane(self, agent, monkeypatch):
+        monkeypatch.delenv("CLOUDFLARE_AI_GATEWAY_ROUTE_MODE", raising=False)
+        monkeypatch.delenv("CLOUDFLARE_AI_GATEWAY_ROUTE_TOOLS", raising=False)
+        monkeypatch.delenv("CLOUDFLARE_AI_GATEWAY_ROUTE_TOOLS_IMAGE", raising=False)
+        monkeypatch.delenv("CLOUDFLARE_AI_GATEWAY_ROUTE_IMAGE", raising=False)
+        agent.base_url = "https://gateway.ai.cloudflare.com/v1/account/gateway/compat"
+        agent._base_url_lower = agent.base_url.lower()
+        agent.model = "openrouter/free"
+        agent.tools = [{"type": "function", "function": {"name": "browser_get_images"}}]
+        agent._trace_metadata = {"task_kind": "image"}
+
+        kwargs = agent._build_api_kwargs([{"role": "user", "content": "Inspect this screenshot and describe it."}])
+
+        assert kwargs["model"] == "dynamic/affiliate-general"
+        metadata = json.loads(kwargs["extra_headers"]["cf-aig-metadata"])
+        assert metadata["task_kind"] == "image"
+        assert metadata["hermes_request"] == "openrouter/free=>dynamic/affiliate-general"
+
+    def test_cloudflare_ai_gateway_metadata_only_uses_explicit_image_tools_route(self, agent, monkeypatch):
+        monkeypatch.delenv("CLOUDFLARE_AI_GATEWAY_ROUTE_MODE", raising=False)
+        monkeypatch.delenv("CLOUDFLARE_AI_GATEWAY_ROUTE_TOOLS", raising=False)
+        monkeypatch.setenv("CLOUDFLARE_AI_GATEWAY_ROUTE_TOOLS_IMAGE", "affiliate-image-tools")
+        agent.base_url = "https://gateway.ai.cloudflare.com/v1/account/gateway/compat"
+        agent._base_url_lower = agent.base_url.lower()
+        agent.model = "openrouter/free"
+        agent.tools = [{"type": "function", "function": {"name": "browser_get_images"}}]
+        agent._trace_metadata = {"task_kind": "image"}
+
+        kwargs = agent._build_api_kwargs([{"role": "user", "content": "Inspect this screenshot and describe it."}])
+
+        assert kwargs["model"] == "dynamic/affiliate-image-tools"
+
+    def test_cloudflare_ai_gateway_creative_defaults_to_general_route(self, agent, monkeypatch):
+        monkeypatch.setenv("CLOUDFLARE_AI_GATEWAY_ROUTE_MODE", "dynamic_by_task_kind")
+        monkeypatch.delenv("CLOUDFLARE_AI_GATEWAY_ROUTE_GENERAL", raising=False)
+        monkeypatch.delenv("CLOUDFLARE_AI_GATEWAY_ROUTE_CREATIVE", raising=False)
+        agent.base_url = "https://gateway.ai.cloudflare.com/v1/account/gateway/compat"
+        agent._base_url_lower = agent.base_url.lower()
+        agent.model = "openrouter/free"
+        agent.tools = []
+
+        kwargs = agent._build_api_kwargs([{"role": "user", "content": "Write a catchy launch campaign script."}])
+
+        assert kwargs["model"] == "dynamic/affiliate-general"
+
+    def test_openrouter_broadcast_derives_correlation_id(self, agent, monkeypatch):
+        monkeypatch.setenv("OPENROUTER_BROADCAST_ENABLED", "true")
+        monkeypatch.setenv("OPENROUTER_BROADCAST_PRIVACY_MODE", "true")
+        agent.base_url = "https://openrouter.ai/api/v1"
+        agent._base_url_lower = agent.base_url.lower()
+        agent.provider = "openrouter"
+        agent.model = "qwen/qwen3-coder:free"
+        agent.platform = "feishu"
+        agent._trace_session_key = "feishu:oc_test_chat"
+        agent._trace_metadata = {"message_id": "om_test"}
+
+        kwargs = agent._build_api_kwargs([{"role": "user", "content": "hi"}])
+
+        assert kwargs["extra_body"]["trace"]["correlation_id"] == "feishu:oc_test_chat:om_test"
 
     def test_extract_openrouter_usage_metadata(self, agent):
         agent.base_url = "https://openrouter.ai/api/v1"
@@ -2906,6 +3154,52 @@ def test_is_openai_client_closed_falls_back_to_http_client():
 
     assert AIAgent._is_openai_client_closed(ClientWithHttpClient(http_closed=False)) is False
     assert AIAgent._is_openai_client_closed(ClientWithHttpClient(http_closed=True)) is True
+
+
+def test_create_openai_client_disables_env_proxy_for_local_endpoint():
+    with (
+        patch("run_agent.get_tool_definitions", return_value=_make_tool_defs("web_search")),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI") as mock_openai,
+    ):
+        mock_openai.return_value = MagicMock()
+        agent = AIAgent(
+            api_key="local-key",
+            base_url="http://127.0.0.1:11434/v1",
+            provider="custom",
+            api_mode="chat_completions",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+
+        _, kwargs = mock_openai.call_args
+        http_client = kwargs.get("http_client")
+
+        assert http_client is not None
+        assert http_client._trust_env is False
+        http_client.close()
+
+
+def test_create_openai_client_keeps_default_transport_for_remote_endpoint():
+    with (
+        patch("run_agent.get_tool_definitions", return_value=_make_tool_defs("web_search")),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI") as mock_openai,
+    ):
+        mock_openai.return_value = MagicMock()
+        AIAgent(
+            api_key="remote-key",
+            base_url="https://openrouter.ai/api/v1",
+            provider="openrouter",
+            api_mode="chat_completions",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+
+        _, kwargs = mock_openai.call_args
+        assert "http_client" not in kwargs
 
 
 class TestAnthropicBaseUrlPassthrough:

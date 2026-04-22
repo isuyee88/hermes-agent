@@ -132,6 +132,9 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("usage", "Show token usage and rate limits for the current session", "Info"),
     CommandDef("insights", "Show usage insights and analytics", "Info",
                args_hint="[days]"),
+    CommandDef("kpi", "Generate the Feishu-CF-Modal-Hermes KPI report", "Info",
+               gateway_only=True, aliases=("report", "feishu-kpi"),
+               args_hint="[hours] [--recent-hours N] [--compare-days 1 2]"),
     CommandDef("platforms", "Show gateway/messaging platform status", "Info",
                cli_only=True, aliases=("gateway",)),
     CommandDef("paste", "Check clipboard for an image and attach it", "Info",
@@ -749,8 +752,7 @@ class SlashCommandCompleter(Completer):
             return None
         return word
 
-    @staticmethod
-    def _context_completions(word: str, limit: int = 30):
+    def _context_completions(self, word: str, limit: int = 30):
         """Yield Claude Code-style @ context completions.
 
         Bare ``@`` or ``@partial`` shows static references and matching

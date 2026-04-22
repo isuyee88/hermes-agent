@@ -55,6 +55,53 @@ Settings are resolved in this order (highest priority first):
 Secrets (API keys, bot tokens, passwords) go in `.env`. Everything else (model, terminal backend, compression settings, memory limits, toolsets) goes in `config.yaml`. When both are set, `config.yaml` wins for non-secret settings.
 :::
 
+## Startup Operator Presets
+
+If you want Hermes to behave like a higher-agency operator for startup or affiliate work, prefer configuring `platform_toolsets` with role presets instead of manually listing dozens of toolsets:
+
+```yaml
+platform_toolsets:
+  cli: [founder-max, feishu]
+  feishu: [collab-safe, feishu]
+  api_server: [cto-max]
+```
+
+These presets intentionally elevate browser automation to a first-class execution surface. `founder-max` and `cto-max` include browser, terminal, and research tools; `collab-safe` keeps browser automation but excludes terminal and file mutation.
+
+You can also auto-load project operating skills into new sessions:
+
+```yaml
+skills:
+  startup: [affiliate-os, browser-ops]
+  platform_startup:
+    cli: [automation-os]
+    feishu: [feishu-workbench, affiliate-os, browser-ops]
+```
+
+This is useful when you want Hermes to consistently start with your project's operating method instead of waiting for a manual `/skill` command every time.
+
+Project-local plugins can now also be enabled from `config.yaml`, which is often easier than relying on a deployment-only environment variable:
+
+```yaml
+plugins:
+  enable_project: true
+```
+
+This enables discovery of repo-local plugins from `./.hermes/plugins/`. The `HERMES_ENABLE_PROJECT_PLUGINS` environment variable still works and takes precedence as an explicit opt-in.
+
+## Browser Provider Configuration
+
+Hermes browser automation can run locally or through cloud providers. Make the provider explicit in `config.yaml` so the active execution path is obvious:
+
+```yaml
+browser:
+  cloud_provider: local   # local | browser-use | browserbase | firecrawl
+  command_timeout: 30
+  inactivity_timeout: 120
+```
+
+Provider credentials still belong in `.env`, for example `BROWSER_USE_API_KEY`, `BROWSERBASE_API_KEY`, `BROWSERBASE_PROJECT_ID`, or `FIRECRAWL_API_KEY`.
+
 ## Environment Variable Substitution
 
 You can reference environment variables in `config.yaml` using `${VAR_NAME}` syntax:

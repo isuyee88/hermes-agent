@@ -112,7 +112,16 @@ def _managed_persistence_enabled() -> bool:
 # ---------------------------------------------------------------------------
 # Maps task_id -> {"user_id": str, "tab_id": str|None}
 _sessions: Dict[str, Dict[str, Any]] = {}
-_sessions_lock = threading.Lock()
+_sessions_lock = None
+
+
+def _get_sessions_lock() -> threading.Lock:
+    """Lazy-initialized lock to avoid Modal serialization issues."""
+    global _sessions_lock
+    if _sessions_lock is None:
+        _sessions_lock = threading.Lock()
+    return _sessions_lock
+
 
 
 def _get_session(task_id: Optional[str]) -> Dict[str, Any]:
@@ -123,7 +132,7 @@ def _get_session(task_id: Optional[str]) -> Dict[str, Any]:
     to the same persistent browser profile across restarts.
     """
     task_id = task_id or "default"
-    with _sessions_lock:
+    with _get_sessions_lock():
         if task_id in _sessions:
             return _sessions[task_id]
         if _managed_persistence_enabled():
@@ -169,7 +178,7 @@ def _ensure_tab(task_id: Optional[str], url: str = "about:blank") -> Dict[str, A
 def _drop_session(task_id: Optional[str]) -> Optional[Dict[str, Any]]:
     """Remove and return session info."""
     task_id = task_id or "default"
-    with _sessions_lock:
+    with _get_sessions_lock():
         return _sessions.pop(task_id, None)
 
 
@@ -595,12 +604,12 @@ def camofox_console(clear: bool = False, task_id: Optional[str] = None) -> str:
 
 def cleanup_all_camofox_sessions() -> None:
     """Close all active camofox sessions."""
-    with _sessions_lock:
+    with _get_sessions_lock():
         sessions = list(_sessions.items())
     for task_id, session in sessions:
         try:
             _delete(f"/sessions/{session['user_id']}")
         except Exception:
             pass
-    with _sessions_lock:
+    with _get_sessions_lock():
         _sessions.clear()

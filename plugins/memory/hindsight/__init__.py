@@ -57,13 +57,21 @@ _PROVIDER_DEFAULT_MODELS = {
 
 _loop: asyncio.AbstractEventLoop | None = None
 _loop_thread: threading.Thread | None = None
-_loop_lock = threading.Lock()
+_loop_lock = None
+
+
+def _get_loop_lock() -> threading.Lock:
+    """Lazy-initialized lock to avoid Modal serialization issues."""
+    global _loop_lock
+    if _loop_lock is None:
+        _loop_lock = threading.Lock()
+    return _loop_lock
 
 
 def _get_loop() -> asyncio.AbstractEventLoop:
     """Return a long-lived event loop running on a background thread."""
     global _loop, _loop_thread
-    with _loop_lock:
+    with _get_loop_lock():
         if _loop is not None and _loop.is_running():
             return _loop
         _loop = asyncio.new_event_loop()

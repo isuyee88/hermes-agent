@@ -18,11 +18,20 @@ import httpx
 logger = logging.getLogger(__name__)
 
 _TOKEN_CACHE: Dict[str, Dict[str, Any]] = {}
-_TOKEN_CACHE_LOCK = threading.Lock()
+_TOKEN_CACHE_LOCK = None
+
+
+def _get_token_cache_lock_lock() -> threading.Lock:
+    """Lazy-initialized lock to avoid Modal serialization issues."""
+    global _TOKEN_CACHE_LOCK
+    if _TOKEN_CACHE_LOCK is None:
+        _TOKEN_CACHE_LOCK = threading.Lock()
+    return _TOKEN_CACHE_LOCK
 _DOC_URL_RE = re.compile(r"/docx/([A-Za-z0-9]+)")
 _SHEET_URL_RE = re.compile(r"/sheets/([A-Za-z0-9]+)")
 _BITABLE_APP_URL_RE = re.compile(r"/base/([^/?]+)")
 _BITABLE_WIKI_URL_RE = re.compile(r"(?:^|/)wiki/([A-Za-z0-9]+)")
+_SHEET_RANGE_PREFIX_RE = re.compile(r"^(?P<prefix>[^!]+)!(?P<cells>.+)$")
 _TRUNCATE_RAW_CONTENT_AT = 12_000
 _FEISHU_FILE_UPLOAD_TYPE = "stream"
 _FEISHU_IMAGE_UPLOAD_TYPE = "message"
@@ -463,28 +472,83 @@ def build_plain_post_payload(text: str, *, title: str | None = None) -> str:
 
 
 def markdown_to_doc_blocks(markdown_text: str) -> list[dict[str, Any]]:
+    def _text_elements(content: str) -> list[dict[str, Any]]:
+        return [{"text_run": {"content": content}}]
+
+    def _text_block(content: str) -> dict[str, Any]:
+        return {
+            "block_type": 2,
+            "text": {
+                "elements": _text_elements(content),
+            },
+        }
+
     blocks: list[dict[str, Any]] = []
     for raw_line in str(markdown_text or "").splitlines():
         line = raw_line.rstrip()
-        blocks.append(
-            {
-                "block_type": 2,
-                "paragraph": {
-                    "elements": [
-                        {
-                            "text_run": {"content": line},
-                            "type": "text_run",
-                        }
-                    ]
-                },
-            }
-        )
-    return blocks or [
-        {
-            "block_type": 2,
-            "paragraph": {"elements": [{"text_run": {"content": str(markdown_text or "")}, "type": "text_run"}]},
-        }
-    ]
+        stripped = line.lstrip()
+        if line.startswith("### "):
+            blocks.append({"block_type": 5, "heading3": {"elements": _text_elements(line[4:].strip() or " ")}})
+        elif line.startswith("## "):
+            blocks.append({"block_type": 4, "heading2": {"elements": _text_elements(line[3:].strip() or " ")}})
+        elif line.startswith("# "):
+            blocks.append({"block_type": 3, "heading1": {"elements": _text_elements(line[2:].strip() or " ")}})
+        elif stripped.startswith("- ") or stripped.startswith("* "):
+            blocks.append({"block_type": 12, "bullet": {"elements": _text_elements(stripped[2:].strip() or " ")}})
+        else:
+            blocks.append(_text_block(line or " "))
+    return blocks or [_text_block(str(markdown_text or "") or " ")]
+
+
+def get_spreadsheet_metainfo(client: "FeishuOpenApiClient", *, spreadsheet_token: str) -> Dict[str, Any]:
+    return client.request_json(
+        "GET",
+        f"/open-apis/sheets/v2/spreadsheets/{spreadsheet_token}/metainfo",
+    )
+
+
+def normalize_sheet_range(
+    client: "FeishuOpenApiClient",
+    *,
+    spreadsheet_token: str,
+    range_name: str,
+) -> str:
+    raw_range = str(range_name or "").strip()
+    if not raw_range:
+        raise ValueError("range is required")
+
+    match = _SHEET_RANGE_PREFIX_RE.match(raw_range)
+    prefix = ""
+    cells = raw_range
+    if match:
+        prefix = str(match.group("prefix") or "").strip()
+        cells = str(match.group("cells") or "").strip()
+
+    if not cells:
+        raise ValueError("range must include sheet cells such as A1:B2")
+
+    metainfo = get_spreadsheet_metainfo(client, spreadsheet_token=spreadsheet_token)
+    sheets = [sheet for sheet in (metainfo.get("sheets") or []) if isinstance(sheet, dict)]
+    if not sheets:
+        raise RuntimeError("Feishu spreadsheet metadata returned no sheets")
+
+    target_sheet_id = ""
+    if prefix:
+        for sheet in sheets:
+            sheet_id = str(sheet.get("sheetId") or "").strip()
+            title = str(sheet.get("title") or "").strip()
+            index = str(sheet.get("index") or "").strip()
+            if prefix in {sheet_id, title, index}:
+                target_sheet_id = sheet_id
+                break
+        if not target_sheet_id:
+            raise RuntimeError(f"Sheet '{prefix}' was not found in spreadsheet metadata")
+    else:
+        target_sheet_id = str(sheets[0].get("sheetId") or "").strip()
+
+    if not target_sheet_id:
+        raise RuntimeError("Feishu spreadsheet metadata returned no sheetId")
+    return f"{target_sheet_id}!{cells}"
 
 
 class FeishuOpenApiClient:
@@ -507,7 +571,7 @@ class FeishuOpenApiClient:
     def get_tenant_access_token(self, *, force_refresh: bool = False) -> str:
         cache_key = f"{self.base_url}:{self.app_id}"
         now = time.time()
-        with _TOKEN_CACHE_LOCK:
+        with _get_token_cache_lock_lock():
             cached = _TOKEN_CACHE.get(cache_key, {})
             if (
                 not force_refresh
@@ -534,7 +598,7 @@ class FeishuOpenApiClient:
         if not token:
             raise FeishuOpenApiError("Feishu auth succeeded but returned no tenant_access_token")
         expires_in = int(payload.get("expire", 7200) or 7200)
-        with _TOKEN_CACHE_LOCK:
+        with _get_token_cache_lock_lock():
             _TOKEN_CACHE[cache_key] = {
                 "token": token,
                 "expires_at": now + max(60, expires_in - 120),
@@ -753,8 +817,10 @@ class FeishuOpenApiClient:
         )
 
 
-def build_feishu_client() -> FeishuOpenApiClient:
-    return FeishuOpenApiClient()
+def build_feishu_client(*, timeout: float | None = None) -> FeishuOpenApiClient:
+    if timeout is None:
+        return FeishuOpenApiClient()
+    return FeishuOpenApiClient(timeout=float(timeout))
 
 
 def resolve_message_receive_id_type(receive_id: str, *, explicit_type: str | None = None) -> str:

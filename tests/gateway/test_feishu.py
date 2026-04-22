@@ -100,6 +100,171 @@ class TestGatewayIntegration(unittest.TestCase):
         self.assertIn("hermes-feishu", TOOLSETS)
         self.assertIn("hermes-feishu", TOOLSETS["hermes-gateway"]["includes"])
 
+    def test_feishu_browser_refusal_is_clarified_when_browser_tools_ran(self):
+        from gateway.response_clarifiers import clarify_feishu_browser_refusal
+
+        response = "I'm sorry, but I can't help with that."
+        user_message = "请验证浏览器能力，并注册一个邮箱账号和几个社交媒体账号。"
+        agent_messages = [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {"function": {"name": "browser_navigate"}},
+                    {"function": {"name": "browser_snapshot"}},
+                    {"function": {"name": "browser_click"}},
+                ],
+            }
+        ]
+
+        clarified = clarify_feishu_browser_refusal(
+            response,
+            user_message=user_message,
+            agent_messages=agent_messages,
+        )
+
+        self.assertIn("浏览器能力是可用的", clarified)
+        self.assertIn("browser_navigate", clarified)
+        self.assertIn("账号注册/创建", clarified)
+
+    def test_feishu_browser_refusal_is_not_rewritten_without_browser_activity(self):
+        from gateway.response_clarifiers import clarify_feishu_browser_refusal
+
+        response = "I'm sorry, but I can't help with that."
+        user_message = "请验证浏览器能力，并注册一个邮箱账号和几个社交媒体账号。"
+
+        clarified = clarify_feishu_browser_refusal(
+            response,
+            user_message=user_message,
+            agent_messages=[{"role": "assistant", "content": "no tools"}],
+        )
+
+        self.assertEqual(clarified, response)
+
+    def test_feishu_workspace_refusal_is_clarified_when_feishu_tools_ran(self):
+        from gateway.response_clarifiers import clarify_feishu_workspace_refusal
+
+        response = "抱歉，我无法操作飞书多维表格来保存这些关键词。"
+        user_message = "把关键词存入到飞书的多维表格里面"
+        agent_messages = [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {"function": {"name": "feishu_bitable_upsert_records"}},
+                    {"function": {"name": "feishu_bitable_list_records"}},
+                ],
+            }
+        ]
+
+        clarified = clarify_feishu_workspace_refusal(
+            response,
+            user_message=user_message,
+            agent_messages=agent_messages,
+        )
+
+        self.assertIn("飞书原生工作台能力是可用的", clarified)
+        self.assertIn("feishu_bitable_upsert_records", clarified)
+        self.assertIn("table_id", clarified)
+        self.assertIn("而不是把问题描述成“无法操作飞书”", clarified)
+
+    def test_feishu_workspace_refusal_is_clarified_even_without_tool_calls(self):
+        from gateway.response_clarifiers import clarify_feishu_workspace_refusal
+
+        response = "I cannot access Feishu docs or sheets from here."
+        user_message = "请把这份周报写进飞书文档"
+
+        clarified = clarify_feishu_workspace_refusal(
+            response,
+            user_message=user_message,
+            agent_messages=[{"role": "assistant", "content": "no tools"}],
+        )
+
+        self.assertIn("原生 `feishu_*` 工具能力", clarified)
+        self.assertIn("文档", clarified)
+        self.assertIn("doc/sheet/bitable", clarified)
+
+    def test_feishu_plain_text_prunes_browser_toolset(self):
+        from gateway.run import _apply_feishu_toolset_cost_controls
+
+        enabled, disabled, summary = _apply_feishu_toolset_cost_controls(
+            platform_key="feishu",
+            message="请帮我总结今天这段对话，然后给出三条建议。",
+            enabled_toolsets=["collab-safe", "browser", "feishu"],
+            disabled_toolsets=[],
+        )
+
+        self.assertNotIn("browser", enabled)
+        self.assertIn("browser", disabled)
+        self.assertFalse(summary["browser_requested"])
+        self.assertTrue(summary["browser_toolset_pruned"])
+
+    def test_feishu_explicit_browser_request_keeps_browser_toolset(self):
+        from gateway.run import _apply_feishu_toolset_cost_controls
+
+        enabled, disabled, summary = _apply_feishu_toolset_cost_controls(
+            platform_key="feishu",
+            message="请打开 https://example.com 看一下首页并截图。",
+            enabled_toolsets=["collab-safe", "browser", "feishu"],
+            disabled_toolsets=[],
+        )
+
+        self.assertIn("browser", enabled)
+        self.assertNotIn("browser", disabled)
+        self.assertTrue(summary["browser_requested"])
+        self.assertFalse(summary["browser_toolset_pruned"])
+
+    def test_feishu_docs_url_only_does_not_trigger_browser_toolset(self):
+        from gateway.run import _apply_feishu_toolset_cost_controls
+
+        enabled, disabled, summary = _apply_feishu_toolset_cost_controls(
+            platform_key="feishu",
+            message="https://developers.cloudflare.com/workers/",
+            enabled_toolsets=["collab-safe", "browser", "feishu"],
+            disabled_toolsets=[],
+        )
+
+        self.assertNotIn("browser", enabled)
+        self.assertIn("browser", disabled)
+        self.assertFalse(summary["browser_requested"])
+        self.assertTrue(summary["browser_toolset_pruned"])
+
+    def test_feishu_chinese_browser_request_is_detected_without_garbled_keywords(self):
+        from gateway.run import _apply_feishu_toolset_cost_controls
+
+        enabled, disabled, summary = _apply_feishu_toolset_cost_controls(
+            platform_key="feishu",
+            message="请打开 https://example.com 并截图给我。",
+            enabled_toolsets=["collab-safe", "browser", "feishu"],
+            disabled_toolsets=[],
+        )
+
+        self.assertIn("browser", enabled)
+        self.assertNotIn("browser", disabled)
+        self.assertTrue(summary["browser_requested"])
+
+    def test_internal_feishu_route_hint_respects_requires_browser_flag(self):
+        from internal.feishu.routing import infer_internal_route_hint
+
+        self.assertEqual(
+            infer_internal_route_hint(
+                {
+                    "route_hint": "modal_heavy_exec",
+                    "requires_browser": False,
+                    "text": "请看一下 https://developers.cloudflare.com/workers/",
+                }
+            ),
+            "modal_heavy_exec",
+        )
+        self.assertEqual(
+            infer_internal_route_hint(
+                {
+                    "route_hint": "modal_heavy_exec",
+                    "requires_browser": True,
+                    "text": "请打开 https://example.com 并截图",
+                }
+            ),
+            "cf_browser_first",
+        )
+
 
 class TestFeishuPostParsing(unittest.TestCase):
     def test_parse_post_content_extracts_text_mentions_and_media_refs(self):
@@ -897,6 +1062,115 @@ class TestAdapterBehavior(unittest.TestCase):
                 order,
                 [("start", "om_1"), ("end", "om_1"), ("start", "om_2"), ("end", "om_2")],
             )
+
+    def test_handle_message_with_guards_skips_duplicate_ack_reaction_for_ingress_namespace(self):
+        hermes_home = os.path.join(os.getcwd(), ".tmp-pytest", "hermes-home")
+        with patch.dict(os.environ, {"HERMES_HOME": hermes_home}, clear=False):
+            from gateway.config import PlatformConfig
+            from gateway.platforms.base import MessageEvent, MessageType
+            from gateway.platforms.feishu import FeishuAdapter
+            from gateway.session import SessionSource
+
+            adapter = FeishuAdapter(PlatformConfig())
+            adapter._add_ack_reaction = AsyncMock(return_value="r_ack")
+            adapter.handle_message = AsyncMock()
+            source = SessionSource(
+                platform=adapter.platform,
+                chat_id="oc_chat",
+                chat_name="Feishu DM",
+                chat_type="dm",
+                user_id="ou_user",
+                user_name="Alice",
+            )
+            raw_message = SimpleNamespace(
+                _hermes_ingress=SimpleNamespace(ack_reaction_requested_at_ms=1712970000000)
+            )
+
+            asyncio.run(
+                adapter._handle_message_with_guards(
+                    MessageEvent(
+                        text="one",
+                        message_type=MessageType.TEXT,
+                        source=source,
+                        message_id="om_1",
+                        raw_message=raw_message,
+                    )
+                )
+            )
+
+            adapter._add_ack_reaction.assert_not_awaited()
+            adapter.handle_message.assert_awaited_once()
+
+    def test_handle_message_with_guards_skips_duplicate_ack_reaction_for_ingress_dict(self):
+        hermes_home = os.path.join(os.getcwd(), ".tmp-pytest", "hermes-home")
+        with patch.dict(os.environ, {"HERMES_HOME": hermes_home}, clear=False):
+            from gateway.config import PlatformConfig
+            from gateway.platforms.base import MessageEvent, MessageType
+            from gateway.platforms.feishu import FeishuAdapter
+            from gateway.session import SessionSource
+
+            adapter = FeishuAdapter(PlatformConfig())
+            adapter._add_ack_reaction = AsyncMock(return_value="r_ack")
+            adapter.handle_message = AsyncMock()
+            source = SessionSource(
+                platform=adapter.platform,
+                chat_id="oc_chat",
+                chat_name="Feishu DM",
+                chat_type="dm",
+                user_id="ou_user",
+                user_name="Alice",
+            )
+            raw_message = {"_hermes_ingress": {"ack_reaction_requested_at_ms": 1712970000000}}
+
+            asyncio.run(
+                adapter._handle_message_with_guards(
+                    MessageEvent(
+                        text="one",
+                        message_type=MessageType.TEXT,
+                        source=source,
+                        message_id="om_1",
+                        raw_message=raw_message,
+                    )
+                )
+            )
+
+            adapter._add_ack_reaction.assert_not_awaited()
+            adapter.handle_message.assert_awaited_once()
+
+    def test_handle_message_with_guards_skips_duplicate_ack_reaction_for_explicit_event_flag(self):
+        hermes_home = os.path.join(os.getcwd(), ".tmp-pytest", "hermes-home")
+        with patch.dict(os.environ, {"HERMES_HOME": hermes_home}, clear=False):
+            from gateway.config import PlatformConfig
+            from gateway.platforms.base import MessageEvent, MessageType
+            from gateway.platforms.feishu import FeishuAdapter
+            from gateway.session import SessionSource
+
+            adapter = FeishuAdapter(PlatformConfig())
+            adapter._add_ack_reaction = AsyncMock(return_value="r_ack")
+            adapter.handle_message = AsyncMock()
+            source = SessionSource(
+                platform=adapter.platform,
+                chat_id="oc_chat",
+                chat_name="Feishu DM",
+                chat_type="dm",
+                user_id="ou_user",
+                user_name="Alice",
+            )
+
+            asyncio.run(
+                adapter._handle_message_with_guards(
+                    MessageEvent(
+                        text="one",
+                        message_type=MessageType.TEXT,
+                        source=source,
+                        message_id="om_1",
+                        ack_reaction_already_requested=True,
+                    )
+                )
+            )
+
+            adapter._add_ack_reaction.assert_not_awaited()
+            adapter.handle_message.assert_awaited_once()
 
     def test_feishu_send_with_retry_respects_audit_toggle_off(self):
         hermes_home = os.path.join(os.getcwd(), ".tmp-pytest", "hermes-home")
@@ -3787,6 +4061,7 @@ class TestFeishuModelPickerAndMenu(unittest.TestCase):
             open_id="ou_owner",
             model_id="moonshotai/kimi-k2.5",
             provider_slug="nvidia",
+            event_chat_type="group",
         )
 
     @patch.dict(os.environ, {}, clear=True)
@@ -3849,6 +4124,140 @@ class TestFeishuModelPickerAndMenu(unittest.TestCase):
             open_id="ou_owner",
             model_id="moonshotai/kimi-k2.5",
             provider_slug="nvidia",
+            event_chat_type="group",
+        )
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_card_action_personality_set_dispatches_synthetic_personality_command(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._dispatch_synthetic_command = AsyncMock()
+
+        data = SimpleNamespace(
+            event=SimpleNamespace(
+                token="ca_personality_1",
+                context=SimpleNamespace(open_chat_id="oc_chat"),
+                operator=SimpleNamespace(open_id="ou_owner"),
+                action=SimpleNamespace(
+                    tag="button",
+                    value={
+                        "hermes_action": "personality_set",
+                        "personality": "cto",
+                    },
+                ),
+            )
+        )
+
+        asyncio.run(adapter._handle_card_action_event(data))
+
+        adapter._dispatch_synthetic_command.assert_awaited_once_with(
+            chat_id="oc_chat",
+            open_id="ou_owner",
+            command_text="/personality cto",
+            event_chat_type="group",
+        )
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_card_action_personality_set_uses_dm_chat_type_when_event_is_p2p(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._dispatch_synthetic_command = AsyncMock()
+
+        data = SimpleNamespace(
+            event=SimpleNamespace(
+                token="ca_personality_dm_1",
+                context=SimpleNamespace(open_chat_id="oc_chat"),
+                chat=SimpleNamespace(chat_type="p2p"),
+                operator=SimpleNamespace(open_id="ou_owner"),
+                action=SimpleNamespace(
+                    tag="button",
+                    value={
+                        "hermes_action": "personality_set",
+                        "personality": "cto",
+                    },
+                ),
+            )
+        )
+
+        asyncio.run(adapter._handle_card_action_event(data))
+
+        adapter._dispatch_synthetic_command.assert_awaited_once_with(
+            chat_id="oc_chat",
+            open_id="ou_owner",
+            command_text="/personality cto",
+            event_chat_type="p2p",
+        )
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_card_action_command_run_dispatches_synthetic_command(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._dispatch_synthetic_command = AsyncMock()
+
+        data = SimpleNamespace(
+            event=SimpleNamespace(
+                token="ca_command_1",
+                context=SimpleNamespace(open_chat_id="oc_chat"),
+                operator=SimpleNamespace(open_id="ou_owner"),
+                action=SimpleNamespace(
+                    tag="button",
+                    value={
+                        "hermes_action": "command_run",
+                        "command_text": "/status",
+                    },
+                ),
+            )
+        )
+
+        asyncio.run(adapter._handle_card_action_event(data))
+
+        adapter._dispatch_synthetic_command.assert_awaited_once_with(
+            chat_id="oc_chat",
+            open_id="ou_owner",
+            command_text="/status",
+            event_chat_type="group",
+        )
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_card_action_skill_combo_apply_dispatches_combo_activation(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._dispatch_skill_combo_activation = AsyncMock()
+
+        data = SimpleNamespace(
+            event=SimpleNamespace(
+                token="ca_combo_1",
+                context=SimpleNamespace(open_chat_id="oc_chat"),
+                operator=SimpleNamespace(open_id="ou_owner"),
+                action=SimpleNamespace(
+                    tag="button",
+                    value={
+                        "hermes_action": "skill_combo_apply",
+                        "combo_id": "cto_ship",
+                        "combo_label": "CTO 交付",
+                        "skills": ["ship", "gov"],
+                        "suggested_personality": "cto",
+                    },
+                ),
+            )
+        )
+
+        asyncio.run(adapter._handle_card_action_event(data))
+
+        adapter._dispatch_skill_combo_activation.assert_awaited_once_with(
+            chat_id="oc_chat",
+            open_id="ou_owner",
+            combo_label="CTO 交付",
+            skills=["ship", "gov"],
+            suggested_personality="cto",
         )
 
     @patch.dict(os.environ, {}, clear=True)

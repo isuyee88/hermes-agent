@@ -355,6 +355,12 @@ def build_session_context_prompt(
                 "Do not claim a user access token is required when the configured target below is enough for the requested action."
             )
             lines.append(
+                "For requests like saving keywords/rows into the default Feishu Bitable, call the native `feishu_bitable_*` tools against the configured default target before asking the user for a link or token again."
+            )
+            lines.append(
+                "If the configured default Bitable target returns 403/404, explain that the current default table target is inaccessible or misconfigured; do not say Feishu Bitable capability is unavailable in general."
+            )
+            lines.append(
                 "For default Hermes model catalog questions, prefer the native Hermes model registry tools first instead of querying the mirrored Bitable table."
             )
             if bitable_app_token:

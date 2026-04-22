@@ -81,7 +81,12 @@ _hermes_home = get_hermes_home()
 
 # Load environment variables from ~/.hermes/.env first.
 # User-managed env files should override stale shell exports on restart.
-from dotenv import load_dotenv  # backward-compat for tests that monkeypatch this symbol
+try:
+    from dotenv import load_dotenv  # backward-compat for tests that monkeypatch this symbol
+except ImportError:  # pragma: no cover - fallback for lean test envs
+    def load_dotenv(*_args, **_kwargs):
+        return False
+
 from hermes_cli.env_loader import load_hermes_dotenv
 _env_path = _hermes_home / '.env'
 load_hermes_dotenv(hermes_home=_hermes_home, project_env=Path(__file__).resolve().parents[1] / '.env')
@@ -236,6 +241,14 @@ from gateway.session import (
 )
 from gateway.delivery import DeliveryRouter
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType
+from gateway.response_clarifiers import (
+    clarify_feishu_browser_refusal,
+    clarify_feishu_workspace_refusal,
+)
+from internal.domain_skills import (
+    build_site_skill_runtime_note,
+    extract_target_url_and_domain as _extract_domain_skill_target,
+)
 
 
 def _normalize_whatsapp_identifier(value: str) -> str:
@@ -281,6 +294,47 @@ def _expand_whatsapp_auth_aliases(identifier: str) -> set:
     return resolved
 
 logger = logging.getLogger(__name__)
+DEFAULT_CLOUDFLARE_AI_GATEWAY_BASE_URL = (
+    "https://gateway.ai.cloudflare.com/v1/"
+    "d1215a30b84b673ef0367010b0e78c10/affiliate-manager"
+)
+GATEWAY_ENFORCED_PROVIDERS = frozenset({"openrouter", "nvidia"})
+
+
+def _normalize_cloudflare_ai_gateway_base_url(raw_url: str | None) -> str:
+    base_url = str(raw_url or "").strip().rstrip("/")
+    if not base_url:
+        return ""
+    lower = base_url.lower()
+    if lower.endswith("/chat/completions"):
+        base_url = base_url[: -len("/chat/completions")]
+        lower = base_url.lower()
+    if lower.endswith("/v1/chat/completions"):
+        base_url = base_url[: -len("/v1/chat/completions")]
+        lower = base_url.lower()
+    if not lower.endswith("/compat"):
+        base_url = f"{base_url}/compat"
+    return base_url.rstrip("/")
+
+
+def _force_cloudflare_gateway_runtime_binding(provider_name: str, runtime: dict[str, Any]) -> dict[str, Any]:
+    normalized_provider = str(provider_name or "").strip().lower()
+    if normalized_provider not in GATEWAY_ENFORCED_PROVIDERS:
+        return runtime
+    api_mode = str(runtime.get("api_mode") or "chat_completions").strip().lower() or "chat_completions"
+    if api_mode != "chat_completions":
+        return runtime
+    gateway_base_url = _normalize_cloudflare_ai_gateway_base_url(
+        os.getenv("CLOUDFLARE_AI_GATEWAY_BASE_URL", DEFAULT_CLOUDFLARE_AI_GATEWAY_BASE_URL)
+    )
+    if not gateway_base_url:
+        return runtime
+    forced = dict(runtime)
+    forced["provider"] = normalized_provider
+    forced["base_url"] = gateway_base_url
+    forced["api_mode"] = "chat_completions"
+    forced["gateway_transport"] = True
+    return forced
 
 INVALID_MODEL_ERROR_MARKERS = (
     "invalid model",
@@ -499,6 +553,220 @@ def _resolve_platform_toolset_controls(
         enabled -= disabled
 
     return sorted(enabled), sorted(disabled)
+
+
+def _message_explicitly_requests_browser_tools(message: str) -> bool:
+    text = str(message or "").strip()
+    if not text:
+        return False
+    lowered = text.lower()
+    if "http://" in lowered or "https://" in lowered or "www." in lowered:
+        return True
+
+    english_keywords = (
+        "browser",
+        "playwright",
+        "camofox",
+        "browserbase",
+        "navigate",
+        "webpage",
+        "website",
+        "click",
+        "scroll",
+        "screenshot",
+        "captcha",
+        "sign in",
+        "log in",
+        "login",
+        "sign up",
+        "register",
+        "fill form",
+        "web automation",
+    )
+    if any(keyword in lowered for keyword in english_keywords):
+        return True
+
+    chinese_keywords = (
+        "浏览器",
+        "网页",
+        "网站",
+        "页面",
+        "点击",
+        "滚动",
+        "截图",
+        "验证码",
+        "登录",
+        "注册",
+        "表单",
+        "自动化",
+        "打开网址",
+        "打开网站",
+        "访问网站",
+        "访问网页",
+        "跳转到",
+        "导航到",
+    )
+    return any(keyword in text for keyword in chinese_keywords)
+
+
+def _message_explicitly_requests_browser_tools(message: str) -> bool:
+    text = str(message or "").strip()
+    if not text:
+        return False
+    lowered = text.lower()
+    target_url, _ = _extract_domain_skill_target(text)
+    explicit_patterns = (
+        "browser",
+        "playwright",
+        "camofox",
+        "browserbase",
+        "browser use",
+        "web automation",
+        "open ",
+        "visit ",
+        "navigate",
+        "click",
+        "scroll",
+        "screenshot",
+        "fill form",
+        "submit",
+        "upload",
+        "captcha",
+        "log in to",
+        "login to",
+        "sign in to",
+        "sign up on",
+        "register on",
+        "打开",
+        "访问",
+        "导航到",
+        "点击",
+        "滚动",
+        "截图",
+        "填写",
+        "提交",
+        "上传",
+        "验证码",
+        "用浏览器",
+        "帮我登录",
+        "登录到",
+        "注册到",
+        "控制台",
+        "后台",
+    )
+    if any(pattern in lowered for pattern in explicit_patterns):
+        return True
+    if target_url:
+        url_with_action_patterns = (
+            "看一下首页并截图",
+            "打开这个网站",
+            "访问这个网站",
+            "open this url",
+            "open this site",
+            "go to this site",
+        )
+        if any(pattern in lowered for pattern in url_with_action_patterns):
+            return True
+    return False
+
+
+def _message_explicitly_requests_browser_tools(message: str) -> bool:
+    text = str(message or "").strip()
+    if not text:
+        return False
+
+    lowered = text.lower()
+    target_url, _ = _extract_domain_skill_target(text)
+    explicit_patterns = (
+        "browser",
+        "playwright",
+        "camofox",
+        "browserbase",
+        "browser use",
+        "web automation",
+        "open ",
+        "visit ",
+        "navigate",
+        "click",
+        "scroll",
+        "screenshot",
+        "fill form",
+        "fill out",
+        "submit",
+        "upload",
+        "captcha",
+        "log in to",
+        "login to",
+        "sign in to",
+        "sign up on",
+        "register on",
+        "\u6253\u5f00",
+        "\u8bbf\u95ee",
+        "\u5bfc\u822a\u5230",
+        "\u70b9\u51fb",
+        "\u6eda\u52a8",
+        "\u622a\u56fe",
+        "\u586b\u5199",
+        "\u63d0\u4ea4",
+        "\u4e0a\u4f20",
+        "\u9a8c\u8bc1\u7801",
+        "\u7528\u6d4f\u89c8\u5668",
+        "\u5e2e\u6211\u767b\u5f55",
+        "\u767b\u5f55\u5230",
+        "\u6ce8\u518c\u5230",
+        "\u63a7\u5236\u53f0",
+        "\u540e\u53f0",
+    )
+    if any(pattern in lowered for pattern in explicit_patterns):
+        return True
+
+    if target_url:
+        url_with_action_patterns = (
+            "\u770b\u4e00\u4e0b\u9996\u9875\u5e76\u622a\u56fe",
+            "\u6253\u5f00\u8fd9\u4e2a\u7f51\u7ad9",
+            "\u8bbf\u95ee\u8fd9\u4e2a\u7f51\u7ad9",
+            "open this url",
+            "open this site",
+            "go to this site",
+        )
+        if any(pattern in lowered for pattern in url_with_action_patterns):
+            return True
+    return False
+
+
+def _apply_feishu_toolset_cost_controls(
+    *,
+    platform_key: str,
+    message: str,
+    enabled_toolsets: list[str],
+    disabled_toolsets: list[str],
+) -> tuple[list[str], list[str], dict[str, Any]]:
+    normalized_enabled = [str(name).strip().lower() for name in (enabled_toolsets or []) if str(name).strip()]
+    normalized_disabled = [str(name).strip().lower() for name in (disabled_toolsets or []) if str(name).strip()]
+    summary = {
+        "platform": platform_key,
+        "browser_requested": False,
+        "browser_toolset_pruned": False,
+        "enabled_toolsets": list(normalized_enabled),
+        "disabled_toolsets": list(normalized_disabled),
+    }
+    if platform_key != "feishu":
+        return normalized_enabled, normalized_disabled, summary
+
+    browser_requested = _message_explicitly_requests_browser_tools(message)
+    summary["browser_requested"] = browser_requested
+    if browser_requested:
+        return normalized_enabled, normalized_disabled, summary
+
+    if "browser" in normalized_enabled:
+        normalized_enabled = [name for name in normalized_enabled if name != "browser"]
+        if "browser" not in normalized_disabled:
+            normalized_disabled = sorted(set(normalized_disabled) | {"browser"})
+        summary["browser_toolset_pruned"] = True
+
+    summary["enabled_toolsets"] = list(normalized_enabled)
+    summary["disabled_toolsets"] = list(normalized_disabled)
+    return normalized_enabled, normalized_disabled, summary
 def _resolve_hermes_bin() -> Optional[list[str]]:
     """Resolve the Hermes update command as argv parts.
 
@@ -859,6 +1127,38 @@ class GatewayRunner:
             pass
         return self.session_store._entries.get(session_key)
 
+    def _build_agent_trace_metadata(
+        self,
+        *,
+        source: SessionSource,
+        session_key: str,
+        route_selection: str | None = None,
+        event_message_id: str | None = None,
+        correlation_suffix: str | None = None,
+        extra: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        metadata: dict[str, Any] = {
+            "channel_type": source.chat_type,
+            "route_selection": route_selection,
+            "chat_id": source.chat_id,
+            "user_id": source.user_id,
+        }
+        message_id = str(event_message_id or "").strip()
+        if message_id:
+            metadata["message_id"] = message_id
+
+        suffix = str(correlation_suffix or message_id or "").strip()
+        if session_key and suffix:
+            metadata["correlation_id"] = f"{session_key}:{suffix}"
+        elif session_key:
+            metadata["correlation_id"] = session_key
+
+        if extra:
+            for key, value in extra.items():
+                if value not in (None, ""):
+                    metadata[key] = value
+        return metadata
+
     @staticmethod
     def _route_selection_label(selection_reason: str | None) -> str:
         mapping = {
@@ -946,6 +1246,34 @@ class GatewayRunner:
             return inferred
         return normalized or inferred
 
+    @staticmethod
+    def _resolve_runtime_route_binding(provider_name: str) -> dict[str, Any] | None:
+        normalized = str(provider_name or "").strip().lower()
+        if not normalized:
+            return None
+        try:
+            from hermes_cli.runtime_provider import resolve_runtime_provider
+
+            runtime = resolve_runtime_provider(requested=normalized) or {}
+            runtime = _force_cloudflare_gateway_runtime_binding(normalized, runtime)
+        except Exception:
+            return None
+
+        base_url = str(runtime.get("base_url") or "").strip()
+        api_key = str(runtime.get("api_key") or "").strip()
+        resolved_provider = str(runtime.get("provider") or normalized).strip().lower() or normalized
+        if not base_url or not api_key:
+            return None
+        return {
+            "provider": resolved_provider,
+            "base_url": base_url,
+            "api_key": api_key,
+            "api_mode": str(runtime.get("api_mode") or "").strip(),
+            "command": runtime.get("command"),
+            "args": list(runtime.get("args") or []),
+            "credential_pool": runtime.get("credential_pool"),
+        }
+
     def _build_recent_route_entries(
         self,
         session_key: str,
@@ -961,7 +1289,7 @@ class GatewayRunner:
             for item in route_debug.get("recent_routes") or []:
                 if isinstance(item, dict):
                     seed.append(item)
-        override = getattr(self, "_session_model_overrides", {}).get(session_key, {}) or {}
+        override = self._get_manual_model_override(session_key)
         if override:
             seed = self._merge_recent_route_entries(
                 seed,
@@ -972,6 +1300,82 @@ class GatewayRunner:
         if provider or model:
             seed = self._merge_recent_route_entries(seed, provider, model, limit=limit)
         return seed[:limit]
+
+    @staticmethod
+    def _is_feishu_session_key(session_key: str | None) -> bool:
+        normalized = str(session_key or "").strip().lower()
+        return normalized.startswith("feishu:") or ":feishu:" in normalized
+
+    def _is_manual_model_override(self, session_key: str | None, override: dict[str, Any] | None) -> bool:
+        if not isinstance(override, dict):
+            return False
+        model_name = str(override.get("model") or "").strip()
+        if not model_name:
+            return False
+        source_platform = str(override.get("source_platform") or "").strip().lower()
+        if source_platform:
+            if source_platform != "feishu":
+                return False
+            return bool(override.get("manual_model_lock", False))
+        return self._is_feishu_session_key(session_key)
+
+    def _get_manual_model_override(self, session_key: str | None) -> dict[str, Any]:
+        override = getattr(self, "_session_model_overrides", {}).get(session_key or "", {}) or {}
+        return override if self._is_manual_model_override(session_key, override) else {}
+
+    def _store_manual_model_override(
+        self,
+        *,
+        session_key: str,
+        source: SessionSource,
+        previous_model: str,
+        result: Any,
+    ) -> None:
+        if source.platform != Platform.FEISHU:
+            return
+        if not hasattr(self, "_pending_model_notes"):
+            self._pending_model_notes = {}
+        if not hasattr(self, "_session_model_overrides"):
+            self._session_model_overrides = {}
+
+        self._pending_model_notes[session_key] = (
+            f"[Note: model was just switched from {previous_model} to {result.new_model} "
+            f"via {result.provider_label or result.target_provider}. "
+            f"Adjust your self-identification accordingly.]"
+        )
+        self._session_model_overrides[session_key] = {
+            "model": result.new_model,
+            "provider": result.target_provider,
+            "api_key": result.api_key,
+            "base_url": result.base_url,
+            "api_mode": result.api_mode,
+            "manual_model_lock": True,
+            "source_platform": source.platform.value,
+        }
+        if getattr(self, "session_store", None) is not None:
+            self.session_store.update_session(
+                session_key,
+                route_lease=self._build_session_route_lease(
+                    {
+                        "provider": result.target_provider,
+                        "model": result.new_model,
+                        "base_url": result.base_url,
+                        "api_mode": result.api_mode,
+                    },
+                    selection_reason="explicit_override",
+                ),
+                route_debug=self._build_route_debug_payload(
+                    session_key=session_key,
+                    provider=result.target_provider,
+                    model=result.new_model,
+                    base_url=result.base_url,
+                    selection_reason="explicit_override",
+                ),
+                route_metrics=self._increment_route_metric(
+                    getattr(self._get_session_entry(session_key), "route_metrics", {}) or {},
+                    "explicit_override",
+                ),
+            )
 
     def _load_chat_model_registry_index(self) -> dict[str, list[dict[str, Any]]]:
         try:
@@ -1069,7 +1473,7 @@ class GatewayRunner:
         current_base_url: str,
         current_api_key: str,
     ) -> dict[str, Any]:
-        override = getattr(self, "_session_model_overrides", {}).get(session_key, {}) or {}
+        override = self._get_manual_model_override(session_key)
         entry = self._get_session_entry(session_key)
         route_lease = getattr(entry, "route_lease", None) if entry else None
         route_debug = getattr(entry, "route_debug", None) if entry else None
@@ -1310,6 +1714,7 @@ class GatewayRunner:
         return [
             f"Current provider: {get_label(provider_slug)} (`{provider_slug}`)",
             f"Current model: `{model_name}`",
+            "Transport: `cloudflare_ai_gateway`",
             f"Route mode: `{self._route_selection_label(route_state.get('selection_reason'))}`",
             f"Manual lock: `{'yes' if route_state.get('manual_locked') else 'no'}`",
         ]
@@ -1356,7 +1761,7 @@ class GatewayRunner:
         lines.extend(
             [
                 "",
-                f"Switch: `/model <name> --provider {provider_slug}`",
+                f"Switch: `/model <model-id> --provider {provider_slug}`",
                 f"Expanded list: `/model list --provider {provider_slug}`",
             ]
         )
@@ -1425,6 +1830,7 @@ class GatewayRunner:
             from hermes_cli.runtime_provider import resolve_runtime_provider
 
             runtime = resolve_runtime_provider(requested=requested_provider)
+            runtime = _force_cloudflare_gateway_runtime_binding(requested_provider, runtime or {})
             provider_name = str(runtime.get("provider") or requested_provider).strip().lower() or requested_provider
             api_key = str(runtime.get("api_key") or "").strip()
             base_url = str(runtime.get("base_url") or "").strip()
@@ -1481,6 +1887,8 @@ class GatewayRunner:
         current_api_key: str,
     ):
         async def _on_model_selected(_chat_id: str, model_id: str, provider_slug: str) -> str:
+            if source.platform != Platform.FEISHU:
+                return "Manual model lock is only supported in Feishu. Dynamic routing remains active."
             target_session_keys = {session_key}
             if (
                 _chat_id
@@ -1544,48 +1952,13 @@ class GatewayRunner:
                     except Exception as exc:
                         logger.warning("Picker model switch failed for cached agent: %s", exc)
 
-            if not hasattr(self, "_pending_model_notes"):
-                self._pending_model_notes = {}
-            note_text = (
-                f"[Note: model was just switched from {current_model} to {result.new_model} "
-                f"via {result.provider_label or result.target_provider}. "
-                f"Adjust your self-identification accordingly.]"
-            )
-            if not hasattr(self, "_session_model_overrides"):
-                self._session_model_overrides = {}
             for target_key in target_session_keys:
-                self._pending_model_notes[target_key] = note_text
-                self._session_model_overrides[target_key] = {
-                    "model": result.new_model,
-                    "provider": result.target_provider,
-                    "api_key": result.api_key,
-                    "base_url": result.base_url,
-                    "api_mode": result.api_mode,
-                }
-                if getattr(self, "session_store", None) is not None:
-                    self.session_store.update_session(
-                        target_key,
-                        route_lease=self._build_session_route_lease(
-                            {
-                                "provider": result.target_provider,
-                                "model": result.new_model,
-                                "base_url": result.base_url,
-                                "api_mode": result.api_mode,
-                            },
-                            selection_reason="explicit_override",
-                        ),
-                        route_debug=self._build_route_debug_payload(
-                            session_key=target_key,
-                            provider=result.target_provider,
-                            model=result.new_model,
-                            base_url=result.base_url,
-                            selection_reason="explicit_override",
-                        ),
-                        route_metrics=self._increment_route_metric(
-                            getattr(self._get_session_entry(target_key), "route_metrics", {}) or {},
-                            "explicit_override",
-                        ),
-                    )
+                self._store_manual_model_override(
+                    session_key=target_key,
+                    source=source,
+                    previous_model=current_model,
+                    result=result,
+                )
 
             lines = [f"Model switched to `{result.new_model}`"]
             lines.append(f"Provider: {result.provider_label or result.target_provider}")
@@ -1600,7 +1973,7 @@ class GatewayRunner:
                 if mi.has_cost_data():
                     lines.append(f"Cost: {mi.format_cost()}")
                 lines.append(f"Capabilities: {mi.format_capabilities()}")
-            lines.append("_(session only - use `/model <name> --global` to persist)_")
+            lines.append("_(session only - other requests continue on dynamic routing by default)_")
             return "\n".join(lines)
 
         return _on_model_selected
@@ -1896,7 +2269,10 @@ class GatewayRunner:
         success_ts = int(last_success_at or selected_ts)
         base_url = str(route.get("base_url") or "").strip()
         provider_name = self._normalize_route_provider(route.get("provider"), base_url)
-        if provider_name == "openrouter":
+        normalized_base_url = base_url.lower()
+        if "gateway.ai.cloudflare.com" in normalized_base_url:
+            api_key_source = "CLOUDFLARE_API_TOKEN"
+        elif provider_name == "openrouter":
             api_key_source = "OPENROUTER_API_KEY"
         elif provider_name == "nvidia":
             api_key_source = "NVIDIA_API_KEY"
@@ -1970,20 +2346,30 @@ class GatewayRunner:
         model_name = str(lease.get("model") or "").strip()
         if not provider_name or not model_name:
             return None
-        resolved_runtime: dict[str, Any] = {}
-        try:
-            from hermes_cli.runtime_provider import resolve_runtime_provider
+        resolved_runtime = (
+            self._resolve_runtime_route_binding(provider_name)
+            if provider_name in {"openrouter", "nvidia"}
+            else None
+        ) or {}
+        if not resolved_runtime:
+            try:
+                from hermes_cli.runtime_provider import resolve_runtime_provider
 
-            resolved_runtime = resolve_runtime_provider(
-                requested=provider_name,
-                explicit_base_url=base_url or None,
-            ) or {}
-        except Exception:
-            resolved_runtime = {}
+                resolved_runtime = resolve_runtime_provider(
+                    requested=provider_name,
+                    explicit_base_url=base_url or None,
+                ) or {}
+            except Exception:
+                resolved_runtime = {}
 
         runtime = {
             "api_key": str(resolved_runtime.get("api_key") or "").strip(),
-            "base_url": base_url or resolved_runtime.get("base_url") or runtime_kwargs.get("base_url"),
+            "base_url": str(
+                resolved_runtime.get("base_url")
+                or base_url
+                or runtime_kwargs.get("base_url")
+                or ""
+            ).strip(),
             "provider": str(resolved_runtime.get("provider") or provider_name or runtime_kwargs.get("provider") or "").strip().lower(),
             "api_mode": (
                 str(
@@ -2051,7 +2437,7 @@ class GatewayRunner:
         route_lease = None
         override = {}
         if session_key:
-            override = getattr(self, "_session_model_overrides", {}).get(session_key, {}) or {}
+            override = self._get_manual_model_override(session_key)
             entry = self._get_session_entry(session_key)
             route_lease = getattr(entry, "route_lease", None) if entry else None
 
@@ -2301,6 +2687,63 @@ class GatewayRunner:
         if effort and effort.strip() and result is None:
             logger.warning("Unknown reasoning_effort '%s', using default (medium)", effort)
         return result
+
+    @staticmethod
+    def _resolve_agent_execution_profile(
+        platform_key: str,
+        *,
+        max_iterations: int,
+        reasoning_config: dict | None,
+        max_tokens: int | None = None,
+        ephemeral_prompt: str = "",
+    ) -> dict[str, Any]:
+        profile = {
+            "max_iterations": max_iterations,
+            "reasoning_config": reasoning_config,
+            "max_tokens": max_tokens,
+            "ephemeral_prompt": ephemeral_prompt or "",
+        }
+        if str(platform_key or "").strip().lower() != "feishu":
+            return profile
+
+        def _read_int(name: str, default: int, *, minimum: int = 0) -> int:
+            raw = str(os.getenv(name, str(default)) or "").strip()
+            try:
+                return max(minimum, int(raw))
+            except (TypeError, ValueError):
+                return default
+
+        feishu_iterations = _read_int("HERMES_FEISHU_AGENT_MAX_ITERATIONS", 12, minimum=1)
+        profile["max_iterations"] = min(max_iterations, feishu_iterations)
+
+        feishu_max_tokens = _read_int("HERMES_FEISHU_AGENT_MAX_TOKENS", 900, minimum=0)
+        if feishu_max_tokens > 0:
+            profile["max_tokens"] = feishu_max_tokens
+
+        feishu_reasoning_effort = str(os.getenv("HERMES_FEISHU_REASONING_EFFORT", "none") or "").strip()
+        if feishu_reasoning_effort:
+            from hermes_constants import parse_reasoning_effort
+
+            parsed_reasoning = parse_reasoning_effort(feishu_reasoning_effort)
+            if parsed_reasoning is not None:
+                profile["reasoning_config"] = parsed_reasoning
+
+        default_feishu_prompt = (
+            "Feishu chat profile: respond in concise Chinese by default. "
+            "Lead with the answer, keep to 1-3 short paragraphs or one flat list unless the user asks for depth. "
+            "Prefer direct execution status, concrete findings, and next action. "
+            "Avoid long preambles and unnecessary exposition."
+        )
+        feishu_prompt = str(
+            os.getenv("HERMES_FEISHU_RESPONSE_STYLE_PROMPT", default_feishu_prompt) or ""
+        ).strip()
+        if feishu_prompt:
+            profile["ephemeral_prompt"] = (
+                (profile["ephemeral_prompt"] + "\n\n" + feishu_prompt).strip()
+                if profile["ephemeral_prompt"]
+                else feishu_prompt
+            )
+        return profile
 
     @staticmethod
     def _load_show_reasoning() -> bool:
@@ -3621,6 +4064,9 @@ class GatewayRunner:
         if canonical == "insights":
             return await self._handle_insights_command(event)
 
+        if canonical == "kpi":
+            return await self._handle_kpi_command(event)
+
         if canonical == "reload-mcp":
             return await self._handle_reload_mcp_command(event)
 
@@ -3813,6 +4259,12 @@ class GatewayRunner:
     async def _handle_message_with_agent(self, event, source, _quick_key: str):
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
+        _msg_perf_started_at = time.perf_counter()
+        _phase_timings: dict[str, int] = {}
+
+        def _capture_phase(name: str, started_at: float) -> None:
+            _phase_timings[name] = int((time.perf_counter() - started_at) * 1000)
+
         _platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
         _message_id = getattr(event, "message_id", "") or ""
         _msg_preview = (event.text or "")[:80].replace("\n", " ")
@@ -3823,7 +4275,9 @@ class GatewayRunner:
         )
 
         # Get or create session
+        _session_lookup_started_at = time.perf_counter()
         session_entry = self.session_store.get_or_create_session(source)
+        _capture_phase("session_lookup_elapsed_ms", _session_lookup_started_at)
         session_key = session_entry.session_key
         logger.info(
             "[Gateway] session ready platform=%s chat=%s message_id=%s session=%s session_id=%s",
@@ -3840,14 +4294,17 @@ class GatewayRunner:
             or getattr(session_entry, "was_auto_reset", False)
         )
         if _is_new_session:
+            _session_start_hook_started_at = time.perf_counter()
             await self.hooks.emit("session:start", {
                 "platform": source.platform.value if source.platform else "",
                 "user_id": source.user_id,
                 "session_id": session_entry.session_id,
                 "session_key": session_key,
             })
+            _capture_phase("session_start_hook_elapsed_ms", _session_start_hook_started_at)
         
         # Build session context
+        _context_prepare_started_at = time.perf_counter()
         context = build_session_context(source, self.config, session_entry)
         
         # Set environment variables for tools
@@ -3865,6 +4322,7 @@ class GatewayRunner:
 
         # Build the context prompt to inject
         context_prompt = build_session_context_prompt(context, redact_pii=_redact_pii)
+        _capture_phase("context_prepare_elapsed_ms", _context_prepare_started_at)
         
         # If the previous session expired and was auto-reset, prepend a notice
         # so the agent knows this is a fresh conversation (not an intentional /reset).
@@ -3924,39 +4382,46 @@ class GatewayRunner:
             session_entry.was_auto_reset = False
             session_entry.auto_reset_reason = None
 
-        # Auto-load skill for DM topic bindings (e.g., Telegram Private Chat Topics)
-        # Only inject on NEW sessions — for ongoing conversations the skill content
-        # is already in the conversation history from the first message.
-        if _is_new_session and getattr(event, "auto_skill", None):
+        # Auto-load configured startup skills for new sessions so the first turn
+        # starts with the project's operating system already attached.
+        if _is_new_session:
             try:
-                from agent.skill_commands import _load_skill_payload, _build_skill_message
-                _skill_name = event.auto_skill
-                _loaded = _load_skill_payload(_skill_name, task_id=_quick_key)
-                if _loaded:
-                    _loaded_skill, _skill_dir, _display_name = _loaded
-                    _activation_note = (
-                        f'[SYSTEM: This conversation is in a topic with the "{_display_name}" skill '
-                        f"auto-loaded. Follow its instructions for the duration of this session.]"
-                    )
-                    _skill_msg = _build_skill_message(
-                        _loaded_skill, _skill_dir, _activation_note,
+                from agent.skill_commands import (
+                    build_session_start_skills_message,
+                    get_configured_startup_skills,
+                )
+
+                _platform_name = source.platform.value if source.platform else None
+                _startup_skills = []
+                if getattr(event, "auto_skill", None):
+                    _startup_skills.append(event.auto_skill)
+                _startup_skills.extend(get_configured_startup_skills(platform=_platform_name))
+
+                if _startup_skills:
+                    _skill_msg, _loaded_skills, _missing_skills = build_session_start_skills_message(
+                        _startup_skills,
                         user_instruction=event.text,
+                        task_id=_quick_key,
                     )
                     if _skill_msg:
                         event.text = _skill_msg
                         logger.info(
-                            "[Gateway] Auto-loaded skill '%s' for DM topic session %s",
-                            _skill_name, session_key,
+                            "[Gateway] Auto-loaded startup skills %s for session %s platform=%s",
+                            ",".join(_loaded_skills),
+                            session_key,
+                            _platform_name or "unknown",
                         )
-                else:
-                    logger.warning(
-                        "[Gateway] DM topic skill '%s' not found in available skills",
-                        _skill_name,
-                    )
+                    for _missing_skill in _missing_skills:
+                        logger.warning(
+                            "[Gateway] Configured startup skill '%s' was not found for platform=%s",
+                            _missing_skill,
+                            _platform_name or "unknown",
+                        )
             except Exception as e:
-                logger.warning("[Gateway] Failed to auto-load topic skill '%s': %s", event.auto_skill, e)
+                logger.warning("[Gateway] Failed to auto-load configured startup skills: %s", e)
 
         # Load conversation history from transcript
+        _history_prepare_started_at = time.perf_counter()
         history = self.session_store.load_transcript(session_entry.session_id)
         
         # -----------------------------------------------------------------
@@ -4191,6 +4656,7 @@ class GatewayRunner:
                         logger.warning(
                             "Session hygiene auto-compress failed: %s", e
                         )
+        _capture_phase("history_prepare_elapsed_ms", _history_prepare_started_at)
 
         # First-message onboarding -- only on the very first interaction ever
         if not history and not self.session_store.has_any_sessions():
@@ -4251,6 +4717,91 @@ class GatewayRunner:
         # tool even when they appear in the same message.
         # -----------------------------------------------------------------
         message_text = event.text or ""
+        raw_message = getattr(event, "raw_message", None)
+        ingress_meta = raw_message.get("_hermes_ingress") if isinstance(raw_message, dict) else {}
+        site_prefetch = ingress_meta.get("site_prefetch") if isinstance(ingress_meta, dict) else {}
+        if isinstance(site_prefetch, dict):
+            _prefetch_confidence = float(site_prefetch.get("confidence") or 0.0)
+            _prefetch_parts = [
+                "Cloudflare site prefetch (internal hint, not user-authored):",
+                f"category={str(site_prefetch.get('category') or '').strip()}",
+                f"mode={str(site_prefetch.get('mode') or '').strip()}",
+                f"domain={str(site_prefetch.get('domain') or '').strip()}",
+                f"intent={str(site_prefetch.get('intent') or '').strip()}",
+            ]
+            _prefetch_final_url = str(site_prefetch.get("final_url") or "").strip()
+            _prefetch_page_title = str(site_prefetch.get("page_title") or "").strip()
+            _prefetch_summary = str(site_prefetch.get("summary") or "").strip()
+            _prefetch_candidates = [
+                str(item).strip()
+                for item in (site_prefetch.get("candidate_urls") or [])
+                if str(item or "").strip()
+            ]
+            _prefetch_nav = [
+                str(item).strip()
+                for item in (site_prefetch.get("top_nav_links") or [])
+                if str(item or "").strip()
+            ]
+            _prefetch_sections = [
+                str(item).strip()
+                for item in (site_prefetch.get("sections") or [])
+                if str(item or "").strip()
+            ]
+            _prefetch_actions = [
+                str(item).strip()
+                for item in (site_prefetch.get("primary_actions") or [])
+                if str(item or "").strip()
+            ]
+            _prefetch_forms = [
+                str(item).strip()
+                for item in (site_prefetch.get("forms_summary") or [])
+                if str(item or "").strip()
+            ]
+            _prefetch_dialog = [
+                str(item).strip()
+                for item in (site_prefetch.get("dialog_or_banner") or [])
+                if str(item or "").strip()
+            ]
+            _prefetch_direct_target = _prefetch_final_url or (_prefetch_candidates[0] if _prefetch_candidates else "")
+            _prefetch_category = str(site_prefetch.get("category") or "").strip()
+            _prefetch_direct_instruction = ""
+            if _prefetch_category == "site_content" and _prefetch_confidence >= 0.8 and _prefetch_direct_target:
+                _prefetch_direct_instruction = (
+                    f"direct_navigation_rule=content_direct; direct_navigation_target={_prefetch_direct_target}; "
+                    "start from this URL directly and do not explore the homepage first unless it fails"
+                )
+            elif _prefetch_category == "site_interactive_light" and _prefetch_confidence >= 0.75 and _prefetch_direct_target:
+                _prefetch_direct_instruction = (
+                    f"direct_navigation_rule=interaction_direct; direct_navigation_target={_prefetch_direct_target}; "
+                    "open this URL first and follow the discovered form/action structure before blind homepage exploration"
+                )
+            if _prefetch_final_url:
+                _prefetch_parts.append(f"final_url={_prefetch_final_url}")
+            if _prefetch_page_title:
+                _prefetch_parts.append(f"page_title={_prefetch_page_title}")
+            if _prefetch_summary:
+                _prefetch_parts.append(f"summary={_prefetch_summary}")
+            if _prefetch_candidates:
+                _prefetch_parts.append(f"candidate_urls={'; '.join(_prefetch_candidates[:8])}")
+            if _prefetch_nav:
+                _prefetch_parts.append(f"top_nav_links={'; '.join(_prefetch_nav[:8])}")
+            if _prefetch_sections:
+                _prefetch_parts.append(f"sections={'; '.join(_prefetch_sections[:8])}")
+            if _prefetch_actions:
+                _prefetch_parts.append(f"primary_actions={'; '.join(_prefetch_actions[:8])}")
+            if _prefetch_forms:
+                _prefetch_parts.append(f"forms={'; '.join(_prefetch_forms[:6])}")
+            if _prefetch_dialog:
+                _prefetch_parts.append(f"dialog_or_banner={'; '.join(_prefetch_dialog[:4])}")
+            if _prefetch_direct_instruction:
+                _prefetch_parts.append(_prefetch_direct_instruction)
+            message_text = f"[{' | '.join(part for part in _prefetch_parts if part)}]\n\n{message_text}"
+
+        _site_skill_note = build_site_skill_runtime_note(
+            raw_message if isinstance(raw_message, dict) else {"text": message_text}
+        )
+        if _site_skill_note:
+            message_text = f"{_site_skill_note}\n\n{message_text}"
 
         # -----------------------------------------------------------------
         # Sender attribution for shared thread sessions.
@@ -4437,6 +4988,8 @@ class GatewayRunner:
                 session_key,
                 len(history),
             )
+            _capture_phase("pre_agent_elapsed_ms", _msg_perf_started_at)
+            _run_agent_started_at = time.perf_counter()
             agent_result = await self._run_agent(
                 message=message_text,
                 context_prompt=context_prompt,
@@ -4446,6 +4999,23 @@ class GatewayRunner:
                 session_key=session_key,
                 event_message_id=event.message_id,
             )
+            _capture_phase("run_agent_elapsed_ms", _run_agent_started_at)
+            try:
+                observers = getattr(self, "_agent_run_observers", None)
+                observer = observers.get(session_key) if isinstance(observers, dict) else None
+                if callable(observer):
+                    observer(
+                        {
+                            "session_key": session_key,
+                            "session_id": session_entry.session_id,
+                            "message_id": _message_id,
+                            "agent_result": dict(agent_result or {}) if isinstance(agent_result, dict) else {},
+                            "phase_timings": dict(_phase_timings),
+                        }
+                    )
+            except Exception as exc:
+                logger.debug("[Gateway] agent run observer failed for session %s: %s", session_key, exc)
+            _post_agent_finalize_started_at = time.perf_counter()
 
             # Stop persistent typing indicator now that the agent is done
             try:
@@ -4472,8 +5042,8 @@ class GatewayRunner:
                 bool(agent_result.get("failed")),
                 _already_sent,
                 _api_calls,
-                self._effective_provider or getattr(source.platform, "value", None) or "",
-                self._effective_model or _resolve_gateway_model(),
+                getattr(self, "_effective_provider", None) or getattr(source.platform, "value", None) or "",
+                getattr(self, "_effective_model", None) or _resolve_gateway_model(),
             )
             logger.info(
                 "response ready: platform=%s chat=%s time=%.1fs api_calls=%d response=%d chars",
@@ -4508,6 +5078,18 @@ class GatewayRunner:
                         f"The request failed: {str(error_detail)[:300]}\n"
                         "Try again or use /reset to start a fresh session."
                     )
+
+            if source.platform == Platform.FEISHU and response:
+                response = clarify_feishu_browser_refusal(
+                    response,
+                    user_message=message_text,
+                    agent_messages=agent_messages,
+                )
+                response = clarify_feishu_workspace_refusal(
+                    response,
+                    user_message=message_text,
+                    agent_messages=agent_messages,
+                )
 
             # If the agent's session_id changed during compression, update
             # session_entry so transcript writes below go to the right session.
@@ -4628,13 +5210,18 @@ class GatewayRunner:
             # Token counts and model are now persisted by the agent directly.
             # Keep only last_prompt_tokens here for context-window tracking and
             # compression decisions.
+            _session_update_kwargs = {
+                "last_prompt_tokens": agent_result.get("last_prompt_tokens", 0),
+            }
+            for _route_key in ("route_lease", "route_debug", "route_metrics"):
+                _route_value = agent_result.get(_route_key)
+                if _route_value is not None:
+                    _session_update_kwargs[_route_key] = _route_value
             self.session_store.update_session(
                 session_entry.session_key,
-                last_prompt_tokens=agent_result.get("last_prompt_tokens", 0),
-                route_lease=agent_result.get("route_lease"),
-                route_debug=agent_result.get("route_debug"),
-                route_metrics=agent_result.get("route_metrics"),
+                **_session_update_kwargs,
             )
+            _capture_phase("post_agent_finalize_elapsed_ms", _post_agent_finalize_started_at)
 
             # Auto voice reply: send TTS audio before the text response
             if self._should_send_voice_reply(event, response, agent_messages, already_sent=_already_sent):
@@ -4660,6 +5247,18 @@ class GatewayRunner:
                         await self._deliver_media_from_response(
                             response, event, _media_adapter,
                         )
+                _phase_timings["total_elapsed_ms"] = int((time.perf_counter() - _msg_perf_started_at) * 1000)
+                logger.warning(
+                    "[Gateway] message pipeline done platform=%s chat=%s message_id=%s session=%s "
+                    "response_kind=already_sent response_len=%d api_calls=%d phase_timings=%s",
+                    _platform_name,
+                    source.chat_id or "unknown",
+                    _message_id,
+                    session_key,
+                    len(response or ""),
+                    _api_calls,
+                    json.dumps(_phase_timings, sort_keys=True),
+                )
                 return None
 
             if not response:
@@ -4672,6 +5271,21 @@ class GatewayRunner:
                     session_key,
                     bool(agent_result.get("failed")),
                 )
+            _phase_timings["total_elapsed_ms"] = int((time.perf_counter() - _msg_perf_started_at) * 1000)
+            logger.warning(
+                "[Gateway] message pipeline done platform=%s chat=%s message_id=%s session=%s "
+                "response_kind=%s response_len=%d failed=%s already_sent=%s api_calls=%d phase_timings=%s",
+                _platform_name,
+                source.chat_id or "unknown",
+                _message_id,
+                session_key,
+                "text" if response else "empty",
+                len(response or ""),
+                bool(agent_result.get("failed")),
+                _already_sent,
+                _api_calls,
+                json.dumps(_phase_timings, sort_keys=True),
+            )
             return response
             
         except Exception as e:
@@ -4723,6 +5337,17 @@ class GatewayRunner:
                     )
                 elif status_code == 400:
                     status_hint = " The request was rejected by the API."
+            _phase_timings["total_elapsed_ms"] = int((time.perf_counter() - _msg_perf_started_at) * 1000)
+            logger.warning(
+                "[Gateway] message pipeline failed platform=%s chat=%s message_id=%s session=%s "
+                "error_type=%s phase_timings=%s",
+                _platform_name,
+                source.chat_id or "unknown",
+                _message_id,
+                locals().get("session_key", _quick_key),
+                error_type,
+                json.dumps(_phase_timings, sort_keys=True),
+            )
             return (
                 f"Sorry, I encountered an error ({error_type}).\n"
                 f"{error_detail}\n"
@@ -5073,19 +5698,15 @@ class GatewayRunner:
         return "\n".join(lines)
     
     async def _handle_model_command(self, event: MessageEvent) -> Optional[str]:
-        """Handle /model command — switch model for this session.
+        """Handle /model command.
 
         Supports:
-          /model                              — interactive picker (Telegram/Discord) or text list
-          /model <name>                       — switch for this session only
-          /model <name> --global              — switch and persist to config.yaml
-          /model <name> --provider <provider> — switch provider + model
-          /model --provider <provider>        — switch to provider, auto-detect model
+          /model                              — show current dynamic routing status and model options
+          /model <model-id>                       — Feishu session-only explicit model lock
+          /model <model-id> --provider <provider> — Feishu session-only explicit model lock
+          /model --provider <provider>            — browse provider catalog only
         """
-        import yaml
-        from hermes_cli.model_switch import (
-            switch_model as _switch_model, parse_model_flags,
-        )
+        from hermes_cli.model_switch import parse_model_flags
         from hermes_cli.providers import normalize_provider
 
         raw_args = event.get_command_args().strip()
@@ -5094,8 +5715,6 @@ class GatewayRunner:
         model_input, explicit_provider, persist_global = parse_model_flags(raw_args)
         explicit_provider = normalize_provider(explicit_provider) if explicit_provider else ""
         current_model, current_provider, current_base_url, current_api_key, _user_provs = self._load_model_runtime_config()
-        config_path = _hermes_home / "config.yaml"
-
         source = event.source
         session_key = self._session_key_for_source(source)
         route_state = self._get_active_route_state(
@@ -5109,6 +5728,7 @@ class GatewayRunner:
         current_provider = route_state["current_provider"]
         current_base_url = route_state["current_base_url"]
         current_api_key = route_state["current_api_key"]
+        manual_switch_supported = source.platform == Platform.FEISHU
 
         list_command = model_input.lower() if model_input else ""
         if list_command in {"list", "more"}:
@@ -5132,6 +5752,19 @@ class GatewayRunner:
                 expanded=True,
                 start_index=int(self._session_model_list_offsets.get(page_key, 0)),
             )
+
+        if model_input and not manual_switch_supported:
+            lines = [*self._render_route_status_lines(route_state), ""]
+            lines.append("Manual model lock is only supported in Feishu.")
+            lines.append("Use `Feishu /model <model-id>` when you need to pin a specific model for the current session.")
+            lines.append("All other sessions continue with dynamic routing.")
+            return "\n".join(lines)
+
+        if model_input and persist_global:
+            lines = [*self._render_route_status_lines(route_state), ""]
+            lines.append("`/model --global` is disabled in chat.")
+            lines.append("Feishu only keeps session-scoped explicit model IDs; all other traffic stays on dynamic routing.")
+            return "\n".join(lines)
 
         # No args: show interactive picker (Telegram/Discord) or text list
         if not model_input and not explicit_provider:
@@ -5170,6 +5803,8 @@ class GatewayRunner:
                         _chat_id: str, model_id: str, provider_slug: str
                     ) -> str:
                         """Perform the model switch and return confirmation text."""
+                        if _source.platform != Platform.FEISHU:
+                            return "Manual model lock is only supported in Feishu. Dynamic routing remains active."
                         target_session_keys = {_session_key}
                         if (
                             _chat_id
@@ -5232,49 +5867,13 @@ class GatewayRunner:
                                 except Exception as exc:
                                     logger.warning("Picker model switch failed for cached agent: %s", exc)
 
-                        # Store model note + session override
-                        if not hasattr(_self, "_pending_model_notes"):
-                            _self._pending_model_notes = {}
-                        note_text = (
-                            f"[Note: model was just switched from {_cur_model} to {result.new_model} "
-                            f"via {result.provider_label or result.target_provider}. "
-                            f"Adjust your self-identification accordingly.]"
-                        )
-                        if not hasattr(_self, "_session_model_overrides"):
-                            _self._session_model_overrides = {}
                         for target_key in target_session_keys:
-                            _self._pending_model_notes[target_key] = note_text
-                            _self._session_model_overrides[target_key] = {
-                                "model": result.new_model,
-                                "provider": result.target_provider,
-                                "api_key": result.api_key,
-                                "base_url": result.base_url,
-                                "api_mode": result.api_mode,
-                            }
-                            if getattr(_self, "session_store", None) is not None:
-                                _self.session_store.update_session(
-                                    target_key,
-                                    route_lease=_self._build_session_route_lease(
-                                        {
-                                            "provider": result.target_provider,
-                                            "model": result.new_model,
-                                            "base_url": result.base_url,
-                                            "api_mode": result.api_mode,
-                                        },
-                                        selection_reason="explicit_override",
-                                    ),
-                                    route_debug=_self._build_route_debug_payload(
-                                        session_key=target_key,
-                                        provider=result.target_provider,
-                                        model=result.new_model,
-                                        base_url=result.base_url,
-                                        selection_reason="explicit_override",
-                                    ),
-                                    route_metrics=_self._increment_route_metric(
-                                        getattr(_self._get_session_entry(target_key), "route_metrics", {}) or {},
-                                        "explicit_override",
-                                    ),
-                                )
+                            _self._store_manual_model_override(
+                                session_key=target_key,
+                                source=_source,
+                                previous_model=_cur_model,
+                                result=result,
+                            )
 
                         # Build confirmation text
                         plabel = result.provider_label or result.target_provider
@@ -5291,7 +5890,7 @@ class GatewayRunner:
                             if mi.has_cost_data():
                                 lines.append(f"Cost: {mi.format_cost()}")
                             lines.append(f"Capabilities: {mi.format_capabilities()}")
-                        lines.append("_(session only — use `/model <name> --global` to persist)_")
+                        lines.append("_(session only — other requests continue on dynamic routing by default)_")
                         return "\n".join(lines)
 
                     metadata = {}
@@ -5346,13 +5945,13 @@ class GatewayRunner:
                 lines.append(f"  Expanded: `/model list --provider {provider_record['slug']}`")
                 lines.append("")
 
-            lines.append("`/model <name>` — switch model")
-            lines.append("`/model <name> --provider <slug>` — switch provider")
-            lines.append("`/model <name> --global` — persist")
+            lines.append("`/model <model-id>` — Feishu session-only explicit model lock")
+            lines.append("`/model <model-id> --provider <slug>` — Optional upstream catalog hint for the lock")
+            lines.append("All execution still routes through Cloudflare AI Gateway.")
             lines[-3:] = [
-                "`/model <name>` - switch model on the current provider",
-                "`/model <name> --provider <slug>` - switch provider + model",
-                "`/model <name> --global` - persist the new default",
+                "`/model <model-id>` - Feishu session-only explicit model lock",
+                "`/model <model-id> --provider <slug>` - Optional upstream catalog hint for the lock",
+                "All execution still routes through Cloudflare AI Gateway.",
             ]
             return "\n".join(lines)
 
@@ -5402,73 +6001,18 @@ class GatewayRunner:
             except Exception as exc:
                 logger.warning("In-place model switch failed for cached agent: %s", exc)
 
-        # Store a note to prepend to the next user message so the model
-        # knows about the switch (avoids system messages mid-history).
-        if not hasattr(self, "_pending_model_notes"):
-            self._pending_model_notes = {}
-        self._pending_model_notes[session_key] = (
-            f"[Note: model was just switched from {current_model} to {result.new_model} "
-            f"via {result.provider_label or result.target_provider}. "
-            f"Adjust your self-identification accordingly.]"
+        self._store_manual_model_override(
+            session_key=session_key,
+            source=source,
+            previous_model=current_model,
+            result=result,
         )
-
-        # Store session override so next agent creation uses the new model
-        if not hasattr(self, "_session_model_overrides"):
-            self._session_model_overrides = {}
-        self._session_model_overrides[session_key] = {
-            "model": result.new_model,
-            "provider": result.target_provider,
-            "api_key": result.api_key,
-            "base_url": result.base_url,
-            "api_mode": result.api_mode,
-        }
-        if getattr(self, "session_store", None) is not None:
-            self.session_store.update_session(
-                session_key,
-                route_lease=self._build_session_route_lease(
-                    {
-                        "provider": result.target_provider,
-                        "model": result.new_model,
-                        "base_url": result.base_url,
-                        "api_mode": result.api_mode,
-                    },
-                    selection_reason="explicit_override",
-                ),
-                route_debug=self._build_route_debug_payload(
-                    session_key=session_key,
-                    provider=result.target_provider,
-                    model=result.new_model,
-                    base_url=result.base_url,
-                    selection_reason="explicit_override",
-                ),
-                route_metrics=self._increment_route_metric(
-                    getattr(self._get_session_entry(session_key), "route_metrics", {}) or {},
-                    "explicit_override",
-                ),
-            )
-
-        # Persist to config if --global
-        if persist_global:
-            try:
-                if config_path.exists():
-                    with open(config_path, encoding="utf-8") as f:
-                        cfg = yaml.safe_load(f) or {}
-                else:
-                    cfg = {}
-                model_cfg = cfg.setdefault("model", {})
-                model_cfg["default"] = result.new_model
-                model_cfg["provider"] = result.target_provider
-                if result.base_url:
-                    model_cfg["base_url"] = result.base_url
-                from hermes_cli.config import save_config
-                save_config(cfg)
-            except Exception as e:
-                logger.warning("Failed to persist model switch: %s", e)
 
         # Build confirmation message with full metadata
         provider_label = result.provider_label or result.target_provider
         lines = [f"Model switched to `{result.new_model}`"]
         lines.append(f"Provider: {provider_label}")
+        lines.append("Transport: `cloudflare_ai_gateway`")
         lines.append("Route mode: `explicit override`")
         lines.append("Manual lock: `yes`")
 
@@ -5496,8 +6040,9 @@ class GatewayRunner:
                 pass
 
         # Cache notice
-        cache_enabled = (
-            ("openrouter" in (result.base_url or "").lower() and "claude" in result.new_model.lower())
+        cache_enabled = "claude" in result.new_model.lower() and (
+            "openrouter" in (result.base_url or "").lower()
+            or "gateway.ai.cloudflare.com" in (result.base_url or "").lower()
             or result.api_mode == "anthropic_messages"
         )
         if cache_enabled:
@@ -5506,10 +6051,7 @@ class GatewayRunner:
         if result.warning_message:
             lines.append(f"Warning: {result.warning_message}")
 
-        if persist_global:
-            lines.append("Saved to config.yaml (`--global`)")
-        else:
-            lines.append("_(session only -- add `--global` to persist)_")
+        lines.append("_(session only — Hermes still executes through Cloudflare AI Gateway, with this model ID pinned for the current Feishu session)_")
 
         return "\n".join(lines)
 
@@ -5532,7 +6074,7 @@ class GatewayRunner:
         lines = [
             *self._render_route_status_lines(route_state),
             "",
-            "**Chat providers:**",
+            "**Gateway upstream catalogs:**",
         ]
 
         providers = {
@@ -5543,33 +6085,35 @@ class GatewayRunner:
         for slug in _CHAT_VISIBLE_PROVIDER_ORDER:
             record = providers.get(slug, {})
             marker = " ← current" if slug == current_provider else ""
-            auth = "authenticated" if record.get("authenticated") else "not configured"
+            auth = "catalog ready" if record.get("authenticated") else "catalog unavailable"
             lines.append(f"- `{slug}` - {get_label(slug)} ({auth}){marker}")
 
         lines.append("")
-        lines.append("Switch provider list: `/model --provider openrouter` or `/model --provider nvidia`")
-        lines.append("Switch model directly: `/model <name> --provider <slug>`")
+        lines.append("All model execution now routes through Cloudflare AI Gateway.")
+        lines.append("Use provider names here only to browse catalogs or hint a Feishu session lock.")
+        lines.append("Browse catalog: `/model --provider openrouter` or `/model --provider nvidia`")
+        lines.append("Feishu session lock: `/model <model-id>` or `/model <model-id> --provider <slug>`")
         lines.append("Setup: `hermes setup`")
         return "\n".join(lines)
     
     async def _handle_personality_command(self, event: MessageEvent) -> str:
         """Handle /personality command - list or set a personality."""
         import yaml
+        from hermes_cli.config import DEFAULT_CONFIG
 
         args = event.get_command_args().strip().lower()
         config_path = _hermes_home / 'config.yaml'
+        personalities = dict(DEFAULT_CONFIG.get("agent", {}).get("personalities", {}) or {})
 
         try:
             if config_path.exists():
                 with open(config_path, 'r', encoding="utf-8") as f:
                     config = yaml.safe_load(f) or {}
-                personalities = config.get("agent", {}).get("personalities", {})
+                personalities.update(config.get("agent", {}).get("personalities", {}) or {})
             else:
                 config = {}
-                personalities = {}
         except Exception:
             config = {}
-            personalities = {}
 
         if not personalities:
             return "No personalities configured in `~/.hermes/config.yaml`"
@@ -5601,6 +6145,7 @@ class GatewayRunner:
                 if "agent" not in config or not isinstance(config.get("agent"), dict):
                     config["agent"] = {}
                 config["agent"]["system_prompt"] = ""
+                config["agent"]["personality"] = ""
                 atomic_yaml_write(config_path, config)
             except Exception as e:
                 return f"⚠️ Failed to save personality change: {e}"
@@ -5614,6 +6159,7 @@ class GatewayRunner:
                 if "agent" not in config or not isinstance(config.get("agent"), dict):
                     config["agent"] = {}
                 config["agent"]["system_prompt"] = new_prompt
+                config["agent"]["personality"] = args
                 atomic_yaml_write(config_path, config)
             except Exception as e:
                 return f"⚠️ Failed to save personality change: {e}"
@@ -6256,11 +6802,33 @@ class GatewayRunner:
             model = _resolve_gateway_model(user_config)
             platform_key = _platform_config_key(source.platform)
             enabled_toolsets, disabled_toolsets = _resolve_platform_toolset_controls(platform_key, user_config)
+            enabled_toolsets, disabled_toolsets, toolset_cost_summary = _apply_feishu_toolset_cost_controls(
+                platform_key=platform_key,
+                message=prompt,
+                enabled_toolsets=enabled_toolsets,
+                disabled_toolsets=disabled_toolsets,
+            )
+            if toolset_cost_summary.get("browser_toolset_pruned"):
+                logger.info(
+                    "[Gateway] background task pruned browser toolset for platform=%s task_id=%s",
+                    platform_key,
+                    task_id,
+                )
             from run_agent import AIAgent
 
             pr = self._provider_routing
             max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
             reasoning_config = self._load_reasoning_config()
+            agent_profile = self._resolve_agent_execution_profile(
+                platform_key,
+                max_iterations=max_iterations,
+                reasoning_config=reasoning_config,
+                max_tokens=None,
+            )
+            max_iterations = int(agent_profile.get("max_iterations") or max_iterations)
+            reasoning_config = agent_profile.get("reasoning_config")
+            max_tokens = agent_profile.get("max_tokens")
+            ephemeral_prompt = str(agent_profile.get("ephemeral_prompt") or "")
             self._reasoning_config = reasoning_config
             turn_route = self._resolve_turn_agent_config(
                 prompt,
@@ -6274,10 +6842,12 @@ class GatewayRunner:
                     model=turn_route["model"],
                     **turn_runtime,
                     max_iterations=max_iterations,
+                    max_tokens=max_tokens,
                     quiet_mode=True,
                     verbose_logging=False,
                     enabled_toolsets=enabled_toolsets,
                     disabled_toolsets=disabled_toolsets or None,
+                    ephemeral_system_prompt=ephemeral_prompt or None,
                     reasoning_config=reasoning_config,
                     providers_allowed=pr.get("only"),
                     providers_ignored=pr.get("ignore"),
@@ -6289,10 +6859,12 @@ class GatewayRunner:
                     platform=platform_key,
                     user_id=source.user_id,
                     trace_session_key=self._session_key_for_source(source),
-                    trace_metadata={
-                        "channel_type": source.chat_type,
-                        "route_selection": turn_route.get("route_selection"),
-                    },
+                    trace_metadata=self._build_agent_trace_metadata(
+                        source=source,
+                        session_key=self._session_key_for_source(source),
+                        route_selection=turn_route.get("route_selection"),
+                        correlation_suffix=task_id,
+                    ),
                     session_db=self._session_db,
                     fallback_model=self._fallback_model,
                 )
@@ -6433,6 +7005,16 @@ class GatewayRunner:
             model = _resolve_gateway_model(user_config)
             platform_key = _platform_config_key(source.platform)
             reasoning_config = self._load_reasoning_config()
+            agent_profile = self._resolve_agent_execution_profile(
+                platform_key,
+                max_iterations=8,
+                reasoning_config=reasoning_config,
+                max_tokens=None,
+            )
+            max_iterations = int(agent_profile.get("max_iterations") or 8)
+            reasoning_config = agent_profile.get("reasoning_config")
+            max_tokens = agent_profile.get("max_tokens")
+            ephemeral_prompt = str(agent_profile.get("ephemeral_prompt") or "")
             turn_route = self._resolve_turn_agent_config(
                 question,
                 model,
@@ -6459,10 +7041,12 @@ class GatewayRunner:
                 agent = AIAgent(
                     model=turn_route["model"],
                     **turn_runtime,
-                    max_iterations=8,
+                    max_iterations=max_iterations,
+                    max_tokens=max_tokens,
                     quiet_mode=True,
                     verbose_logging=False,
                     enabled_toolsets=[],
+                    ephemeral_system_prompt=ephemeral_prompt or None,
                     reasoning_config=reasoning_config,
                     providers_allowed=pr.get("only"),
                     providers_ignored=pr.get("ignore"),
@@ -6473,10 +7057,12 @@ class GatewayRunner:
                     session_id=task_id,
                     platform=platform_key,
                     trace_session_key=self._session_key_for_source(source),
-                    trace_metadata={
-                        "channel_type": source.chat_type,
-                        "route_selection": turn_route.get("route_selection"),
-                    },
+                    trace_metadata=self._build_agent_trace_metadata(
+                        source=source,
+                        session_key=self._session_key_for_source(source),
+                        route_selection=turn_route.get("route_selection"),
+                        correlation_suffix=task_id,
+                    ),
                     session_db=None,
                     fallback_model=self._fallback_model,
                     skip_memory=True,
@@ -7069,6 +7655,93 @@ class GatewayRunner:
         except Exception as e:
             logger.error("Insights command error: %s", e, exc_info=True)
             return f"Error generating insights: {e}"
+
+    async def _handle_kpi_command(self, event: MessageEvent) -> str:
+        """Handle /kpi command -- generate the Feishu chain KPI report."""
+        import asyncio as _asyncio
+        import shlex as _shlex
+
+        args = event.get_command_args().strip()
+        hours = 24
+        recent_hours = 3
+        recent_min_sessions = 20
+        compare_days = [1, 2]
+        timezone = "Asia/Shanghai"
+
+        if args:
+            try:
+                parts = _shlex.split(args)
+            except ValueError as exc:
+                return f"Invalid /kpi arguments: {exc}"
+            i = 0
+            parsed_compare_days: list[int] = []
+            while i < len(parts):
+                part = parts[i]
+                if part == "--hours" and i + 1 < len(parts):
+                    try:
+                        hours = int(parts[i + 1])
+                    except ValueError:
+                        return f"Invalid --hours value: {parts[i + 1]}"
+                    i += 2
+                    continue
+                if part == "--recent-hours" and i + 1 < len(parts):
+                    try:
+                        recent_hours = int(parts[i + 1])
+                    except ValueError:
+                        return f"Invalid --recent-hours value: {parts[i + 1]}"
+                    i += 2
+                    continue
+                if part == "--recent-min-sessions" and i + 1 < len(parts):
+                    try:
+                        recent_min_sessions = int(parts[i + 1])
+                    except ValueError:
+                        return f"Invalid --recent-min-sessions value: {parts[i + 1]}"
+                    i += 2
+                    continue
+                if part == "--timezone" and i + 1 < len(parts):
+                    timezone = parts[i + 1]
+                    i += 2
+                    continue
+                if part == "--compare-days":
+                    i += 1
+                    while i < len(parts) and not parts[i].startswith("--"):
+                        try:
+                            parsed_compare_days.append(int(parts[i]))
+                        except ValueError:
+                            return f"Invalid compare-day value: {parts[i]}"
+                        i += 1
+                    continue
+                if part.isdigit():
+                    hours = int(part)
+                    i += 1
+                    continue
+                i += 1
+            if parsed_compare_days:
+                compare_days = parsed_compare_days
+
+        try:
+            from tools.feishu_kpi_tools import (
+                format_feishu_kpi_gateway_summary,
+                generate_feishu_kpi_report,
+            )
+
+            loop = _asyncio.get_event_loop()
+
+            def _run_kpi():
+                result = generate_feishu_kpi_report(
+                    hours=hours,
+                    compare_days=compare_days,
+                    timezone=timezone,
+                    recent_hours=recent_hours,
+                    recent_min_sessions=recent_min_sessions,
+                    include_analytics_snapshot=True,
+                )
+                return format_feishu_kpi_gateway_summary(result)
+
+            return await loop.run_in_executor(None, _run_kpi)
+        except Exception as e:
+            logger.error("KPI command error: %s", e, exc_info=True)
+            return f"Error generating KPI report: {e}"
 
     async def _handle_reload_mcp_command(self, event: MessageEvent) -> str:
         """Handle /reload-mcp command -- disconnect and reconnect all MCP servers."""
@@ -8018,10 +8691,23 @@ class GatewayRunner:
         Supports interruption via new messages.
         """
         import queue
+        _run_agent_started_at = time.perf_counter()
+        _run_agent_phase_timings: dict[str, int] = {}
+        _run_sync_phase_timings: dict[str, int] = {}
+        _run_sync_summary: dict[str, Any] = {}
+
+        def _capture_async_phase(name: str, started_at: float) -> None:
+            _run_agent_phase_timings[name] = int((time.perf_counter() - started_at) * 1000)
         
         user_config = _load_gateway_config()
         platform_key = _platform_config_key(source.platform)
         enabled_toolsets, disabled_toolsets = _resolve_platform_toolset_controls(platform_key, user_config)
+        enabled_toolsets, disabled_toolsets, toolset_cost_summary = _apply_feishu_toolset_cost_controls(
+            platform_key=platform_key,
+            message=message,
+            enabled_toolsets=enabled_toolsets,
+            disabled_toolsets=disabled_toolsets,
+        )
         from run_agent import AIAgent
 
         # Apply tool preview length config (0 = no limit)
@@ -8301,20 +8987,44 @@ class GatewayRunner:
         _status_chat_id = source.chat_id
         _status_thread_metadata = {"thread_id": _progress_thread_id} if _progress_thread_id else None
 
+        def _run_coroutine_threadsafe_safe(
+            coro_factory,
+            *,
+            timeout: float | None = None,
+            error_level: str = "debug",
+            error_message: str,
+        ):
+            if not _loop_for_step or _loop_for_step.is_closed():
+                return None
+
+            coro = None
+            try:
+                coro = coro_factory()
+                future = asyncio.run_coroutine_threadsafe(coro, _loop_for_step)
+                if timeout is not None:
+                    return future.result(timeout=timeout)
+                return future
+            except Exception as _e:
+                if coro is not None:
+                    try:
+                        coro.close()
+                    except Exception:
+                        pass
+                log_fn = logger.error if error_level == "error" else logger.debug
+                log_fn(error_message, _e)
+                return None
+
         def _status_callback_sync(event_type: str, message: str) -> None:
             if not _status_adapter:
                 return
-            try:
-                asyncio.run_coroutine_threadsafe(
-                    _status_adapter.send(
-                        _status_chat_id,
-                        message,
-                        metadata=_status_thread_metadata,
-                    ),
-                    _loop_for_step,
-                )
-            except Exception as _e:
-                logger.debug("status_callback error (%s): %s", event_type, _e)
+            _run_coroutine_threadsafe_safe(
+                lambda: _status_adapter.send(
+                    _status_chat_id,
+                    message,
+                    metadata=_status_thread_metadata,
+                ),
+                error_message=f"status_callback error ({event_type}): %s",
+            )
 
         def run_sync():
             # The conditional re-assignment of `message` further below
@@ -8324,6 +9034,10 @@ class GatewayRunner:
             # triggering an UnboundLocalError on the earlier read at
             # `_resolve_turn_agent_config(message, …)`.
             nonlocal message
+            _sync_started_at = time.perf_counter()
+
+            def _capture_sync_phase(name: str, started_at: float) -> None:
+                _run_sync_phase_timings[name] = int((time.perf_counter() - started_at) * 1000)
 
             # Pass session_key to process registry via env var so background
             # processes can be mapped back to this gateway session
@@ -8350,11 +9064,13 @@ class GatewayRunner:
             except Exception:
                 pass
 
+            _runtime_prepare_started_at = time.perf_counter()
             model = _resolve_gateway_model(user_config)
 
             try:
                 runtime_kwargs = _resolve_runtime_agent_kwargs()
             except Exception as exc:
+                _capture_sync_phase("runtime_prepare_elapsed_ms", _runtime_prepare_started_at)
                 return {
                     "final_response": f"⚠️ Provider authentication failed: {exc}",
                     "messages": [],
@@ -8364,8 +9080,21 @@ class GatewayRunner:
 
             pr = self._provider_routing
             reasoning_config = self._load_reasoning_config()
+            agent_profile = self._resolve_agent_execution_profile(
+                platform_key,
+                max_iterations=max_iterations,
+                reasoning_config=reasoning_config,
+                max_tokens=None,
+                ephemeral_prompt=combined_ephemeral,
+            )
+            max_iterations = int(agent_profile.get("max_iterations") or max_iterations)
+            reasoning_config = agent_profile.get("reasoning_config")
+            max_tokens = agent_profile.get("max_tokens")
+            combined_ephemeral = str(agent_profile.get("ephemeral_prompt") or "")
             self._reasoning_config = reasoning_config
+            _capture_sync_phase("runtime_prepare_elapsed_ms", _runtime_prepare_started_at)
             # Set up streaming consumer if enabled
+            _stream_setup_started_at = time.perf_counter()
             _stream_consumer = None
             _stream_delta_cb = None
             _scfg = getattr(getattr(self, 'config', None), 'streaming', None)
@@ -8393,13 +9122,16 @@ class GatewayRunner:
                         stream_consumer_holder[0] = _stream_consumer
                 except Exception as _sc_err:
                     logger.debug("Could not set up stream consumer: %s", _sc_err)
+            _capture_sync_phase("stream_setup_elapsed_ms", _stream_setup_started_at)
 
+            _route_prepare_started_at = time.perf_counter()
             turn_route = self._resolve_turn_agent_config(
                 message,
                 model,
                 {**runtime_kwargs, "_session_key": session_key},
             )
             turn_runtime = self._sanitize_turn_runtime(turn_route.get("runtime"))
+            _capture_sync_phase("route_prepare_elapsed_ms", _route_prepare_started_at)
 
             # Check agent cache — reuse the AIAgent from the previous message
             # in this session to preserve the frozen system prompt and tool
@@ -8410,7 +9142,9 @@ class GatewayRunner:
                 enabled_toolsets,
                 combined_ephemeral,
             )
+            _agent_prepare_started_at = time.perf_counter()
             agent = None
+            _cached_agent_reused = False
             _cache_lock = getattr(self, "_agent_cache_lock", None)
             _cache = getattr(self, "_agent_cache", None)
             if _cache_lock and _cache is not None:
@@ -8418,6 +9152,7 @@ class GatewayRunner:
                     cached = _cache.get(session_key)
                     if cached and cached[1] == _sig:
                         agent = cached[0]
+                        _cached_agent_reused = True
                         logger.debug("Reusing cached agent for session %s", session_key)
 
             if agent is None:
@@ -8426,6 +9161,7 @@ class GatewayRunner:
                     model=turn_route["model"],
                     **turn_runtime,
                     max_iterations=max_iterations,
+                    max_tokens=max_tokens,
                     quiet_mode=True,
                     verbose_logging=False,
                     enabled_toolsets=enabled_toolsets,
@@ -8443,10 +9179,12 @@ class GatewayRunner:
                     platform=platform_key,
                     user_id=source.user_id,
                     trace_session_key=session_key,
-                    trace_metadata={
-                        "channel_type": source.chat_type,
-                        "route_selection": turn_route.get("route_selection"),
-                    },
+                    trace_metadata=self._build_agent_trace_metadata(
+                        source=source,
+                        session_key=session_key,
+                        route_selection=turn_route.get("route_selection"),
+                        event_message_id=event_message_id,
+                    ),
                     session_db=self._session_db,
                     fallback_model=self._fallback_model,
                 )
@@ -8462,22 +9200,21 @@ class GatewayRunner:
             agent.stream_delta_callback = _stream_delta_cb
             agent.status_callback = _status_callback_sync
             agent.reasoning_config = reasoning_config
+            agent.max_iterations = max_iterations
+            agent.max_tokens = max_tokens
 
             # Background review delivery — send "💾 Memory updated" etc. to user
             def _bg_review_send(message: str) -> None:
                 if not _status_adapter:
                     return
-                try:
-                    asyncio.run_coroutine_threadsafe(
-                        _status_adapter.send(
-                            _status_chat_id,
-                            message,
-                            metadata=_status_thread_metadata,
-                        ),
-                        _loop_for_step,
-                    )
-                except Exception as _e:
-                    logger.debug("background_review_callback error: %s", _e)
+                _run_coroutine_threadsafe_safe(
+                    lambda: _status_adapter.send(
+                        _status_chat_id,
+                        message,
+                        metadata=_status_thread_metadata,
+                    ),
+                    error_message="background_review_callback error: %s",
+                )
 
             agent.background_review_callback = _bg_review_send
 
@@ -8587,22 +9324,19 @@ class GatewayRunner:
                 # Check the *class* for the method, not the instance — avoids
                 # false positives from MagicMock auto-attribute creation in tests.
                 if getattr(type(_status_adapter), "send_exec_approval", None) is not None:
-                    try:
-                        asyncio.run_coroutine_threadsafe(
-                            _status_adapter.send_exec_approval(
-                                chat_id=_status_chat_id,
-                                command=cmd,
-                                session_key=_approval_session_key,
-                                description=desc,
-                                metadata=_status_thread_metadata,
-                            ),
-                            _loop_for_step,
-                        ).result(timeout=15)
+                    result = _run_coroutine_threadsafe_safe(
+                        lambda: _status_adapter.send_exec_approval(
+                            chat_id=_status_chat_id,
+                            command=cmd,
+                            session_key=_approval_session_key,
+                            description=desc,
+                            metadata=_status_thread_metadata,
+                        ),
+                        timeout=15,
+                        error_message="Button-based approval failed, falling back to text: %s",
+                    )
+                    if result is not None:
                         return
-                    except Exception as _e:
-                        logger.warning(
-                            "Button-based approval failed, falling back to text: %s", _e
-                        )
 
                 # Fallback: plain text approval prompt
                 cmd_preview = cmd[:200] + "..." if len(cmd) > 200 else cmd
@@ -8613,32 +9347,64 @@ class GatewayRunner:
                     f"Reply `/approve` to execute, `/approve session` to approve this pattern "
                     f"for the session, `/approve always` to approve permanently, or `/deny` to cancel."
                 )
-                try:
-                    asyncio.run_coroutine_threadsafe(
-                        _status_adapter.send(
-                            _status_chat_id,
-                            msg,
-                            metadata=_status_thread_metadata,
-                        ),
-                        _loop_for_step,
-                    ).result(timeout=15)
-                except Exception as _e:
-                    logger.error("Failed to send approval request: %s", _e)
+                _run_coroutine_threadsafe_safe(
+                    lambda: _status_adapter.send(
+                        _status_chat_id,
+                        msg,
+                        metadata=_status_thread_metadata,
+                    ),
+                    timeout=15,
+                    error_level="error",
+                    error_message="Failed to send approval request: %s",
+                )
 
             # Prepend pending model switch note so the model knows about the switch
             _pending_notes = getattr(self, '_pending_model_notes', {})
             _msn = _pending_notes.pop(session_key, None) if session_key else None
             if _msn:
                 message = _msn + "\n\n" + message
+            _capture_sync_phase("agent_prepare_elapsed_ms", _agent_prepare_started_at)
 
             _approval_session_key = session_key or ""
             _approval_session_token = set_current_session_key(_approval_session_key)
             register_gateway_notify(_approval_session_key, _approval_notify_sync)
+            _run_sync_summary.update(
+                {
+                    "cached_agent_reused": _cached_agent_reused,
+                    "history_messages": len(agent_history),
+                    "model": str(turn_route.get("model") or ""),
+                    "provider": str(turn_runtime.get("provider") or ""),
+                    "route_selection": str(turn_route.get("route_selection") or ""),
+                    "stream_enabled": bool(_stream_consumer is not None),
+                }
+            )
+            logger.warning(
+                "[Gateway] agent executor start platform=%s chat=%s message_id=%s session=%s "
+                "model=%s provider=%s route_selection=%s cached_agent_reused=%s "
+                "history_messages=%d enabled_toolsets=%d disabled_toolsets=%d "
+                "browser_requested=%s browser_toolset_pruned=%s sync_phase_timings=%s",
+                platform_key,
+                source.chat_id or "unknown",
+                event_message_id or "",
+                session_key or "",
+                _run_sync_summary.get("model") or "",
+                _run_sync_summary.get("provider") or "",
+                _run_sync_summary.get("route_selection") or "",
+                _cached_agent_reused,
+                len(agent_history),
+                len(enabled_toolsets or []),
+                len(disabled_toolsets or []),
+                toolset_cost_summary.get("browser_requested"),
+                toolset_cost_summary.get("browser_toolset_pruned"),
+                json.dumps(_run_sync_phase_timings, sort_keys=True),
+            )
+            _agent_run_started_at = time.perf_counter()
             try:
                 result = agent.run_conversation(message, conversation_history=agent_history, task_id=session_id)
             finally:
                 unregister_gateway_notify(_approval_session_key)
                 reset_current_session_key(_approval_session_token)
+            _capture_sync_phase("agent_run_elapsed_ms", _agent_run_started_at)
             result_holder[0] = result
 
             # Signal the stream consumer that the agent is done
@@ -8646,6 +9412,7 @@ class GatewayRunner:
                 _stream_consumer.finish()
             
             # Return final response, or a message if something went wrong
+            _result_finalize_started_at = time.perf_counter()
             final_response = result.get("final_response")
 
             # Extract actual token counts from the agent instance used for this run
@@ -8666,6 +9433,19 @@ class GatewayRunner:
             if isinstance(result, dict):
                 _provider_usage = dict(result.get("provider_usage") or {})
                 _provider_usage_totals = dict(result.get("provider_usage_totals") or {})
+            if _provider_usage:
+                logger.info(
+                    "[Gateway] provider metadata provider=%s model=%s request_id=%s status_code=%s async_poll_supported=%s async_poll_observed=%s async_poll_capability_inferred=%s async_request_id=%s async_poll_url=%s",
+                    _provider_usage.get("provider") or getattr(_agent, "provider", None) or "",
+                    _provider_usage.get("response_model") or getattr(_agent, "model", None) or "",
+                    _provider_usage.get("provider_request_id") or _provider_usage.get("request_id") or "",
+                    _provider_usage.get("provider_http_status_code") or "",
+                    _provider_usage.get("provider_async_poll_supported"),
+                    _provider_usage.get("provider_async_poll_observed"),
+                    _provider_usage.get("provider_async_poll_capability_inferred"),
+                    _provider_usage.get("provider_async_request_id") or "",
+                    _provider_usage.get("provider_async_poll_url") or "",
+                )
             _response_model = str(_provider_usage.get("response_model") or "").strip()
             if _response_model:
                 _resolved_model = _response_model
@@ -8688,6 +9468,21 @@ class GatewayRunner:
                 "base_url": _resolved_base_url or turn_runtime.get("base_url"),
                 "api_mode": _resolved_api_mode or turn_runtime.get("api_mode"),
             }
+            _capture_sync_phase("result_finalize_elapsed_ms", _result_finalize_started_at)
+            _run_sync_phase_timings["sync_total_elapsed_ms"] = int((time.perf_counter() - _sync_started_at) * 1000)
+            logger.warning(
+                "[Gateway] agent executor done platform=%s chat=%s message_id=%s session=%s "
+                "final_response_len=%d interrupted=%s failed=%s api_calls=%s sync_phase_timings=%s",
+                platform_key,
+                source.chat_id or "unknown",
+                event_message_id or "",
+                session_key or "",
+                len(final_response or ""),
+                bool(result.get("interrupted")),
+                bool(result.get("failed")),
+                result.get("api_calls", 0),
+                json.dumps(_run_sync_phase_timings, sort_keys=True),
+            )
 
             if not final_response:
                 _failure_reason = self._determine_route_refresh_reason(result)
@@ -8717,6 +9512,14 @@ class GatewayRunner:
                     "route_lease": _route_lease,
                     "route_debug": _route_debug,
                     "route_metrics": _route_metrics,
+                    "sync_phase_timings": dict(_run_sync_phase_timings),
+                    "sync_summary": dict(_run_sync_summary),
+                    "provider_wait_elapsed_ms": result.get("provider_wait_elapsed_ms"),
+                    "tool_exec_elapsed_ms": result.get("tool_exec_elapsed_ms"),
+                    "provider_attempt_count": result.get("provider_attempt_count"),
+                    "provider_retry_count": result.get("provider_retry_count"),
+                    "provider_wait_measurement_mode": result.get("provider_wait_measurement_mode"),
+                    "provider_fallback_used": result.get("provider_fallback_used"),
                     "provider_usage": _provider_usage,
                     "provider_usage_totals": _provider_usage_totals,
                 }
@@ -8817,6 +9620,14 @@ class GatewayRunner:
                 ),
                 "route_debug": _route_debug,
                 "route_metrics": _route_metrics,
+                "sync_phase_timings": dict(_run_sync_phase_timings),
+                "sync_summary": dict(_run_sync_summary),
+                "provider_wait_elapsed_ms": result.get("provider_wait_elapsed_ms"),
+                "tool_exec_elapsed_ms": result.get("tool_exec_elapsed_ms"),
+                "provider_attempt_count": result.get("provider_attempt_count"),
+                "provider_retry_count": result.get("provider_retry_count"),
+                "provider_wait_measurement_mode": result.get("provider_wait_measurement_mode"),
+                "provider_fallback_used": result.get("provider_fallback_used"),
                 "provider_usage": _provider_usage,
                 "provider_usage_totals": _provider_usage_totals,
             }
@@ -8927,6 +9738,7 @@ class GatewayRunner:
             _agent_warning = _agent_warning_raw if _agent_warning_raw > 0 else None
             _warning_fired = False
             loop = asyncio.get_event_loop()
+            _executor_started_at = time.perf_counter()
             _executor_task = asyncio.ensure_future(
                 loop.run_in_executor(None, run_sync)
             )
@@ -8980,6 +9792,7 @@ class GatewayRunner:
                     if _idle_secs >= _agent_timeout:
                         _inactivity_timeout = True
                         break
+            _capture_async_phase("executor_wait_elapsed_ms", _executor_started_at)
 
             if _inactivity_timeout:
                 # Build a diagnostic summary from the agent's activity tracker.
@@ -9142,6 +9955,19 @@ class GatewayRunner:
 
                 # Process the pending message with updated history
                 updated_history = result.get("messages", history)
+                _run_agent_phase_timings["total_elapsed_ms"] = int((time.perf_counter() - _run_agent_started_at) * 1000)
+                logger.warning(
+                    "[Gateway] run_agent recurse platform=%s chat=%s message_id=%s session=%s "
+                    "interrupt_depth=%d pending_len=%d async_phase_timings=%s sync_phase_timings=%s",
+                    platform_key,
+                    source.chat_id or "unknown",
+                    event_message_id or "",
+                    session_key or "",
+                    _interrupt_depth,
+                    len(pending or ""),
+                    json.dumps(_run_agent_phase_timings, sort_keys=True),
+                    json.dumps(_run_sync_phase_timings, sort_keys=True),
+                )
                 return await self._run_agent(
                     message=pending,
                     context_prompt=context_prompt,
@@ -9189,6 +10015,22 @@ class GatewayRunner:
         _sc = stream_consumer_holder[0]
         if _sc and _sc.already_sent and isinstance(response, dict):
             response["already_sent"] = True
+        _run_agent_phase_timings["total_elapsed_ms"] = int((time.perf_counter() - _run_agent_started_at) * 1000)
+        logger.warning(
+            "[Gateway] run_agent done platform=%s chat=%s message_id=%s session=%s "
+            "response_len=%d failed=%s already_sent=%s interrupted=%s async_phase_timings=%s sync_phase_timings=%s sync_summary=%s",
+            platform_key,
+            source.chat_id or "unknown",
+            event_message_id or "",
+            session_key or "",
+            len((response or {}).get("final_response", "") if isinstance(response, dict) else str(response or "")),
+            bool((response or {}).get("failed")) if isinstance(response, dict) else False,
+            bool((response or {}).get("already_sent")) if isinstance(response, dict) else False,
+            bool((response or {}).get("interrupted")) if isinstance(response, dict) else False,
+            json.dumps(_run_agent_phase_timings, sort_keys=True),
+            json.dumps(_run_sync_phase_timings, sort_keys=True),
+            json.dumps(_run_sync_summary, sort_keys=True),
+        )
         
         return response
 

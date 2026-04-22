@@ -13,7 +13,16 @@ import time
 # Protected by a lock to avoid race conditions in concurrent retry paths
 # (e.g. multiple gateway sessions retrying simultaneously).
 _jitter_counter = 0
-_jitter_lock = threading.Lock()
+_jitter_lock = None
+
+
+def _get_jitter_lock() -> threading.Lock:
+    """Lazy-initialized lock to avoid Modal serialization issues."""
+    global _jitter_lock
+    if _jitter_lock is None:
+        _jitter_lock = threading.Lock()
+    return _jitter_lock
+
 
 
 def jittered_backoff(
@@ -39,7 +48,7 @@ def jittered_backoff(
     hitting the same provider don't all retry at the same instant.
     """
     global _jitter_counter
-    with _jitter_lock:
+    with _get_jitter_lock():
         _jitter_counter += 1
         tick = _jitter_counter
 

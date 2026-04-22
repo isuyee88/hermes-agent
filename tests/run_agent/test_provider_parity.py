@@ -848,3 +848,17 @@ class TestReasoningEffortDefaults:
         agent.reasoning_config = {"enabled": True, "effort": "medium"}
         kwargs = agent._build_api_kwargs([{"role": "user", "content": "hi"}])
         assert kwargs["extra_body"]["reasoning"]["effort"] == "medium"
+
+    def test_openrouter_gpt_oss_omits_disabled_reasoning_override(self, monkeypatch):
+        agent = _make_agent(monkeypatch, "openrouter")
+        agent.model = "openai/gpt-oss-120b:free"
+        agent.reasoning_config = {"enabled": False}
+        kwargs = agent._build_api_kwargs([{"role": "user", "content": "hi"}])
+        assert "reasoning" not in kwargs["extra_body"]
+
+    def test_openrouter_non_mandatory_model_keeps_disabled_reasoning_override(self, monkeypatch):
+        agent = _make_agent(monkeypatch, "openrouter")
+        agent.model = "anthropic/claude-sonnet-4-20250514"
+        agent.reasoning_config = {"enabled": False}
+        kwargs = agent._build_api_kwargs([{"role": "user", "content": "hi"}])
+        assert kwargs["extra_body"]["reasoning"] == {"enabled": False}

@@ -884,6 +884,7 @@ class AIAgent:
             self._fallback_chain = []
         self._fallback_index = 0
         self._fallback_activated = False
+        self._turn_fallback_activations = 0
         # Legacy attribute kept for backward compat (tests, external callers)
         self._fallback_model = self._fallback_chain[0] if self._fallback_chain else None
         if self._fallback_chain and not self.quiet_mode:
@@ -1207,6 +1208,10 @@ class AIAgent:
         self.session_upstream_inference_cost_usd = 0.0
         self.session_cache_discount_usd = 0.0
         self._last_provider_usage_metadata: dict[str, Any] = {}
+        self._turn_provider_wait_elapsed_ms = 0.0
+        self._turn_tool_exec_elapsed_ms = 0.0
+        self._turn_provider_attempt_count = 0
+        self._turn_provider_wait_measurement_mode = "insufficient_data"
         
         # ── Ollama num_ctx injection ──
         # Ollama defaults to 2048 context regardless of the model's capabilities.
@@ -1304,6 +1309,10 @@ class AIAgent:
         self.session_upstream_inference_cost_usd = 0.0
         self.session_cache_discount_usd = 0.0
         self._last_provider_usage_metadata = {}
+        self._turn_provider_wait_elapsed_ms = 0.0
+        self._turn_tool_exec_elapsed_ms = 0.0
+        self._turn_provider_attempt_count = 0
+        self._turn_provider_wait_measurement_mode = "insufficient_data"
         
         # Turn counter (added after reset_session_state was first written — #2635)
         self._user_turn_count = 0
@@ -1570,6 +1579,301 @@ class AIAgent:
     def _is_openrouter_url(self) -> bool:
         """Return True when the base URL targets OpenRouter."""
         return "openrouter" in self._base_url_lower
+
+    def _is_cloudflare_ai_gateway_url(self, base_url: str = None) -> bool:
+        """Return True when the base URL targets Cloudflare AI Gateway."""
+        url = str(base_url or self.base_url or "").strip().lower()
+        return "gateway.ai.cloudflare.com" in url
+
+    @staticmethod
+    def _stringify_message_content(content: Any) -> str:
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts: list[str] = []
+            for item in content:
+                if isinstance(item, dict):
+                    text = item.get("text")
+                    if isinstance(text, str) and text.strip():
+                        parts.append(text.strip())
+            return "\n".join(parts)
+        return ""
+
+    def _infer_cloudflare_gateway_task_kind(self, api_messages: list) -> str:
+        explicit = str((self._trace_metadata or {}).get("task_kind") or "").strip().lower()
+        if explicit in {"general", "coding", "creative", "image", "vision"}:
+            return "image" if explicit == "vision" else explicit
+
+        flattened = "\n".join(
+            self._stringify_message_content(message.get("content"))
+            for message in api_messages
+            if isinstance(message, dict)
+        ).lower()
+
+        for message in api_messages:
+            if not isinstance(message, dict):
+                continue
+            content = message.get("content")
+            if not isinstance(content, list):
+                continue
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                part_type = str(item.get("type") or "").strip().lower()
+                if part_type in {"image_url", "input_image"}:
+                    return "image"
+
+        image_hints = (
+            "image", "图片", "图像", "海报", "插画", "封面", "logo", "配图",
+            "画一", "画个", "生成图", "修图", "vision", "screenshot",
+        )
+        coding_hints = (
+            "code", "coding", "bug", "debug", "stack trace", "traceback", "exception",
+            "python", "javascript", "typescript", "sql", "regex", "函数", "代码",
+            "报错", "修复", "实现", "接口", "编程", "脚本", "deploy", "部署",
+        )
+        creative_hints = (
+            "copywriting", "copy", "article", "blog", "thread", "tweet", "newsletter",
+            "script", "campaign", "landing page", "标题", "文案", "创作", "润色",
+            "改写", "写一篇", "写个", "营销", "广告", "内容策划",
+        )
+
+        if any(hint in flattened for hint in image_hints):
+            return "image"
+        if any(hint in flattened for hint in coding_hints):
+            return "coding"
+        if any(hint in flattened for hint in creative_hints):
+            return "creative"
+        return "general"
+
+    def _cloudflare_gateway_route_name_for_kind(self, task_kind: str) -> str:
+        normalized = str(task_kind or "").strip().lower() or "general"
+        default_map = {
+            "general": "affiliate-general",
+            "coding": "affiliate-coding",
+            "creative": "affiliate-general",
+            "image": "affiliate-general",
+        }
+        env_map = {
+            "general": "CLOUDFLARE_AI_GATEWAY_ROUTE_GENERAL",
+            "coding": "CLOUDFLARE_AI_GATEWAY_ROUTE_CODING",
+            "creative": "CLOUDFLARE_AI_GATEWAY_ROUTE_CREATIVE",
+            "image": "CLOUDFLARE_AI_GATEWAY_ROUTE_IMAGE",
+        }
+        configured = str(os.getenv(env_map.get(normalized, ""), "")).strip()
+        if configured:
+            return configured
+        if normalized in {"creative", "image"}:
+            general_configured = str(os.getenv("CLOUDFLARE_AI_GATEWAY_ROUTE_GENERAL", "")).strip()
+            if general_configured:
+                return general_configured
+        return default_map.get(normalized, "")
+
+    def _cloudflare_gateway_route_mode(self) -> str:
+        return str(
+            os.getenv("CLOUDFLARE_AI_GATEWAY_ROUTE_MODE", "metadata_only") or "metadata_only"
+        ).strip().lower()
+
+    def _cloudflare_gateway_tool_route_name(self, task_kind: str) -> str:
+        normalized_task_kind = str(task_kind or "").strip().lower() or "general"
+        if normalized_task_kind == "image":
+            image_tool_route = str(os.getenv("CLOUDFLARE_AI_GATEWAY_ROUTE_TOOLS_IMAGE", "") or "").strip()
+            if image_tool_route:
+                return image_tool_route
+            return self._cloudflare_gateway_route_name_for_kind("image")
+        explicit = str(os.getenv("CLOUDFLARE_AI_GATEWAY_ROUTE_TOOLS", "") or "").strip()
+        if explicit:
+            return explicit
+        fixed = str(os.getenv("CLOUDFLARE_AI_GATEWAY_ROUTE_NAME", "") or "").strip()
+        if fixed:
+            return fixed
+        default_tool_route = "affiliate-tools"
+        if self._is_cloudflare_ai_gateway_url():
+            return default_tool_route
+        return self._cloudflare_gateway_route_name_for_kind(task_kind)
+
+    def _select_cloudflare_gateway_model(self, api_messages: list) -> tuple[str | None, str]:
+        if not self._is_cloudflare_ai_gateway_url():
+            return None, "general"
+        current_model = str(self.model or "").strip()
+        task_kind = self._infer_cloudflare_gateway_task_kind(api_messages)
+        if current_model.startswith("dynamic/"):
+            return current_model, task_kind
+        route_mode = self._cloudflare_gateway_route_mode()
+        if route_mode in {"metadata_only", "headers_only", "none", "off"} and bool(getattr(self, "tools", None)):
+            route_name = self._cloudflare_gateway_tool_route_name(task_kind)
+            if not route_name:
+                return None, task_kind
+            return f"dynamic/{route_name}", task_kind
+        if route_mode in {"metadata_only", "headers_only", "none", "off"}:
+            return None, task_kind
+        if route_mode in {"single_dynamic", "fixed_dynamic"}:
+            route_name = str(os.getenv("CLOUDFLARE_AI_GATEWAY_ROUTE_NAME", "") or "").strip()
+            if not route_name:
+                return None, task_kind
+            return f"dynamic/{route_name}", task_kind
+        route_name = self._cloudflare_gateway_route_name_for_kind(task_kind)
+        if not route_name:
+            return None, task_kind
+        return f"dynamic/{route_name}", task_kind
+
+    def _cloudflare_gateway_cache_headers(self, *, api_messages: list, task_kind: str) -> dict[str, str]:
+        headers: dict[str, str] = {}
+        if not self._is_cloudflare_ai_gateway_url():
+            return headers
+
+        cache_mode = str(os.getenv("CLOUDFLARE_AI_GATEWAY_CACHE_MODE", "smart") or "smart").strip().lower()
+        if cache_mode in {"off", "disabled", "none"}:
+            headers["cf-aig-skip-cache"] = "true"
+            return headers
+
+        if cache_mode == "smart" and (bool(getattr(self, "tools", None)) or task_kind in {"coding", "creative", "image"}):
+            headers["cf-aig-skip-cache"] = "true"
+            return headers
+
+        ttl_value = str(os.getenv("CLOUDFLARE_AI_GATEWAY_CACHE_TTL_SECONDS", "120") or "120").strip()
+        try:
+            ttl_seconds = int(ttl_value)
+        except ValueError:
+            ttl_seconds = 120
+        if ttl_seconds <= 0:
+            headers["cf-aig-skip-cache"] = "true"
+            return headers
+
+        headers["cf-aig-cache-ttl"] = str(ttl_seconds)
+        if self._env_flag("CLOUDFLARE_AI_GATEWAY_USE_PROMPT_CACHE_KEY", default=False):
+            cache_payload = {
+                "model": str(self.model or "").strip(),
+                "task_kind": task_kind,
+                "messages": [
+                    {
+                        "role": str(message.get("role") or "").strip(),
+                        "content": self._stringify_message_content(message.get("content")),
+                    }
+                    for message in api_messages
+                    if isinstance(message, dict)
+                ],
+            }
+            digest = hashlib.sha256(
+                json.dumps(cache_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+            ).hexdigest()
+            headers["cf-aig-cache-key"] = f"hermes:{task_kind}:{digest[:32]}"
+        return headers
+
+    def _build_cloudflare_gateway_metadata(
+        self,
+        *,
+        task_kind: str,
+        selected_model: str,
+        requested_model: str,
+    ) -> dict[str, Any]:
+        # Cloudflare AI Gateway stores only the first five metadata entries.
+        # Keep this payload intentionally small and stable so the most useful
+        # identifiers always survive into gateway logs and filters.
+        metadata: dict[str, Any] = {}
+
+        def _put(key: str, value: Any, *, limit: int = 120) -> None:
+            if len(metadata) >= 5:
+                return
+            if value in (None, ""):
+                return
+            normalized = str(value).strip()
+            if not normalized:
+                return
+            metadata[key] = normalized[:limit]
+
+        derived_correlation_id = self._derive_trace_correlation_id()
+        trace_metadata = self._trace_metadata or {}
+        _put("correlation_id", derived_correlation_id)
+        _put("task_kind", task_kind)
+        requested_model_value = str(requested_model or "").strip()
+        selected_model_value = str(selected_model or "").strip()
+        hermes_request = requested_model_value
+        if (
+            requested_model_value
+            and selected_model_value
+            and selected_model_value != requested_model_value
+        ):
+            hermes_request = f"{requested_model_value}=>{selected_model_value}"
+        _put("hermes_request", hermes_request, limit=120)
+
+        tool_names = []
+        for tool in list(getattr(self, "tools", None) or []):
+            if not isinstance(tool, dict):
+                continue
+            function_payload = tool.get("function") or {}
+            tool_name = str(function_payload.get("name") or "").strip()
+            if tool_name:
+                tool_names.append(tool_name)
+            if len(tool_names) >= 4:
+                break
+        if tool_names:
+            _put("tools_required", True)
+            _put("tool_names", ",".join(tool_names), limit=120)
+        else:
+            _put("session_id", self._trace_session_key or "")
+
+        # Only keep lower-level identifiers when they add value beyond the
+        # derived correlation id or task/tool routing tags above.
+        if "correlation_id" not in metadata:
+            _put("chat_id", trace_metadata.get("chat_id"))
+            _put("message_id", trace_metadata.get("message_id"))
+
+        if len(metadata) < 5 and "session_id" not in metadata:
+            _put("session_id", self._trace_session_key or "")
+        return metadata
+
+    def _derive_trace_correlation_id(self) -> str:
+        explicit = str((self._trace_metadata or {}).get("correlation_id") or "").strip()
+        if explicit:
+            return explicit
+
+        message_id = str((self._trace_metadata or {}).get("message_id") or "").strip()
+        if self._trace_session_key and message_id:
+            return f"{self._trace_session_key}:{message_id}"[:160]
+
+        chat_id = str((self._trace_metadata or {}).get("chat_id") or "").strip()
+        if self.platform and chat_id and message_id:
+            return f"{self.platform}:{chat_id}:{message_id}"[:160]
+
+        if self._trace_session_key:
+            return str(self._trace_session_key).strip()[:160]
+
+        return ""
+
+    def _build_cloudflare_gateway_headers(
+        self,
+        *,
+        api_messages: list,
+        selected_model: str,
+        requested_model: str,
+        task_kind: str,
+    ) -> dict[str, str]:
+        if not self._is_cloudflare_ai_gateway_url():
+            return {}
+
+        headers = self._cloudflare_gateway_cache_headers(api_messages=api_messages, task_kind=task_kind)
+        metadata = self._build_cloudflare_gateway_metadata(
+            task_kind=task_kind,
+            selected_model=selected_model,
+            requested_model=requested_model,
+        )
+        if metadata:
+            headers["cf-aig-metadata"] = json.dumps(metadata, ensure_ascii=False, separators=(",", ":"))
+
+        request_timeout = str(os.getenv("CLOUDFLARE_AI_GATEWAY_REQUEST_TIMEOUT_MS", "")).strip()
+        if request_timeout:
+            headers["cf-aig-request-timeout"] = request_timeout
+        max_attempts = str(os.getenv("CLOUDFLARE_AI_GATEWAY_MAX_ATTEMPTS", "")).strip()
+        if max_attempts:
+            headers["cf-aig-max-attempts"] = max_attempts
+        retry_delay = str(os.getenv("CLOUDFLARE_AI_GATEWAY_RETRY_DELAY_MS", "")).strip()
+        if retry_delay:
+            headers["cf-aig-retry-delay"] = retry_delay
+        backoff = str(os.getenv("CLOUDFLARE_AI_GATEWAY_BACKOFF", "")).strip().lower()
+        if backoff:
+            headers["cf-aig-backoff"] = backoff
+        return headers
 
     def _max_tokens_param(self, value: int) -> dict:
         """Return the correct max tokens kwarg for the current provider.
@@ -2420,6 +2724,138 @@ class AIAgent:
         except (TypeError, ValueError):
             return None
 
+    def _is_nvidia_route(self) -> bool:
+        base_url = str(getattr(self, "base_url", "") or "").strip().lower()
+        provider = str(getattr(self, "provider", "") or "").strip().lower()
+        return (
+            provider == "nvidia"
+            or "integrate.api.nvidia.com" in base_url
+            or "api.nvcf.nvidia.com" in base_url
+        )
+
+    @staticmethod
+    def _headers_to_dict(headers: Any) -> Dict[str, str]:
+        if not headers:
+            return {}
+        try:
+            return {str(k).lower(): str(v) for k, v in dict(headers).items()}
+        except Exception:
+            try:
+                return {str(k).lower(): str(v) for k, v in headers.items()}
+            except Exception:
+                return {}
+
+    def _build_nvidia_status_poll_url(self, request_id: str) -> Optional[str]:
+        if not self._is_nvidia_route():
+            return None
+        normalized_request_id = str(request_id or "").strip()
+        if not normalized_request_id:
+            return None
+        base_url = str(getattr(self, "base_url", "") or "").strip().rstrip("/")
+        if not base_url:
+            base_url = "https://integrate.api.nvidia.com/v1"
+        return f"{base_url}/status/{normalized_request_id}"
+
+    @staticmethod
+    def _extract_async_request_id_from_payload(body: Any) -> Optional[str]:
+        if isinstance(body, dict):
+            for key in ("requestId", "request_id", "request-id"):
+                value = body.get(key)
+                if value:
+                    return str(value).strip()
+        return None
+
+    def _extract_provider_transport_metadata(
+        self,
+        response: Any = None,
+        *,
+        status_code: Any = None,
+        headers: Any = None,
+        body: Any = None,
+        source: str = "",
+    ) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {}
+
+        resolved_status_code = status_code
+        if resolved_status_code in (None, "") and response is not None:
+            resolved_status_code = getattr(response, "status_code", None)
+        if resolved_status_code not in (None, ""):
+            try:
+                payload["provider_http_status_code"] = int(resolved_status_code)
+            except (TypeError, ValueError):
+                pass
+
+        header_map = self._headers_to_dict(headers)
+        provider_request_id = (
+            getattr(response, "request_id", None)
+            or getattr(response, "_request_id", None)
+            or header_map.get("x-request-id")
+            or header_map.get("request-id")
+            or header_map.get("requestid")
+            or header_map.get("nvcf-request-id")
+        )
+        if provider_request_id:
+            payload["provider_request_id"] = str(provider_request_id).strip()
+
+        response_id = getattr(response, "id", None)
+        if response_id:
+            payload["response_id"] = str(response_id).strip()
+        response_model = getattr(response, "model", None)
+        if response_model:
+            payload["response_model"] = str(response_model).strip()
+        if source:
+            payload["provider_observed_via"] = str(source).strip()
+
+        if self._is_nvidia_route():
+            payload["provider_async_poll_capability_inferred"] = True
+            async_request_id = (
+                self._extract_async_request_id_from_payload(body)
+                or header_map.get("requestid")
+                or header_map.get("request-id")
+                or header_map.get("nvcf-request-id")
+            )
+            if async_request_id:
+                normalized_request_id = str(async_request_id).strip()
+                payload["provider_async_poll_supported"] = True
+                payload["provider_async_poll_observed"] = True
+                payload["provider_async_request_id"] = normalized_request_id
+                poll_url = self._build_nvidia_status_poll_url(normalized_request_id)
+                if poll_url:
+                    payload["provider_async_poll_url"] = poll_url
+                if payload.get("provider_http_status_code") == 202:
+                    payload["provider_async_pending"] = True
+            elif payload.get("provider_http_status_code") == 202:
+                payload["provider_async_poll_supported"] = True
+                payload["provider_async_poll_observed"] = True
+                payload["provider_async_pending"] = True
+
+        return payload
+
+    def _merge_provider_usage_metadata(self, extra: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        merged = dict(self._last_provider_usage_metadata or {})
+        if extra:
+            for key, value in extra.items():
+                if value in (None, "", {}, []):
+                    continue
+                merged[key] = value
+        self._last_provider_usage_metadata = merged
+        return merged
+
+    def _log_provider_async_candidate(self, metadata: Optional[Dict[str, Any]]) -> None:
+        meta = dict(metadata or {})
+        async_request_id = str(meta.get("provider_async_request_id") or "").strip()
+        if not async_request_id:
+            return
+        logger.info(
+            "Provider async candidate detected: provider=%s model=%s status_code=%s request_id=%s poll_url=%s observed_via=%s",
+            getattr(self, "provider", "") or "",
+            getattr(self, "model", "") or "",
+            meta.get("provider_http_status_code"),
+            async_request_id,
+            meta.get("provider_async_poll_url") or "",
+            meta.get("provider_observed_via") or "",
+        )
+
     def _extract_openrouter_usage_metadata(self, response: Any) -> Optional[Dict[str, Any]]:
         """Extract OpenRouter-specific observability fields from a response object.
 
@@ -3098,20 +3534,56 @@ class AIAgent:
         """
         from difflib import get_close_matches
 
-        # 1. Lowercase
-        lowered = tool_name.lower()
-        if lowered in self.valid_tool_names:
-            return lowered
+        raw_name = str(tool_name or "").strip()
+        if not raw_name:
+            return None
 
-        # 2. Normalize
-        normalized = lowered.replace("-", "_").replace(" ", "_")
-        if normalized in self.valid_tool_names:
+        def _normalize_candidate(value: str) -> str:
+            normalized = str(value or "").strip().lower()
+            normalized = normalized.replace("-", "_").replace(" ", "_")
+            normalized = re.sub(r"_+", "_", normalized).strip("_")
             return normalized
 
-        # 3. Fuzzy match
-        matches = get_close_matches(lowered, self.valid_tool_names, n=1, cutoff=0.7)
-        if matches:
-            return matches[0]
+        raw_candidates: list[str] = [raw_name]
+        if "<|" in raw_name:
+            raw_candidates.append(raw_name.split("<|", 1)[0])
+        if "<" in raw_name and ">" in raw_name:
+            raw_candidates.append(re.sub(r"<\|[^>]+\|>", "", raw_name))
+
+        normalized_candidates: list[str] = []
+        seen_candidates: set[str] = set()
+        suffix_tokens = ("commentary", "analysis", "final", "summary")
+        for candidate in raw_candidates:
+            normalized = _normalize_candidate(candidate)
+            if not normalized:
+                continue
+            variants = [normalized]
+            trimmed = normalized
+            while True:
+                matched_suffix = next(
+                    (suffix for suffix in suffix_tokens if trimmed.endswith(f"_{suffix}")),
+                    None,
+                )
+                if not matched_suffix:
+                    break
+                trimmed = trimmed[: -(len(matched_suffix) + 1)].strip("_")
+                if trimmed:
+                    variants.append(trimmed)
+            for variant in variants:
+                if variant and variant not in seen_candidates:
+                    seen_candidates.add(variant)
+                    normalized_candidates.append(variant)
+
+        for candidate in normalized_candidates:
+            if candidate in self.valid_tool_names:
+                return candidate
+
+        # Fuzzy match against cleaned candidates first so streaming residue
+        # does not waste turns on near-miss tool names.
+        for candidate in normalized_candidates:
+            matches = get_close_matches(candidate, self.valid_tool_names, n=1, cutoff=0.7)
+            if matches:
+                return matches[0]
 
         return None
 
@@ -3762,6 +4234,7 @@ class AIAgent:
         return False
 
     def _create_openai_client(self, client_kwargs: dict, *, reason: str, shared: bool) -> Any:
+        client_kwargs = dict(client_kwargs)
         if self.provider == "copilot-acp" or str(client_kwargs.get("base_url", "")).startswith("acp://copilot"):
             from agent.copilot_acp_client import CopilotACPClient
 
@@ -3773,6 +4246,18 @@ class AIAgent:
                 self._client_log_context(),
             )
             return client
+
+        # Local OpenAI-compatible endpoints should bypass shell/system proxy
+        # settings. Otherwise localhost traffic can be accidentally routed
+        # through HTTP_PROXY/HTTPS_PROXY and fail before the request ever
+        # reaches the local server, which breaks local-model and subagent
+        # smoke validation on proxied environments.
+        base_url = str(client_kwargs.get("base_url", "") or "")
+        if is_local_endpoint(base_url) and "http_client" not in client_kwargs:
+            import httpx as _httpx
+
+            client_kwargs["http_client"] = _httpx.Client(trust_env=False)
+
         client = OpenAI(**client_kwargs)
         logger.info(
             "OpenAI client created (%s, shared=%s) %s",
@@ -4411,7 +4896,35 @@ class AIAgent:
                     result["response"] = self._anthropic_messages_create(api_kwargs)
                 else:
                     request_client_holder["client"] = self._create_request_openai_client(reason="chat_completion_request")
-                    result["response"] = request_client_holder["client"].chat.completions.create(**api_kwargs)
+                    _chat_api = request_client_holder["client"].chat.completions
+                    _raw_create = getattr(getattr(_chat_api, "with_raw_response", None), "create", None)
+                    if callable(_raw_create):
+                        raw_response = _raw_create(**api_kwargs)
+                        http_response = getattr(raw_response, "http_response", None)
+                        self._capture_rate_limits(http_response or raw_response)
+                        response_body = None
+                        if http_response is not None:
+                            try:
+                                response_body = http_response.json()
+                            except Exception:
+                                response_body = None
+                        provider_transport_meta = self._extract_provider_transport_metadata(
+                            status_code=getattr(http_response, "status_code", None) or getattr(raw_response, "status_code", None),
+                            headers=getattr(http_response, "headers", None) or getattr(raw_response, "headers", None),
+                            body=response_body,
+                            source="chat_completion_raw_response",
+                        )
+                        self._merge_provider_usage_metadata(provider_transport_meta)
+                        self._log_provider_async_candidate(provider_transport_meta)
+                        result["response"] = raw_response.parse()
+                    else:
+                        result["response"] = _chat_api.create(**api_kwargs)
+                        provider_transport_meta = self._extract_provider_transport_metadata(
+                            result["response"],
+                            source="chat_completion_response",
+                        )
+                        self._merge_provider_usage_metadata(provider_transport_meta)
+                        self._log_provider_async_candidate(provider_transport_meta)
             except Exception as e:
                 result["error"] = e
             finally:
@@ -4546,8 +5059,8 @@ class AIAgent:
         def _call_chat_completions():
             """Stream a chat completions response."""
             import httpx as _httpx
-            _base_timeout = float(os.getenv("HERMES_API_TIMEOUT", 1800.0))
-            _stream_read_timeout = float(os.getenv("HERMES_STREAM_READ_TIMEOUT", 60.0))
+            _base_timeout = self._request_api_timeout_seconds()
+            _stream_read_timeout = self._stream_read_timeout_seconds()
             stream_kwargs = {
                 **api_kwargs,
                 "stream": True,
@@ -4571,7 +5084,15 @@ class AIAgent:
             # Capture rate limit headers from the initial HTTP response.
             # The OpenAI SDK Stream object exposes the underlying httpx
             # response via .response before any chunks are consumed.
-            self._capture_rate_limits(getattr(stream, "response", None))
+            stream_response = getattr(stream, "response", None)
+            self._capture_rate_limits(stream_response)
+            provider_transport_meta = self._extract_provider_transport_metadata(
+                status_code=getattr(stream_response, "status_code", None),
+                headers=getattr(stream_response, "headers", None),
+                source="chat_completion_stream_response",
+            )
+            self._merge_provider_usage_metadata(provider_transport_meta)
+            self._log_provider_async_candidate(provider_transport_meta)
 
             content_parts: list = []
             tool_calls_acc: dict = {}
@@ -4903,6 +5424,9 @@ class AIAgent:
                                 "The provider may be experiencing issues — "
                                 "try again in a moment."
                             )
+                            if self._should_fail_fast_provider_errors_for_request():
+                                result["error"] = e
+                                return
                             logger.warning(
                                 "Streaming exhausted %s retries on transient error, "
                                 "falling back to non-streaming: %s",
@@ -4941,11 +5465,16 @@ class AIAgent:
                 if request_client is not None:
                     self._close_request_openai_client(request_client, reason="stream_request_complete")
 
-        _stream_stale_timeout_base = float(os.getenv("HERMES_STREAM_STALE_TIMEOUT", 180.0))
+        _stream_stale_timeout_base = self._stream_stale_timeout_base_seconds()
         # Local providers (Ollama, oMLX, llama-cpp) can take 300+ seconds
         # for prefill on large contexts.  Disable the stale detector unless
         # the user explicitly set HERMES_STREAM_STALE_TIMEOUT.
-        if _stream_stale_timeout_base == 180.0 and self.base_url and is_local_endpoint(self.base_url):
+        if (
+            _stream_stale_timeout_base == 180.0
+            and self.base_url
+            and is_local_endpoint(self.base_url)
+            and not self._is_cost_optimized_feishu_request()
+        ):
             _stream_stale_timeout = float("inf")
             logger.debug("Local provider detected (%s) — stale stream timeout disabled", self.base_url)
         else:
@@ -5047,7 +5576,99 @@ class AIAgent:
 
     # ── Provider fallback ──────────────────────────────────────────────────
 
-    def _try_activate_fallback(self) -> bool:
+    def _is_cost_optimized_feishu_request(self) -> bool:
+        return str(self.platform or "").strip().lower() == "feishu"
+
+    def _request_api_timeout_seconds(self) -> float:
+        env_name = "HERMES_FEISHU_API_TIMEOUT" if self._is_cost_optimized_feishu_request() else "HERMES_API_TIMEOUT"
+        default = 45.0 if self._is_cost_optimized_feishu_request() else 1800.0
+        try:
+            return max(1.0, float(os.getenv(env_name, str(default))))
+        except (TypeError, ValueError):
+            return default
+
+    def _stream_read_timeout_seconds(self) -> float:
+        env_name = "HERMES_FEISHU_STREAM_READ_TIMEOUT" if self._is_cost_optimized_feishu_request() else "HERMES_STREAM_READ_TIMEOUT"
+        default = 20.0 if self._is_cost_optimized_feishu_request() else 60.0
+        try:
+            return max(1.0, float(os.getenv(env_name, str(default))))
+        except (TypeError, ValueError):
+            return default
+
+    def _stream_stale_timeout_base_seconds(self) -> float:
+        env_name = "HERMES_FEISHU_STREAM_STALE_TIMEOUT" if self._is_cost_optimized_feishu_request() else "HERMES_STREAM_STALE_TIMEOUT"
+        default = 25.0 if self._is_cost_optimized_feishu_request() else 180.0
+        try:
+            return max(1.0, float(os.getenv(env_name, str(default))))
+        except (TypeError, ValueError):
+            return default
+
+    def _should_fail_fast_provider_errors_for_request(self) -> bool:
+        if not self._is_cost_optimized_feishu_request():
+            return False
+        raw = str(os.getenv("HERMES_FEISHU_FAIL_FAST_PROVIDER_ERRORS", "true") or "").strip().lower()
+        return raw not in {"0", "false", "no", "off"}
+
+    def _max_retry_attempts_for_request(self) -> int:
+        if self._is_cost_optimized_feishu_request():
+            raw = os.getenv("HERMES_FEISHU_PROVIDER_MAX_RETRIES", "2")
+            try:
+                return max(1, int(raw))
+            except (TypeError, ValueError):
+                return 2
+        return 3
+
+    def _max_fallback_activations_for_request(self) -> int:
+        if self._is_cost_optimized_feishu_request():
+            raw = os.getenv("HERMES_FEISHU_PROVIDER_MAX_FALLBACKS", "1")
+            try:
+                return max(0, int(raw))
+            except (TypeError, ValueError):
+                return 1
+        return max(len(self._fallback_chain), 0)
+
+    def _cap_retry_wait_for_request(self, wait_time: float) -> float:
+        if not self._is_cost_optimized_feishu_request():
+            return wait_time
+        raw = os.getenv("HERMES_FEISHU_PROVIDER_FAST_RETRY_WAIT_SECONDS", "1.5")
+        try:
+            cap = max(0.0, float(raw))
+        except (TypeError, ValueError):
+            cap = 1.5
+        if cap <= 0:
+            return 0.0
+        return min(wait_time, cap)
+
+    def _cloudflare_gateway_delegates_failover(self) -> bool:
+        if not self._is_cloudflare_ai_gateway_url():
+            return False
+        raw = str(os.getenv("CLOUDFLARE_AI_GATEWAY_DELEGATE_FAILOVER", "true") or "true").strip().lower()
+        return raw not in {"0", "false", "off", "no"}
+
+    def _attempt_local_fallback(
+        self,
+        *,
+        fallback_status: str | None = None,
+        delegated_status: str | None = None,
+        allow_when_delegated: bool = False,
+    ) -> bool:
+        allow_when_delegated = allow_when_delegated or "Max retries" in str(fallback_status or "")
+        if self._cloudflare_gateway_delegates_failover() and not allow_when_delegated:
+            if delegated_status:
+                self._emit_status(delegated_status)
+            logging.info(
+                "Cloudflare AI Gateway manages provider failover; skipping local fallback. "
+                "provider=%s model=%s base_url=%s",
+                self.provider or "",
+                self.model or "",
+                self.base_url or "",
+            )
+            return False
+        if fallback_status:
+            self._emit_status(fallback_status)
+        return self._try_activate_fallback(allow_when_delegated=allow_when_delegated)
+
+    def _try_activate_fallback(self, *, allow_when_delegated: bool = False) -> bool:
         """Switch to the next fallback model/provider in the chain.
 
         Called when the current model is failing after retries.  Swaps the
@@ -5059,7 +5680,13 @@ class AIAgent:
         auth resolution and client construction — no duplicated provider→key
         mappings.
         """
+        if self._cloudflare_gateway_delegates_failover() and not allow_when_delegated:
+            return False
+
         if self._fallback_index >= len(self._fallback_chain):
+            return False
+
+        if self._turn_fallback_activations >= self._max_fallback_activations_for_request():
             return False
 
         fb = self._fallback_chain[self._fallback_index]
@@ -5067,7 +5694,7 @@ class AIAgent:
         fb_provider = (fb.get("provider") or "").strip().lower()
         fb_model = (fb.get("model") or "").strip()
         if not fb_provider or not fb_model:
-            return self._try_activate_fallback()  # skip invalid, try next
+            return self._try_activate_fallback(allow_when_delegated=allow_when_delegated)  # skip invalid, try next
 
         # Use centralized router for client construction.
         # raw_codex=True because the main agent needs direct responses.stream()
@@ -5091,7 +5718,7 @@ class AIAgent:
                 logging.warning(
                     "Fallback to %s failed: provider not configured",
                     fb_provider)
-                return self._try_activate_fallback()  # try next in chain
+                return self._try_activate_fallback(allow_when_delegated=allow_when_delegated)  # try next in chain
 
             # Determine api_mode from provider / base URL
             fb_api_mode = "chat_completions"
@@ -5175,10 +5802,11 @@ class AIAgent:
                 "Fallback activated: %s → %s (%s)",
                 old_model, fb_model, fb_provider,
             )
+            self._turn_fallback_activations += 1
             return True
         except Exception as e:
             logging.error("Failed to activate fallback %s: %s", fb_model, e)
-            return self._try_activate_fallback()  # try next in chain
+            return self._try_activate_fallback(allow_when_delegated=allow_when_delegated)  # try next in chain
 
     # ── Per-turn primary restoration ─────────────────────────────────────
 
@@ -5698,10 +6326,16 @@ class AIAgent:
         if self.provider_data_collection:
             provider_preferences["data_collection"] = self.provider_data_collection
 
+        requested_model = str(self.model or "").strip()
+        selected_model = requested_model
+        cloudflare_dynamic_model, cloudflare_task_kind = self._select_cloudflare_gateway_model(sanitized_messages)
+        if cloudflare_dynamic_model:
+            selected_model = cloudflare_dynamic_model
+
         api_kwargs = {
-            "model": self.model,
+            "model": selected_model,
             "messages": sanitized_messages,
-            "timeout": float(os.getenv("HERMES_API_TIMEOUT", 1800.0)),
+            "timeout": self._request_api_timeout_seconds(),
         }
         if self._is_qwen_portal():
             api_kwargs["metadata"] = {
@@ -5758,8 +6392,9 @@ class AIAgent:
                 if github_reasoning is not None:
                     extra_body["reasoning"] = github_reasoning
             else:
-                if self.reasoning_config is not None:
-                    rc = dict(self.reasoning_config)
+                resolved_reasoning_config = self._resolved_reasoning_config_for_request()
+                if resolved_reasoning_config is not None:
+                    rc = resolved_reasoning_config
                     # Nous Portal requires reasoning enabled — don't send
                     # enabled=false to it (would cause 400).
                     if _is_nous and rc.get("enabled") is False:
@@ -5794,8 +6429,20 @@ class AIAgent:
         # xAI prompt caching: send x-grok-conv-id header to route requests
         # to the same server, maximizing automatic cache hits.
         # https://docs.x.ai/developers/advanced-api-usage/prompt-caching
+        extra_headers = dict(api_kwargs.get("extra_headers") or {})
         if "x.ai" in self._base_url_lower and hasattr(self, "session_id") and self.session_id:
-            api_kwargs["extra_headers"] = {"x-grok-conv-id": self.session_id}
+            extra_headers["x-grok-conv-id"] = self.session_id
+        if self._is_cloudflare_ai_gateway_url():
+            extra_headers.update(
+                self._build_cloudflare_gateway_headers(
+                    api_messages=sanitized_messages,
+                    selected_model=selected_model,
+                    requested_model=requested_model,
+                    task_kind=cloudflare_task_kind,
+                )
+            )
+        if extra_headers:
+            api_kwargs["extra_headers"] = extra_headers
 
         return api_kwargs
 
@@ -5832,6 +6479,9 @@ class AIAgent:
             trace_payload["route_provider"] = self.provider
         if self.model:
             trace_payload["route_model"] = self.model
+        derived_correlation_id = self._derive_trace_correlation_id()
+        if derived_correlation_id:
+            trace_payload["correlation_id"] = derived_correlation_id
 
         privacy_mode = self._env_flag("OPENROUTER_BROADCAST_PRIVACY_MODE", default=True)
         for key, value in (self._trace_metadata or {}).items():
@@ -5879,6 +6529,31 @@ class AIAgent:
             "qwen/qwen3",
         )
         return any(model.startswith(prefix) for prefix in reasoning_model_prefixes)
+
+    def _requires_enabled_reasoning(self) -> bool:
+        """Return True when the route/model rejects `reasoning.enabled=false`."""
+        if "openrouter" not in self._base_url_lower:
+            return False
+        model = (self.model or "").strip().lower()
+        mandatory_reasoning_prefixes = (
+            "openai/gpt-oss",
+        )
+        return any(model.startswith(prefix) for prefix in mandatory_reasoning_prefixes)
+
+    def _resolved_reasoning_config_for_request(self) -> dict | None:
+        """Resolve reasoning config after applying provider/model safety guards."""
+        if self.reasoning_config is None:
+            return None
+        rc = dict(self.reasoning_config) if isinstance(self.reasoning_config, dict) else None
+        if not rc:
+            return None
+        if rc.get("enabled") is False and self._requires_enabled_reasoning():
+            logger.info(
+                "Reasoning disable override omitted for provider-required reasoning model: %s",
+                self.model,
+            )
+            return None
+        return rc
 
     def _github_models_reasoning_extra_body(self) -> dict | None:
         """Format reasoning payload for GitHub Models/OpenAI-compatible routes."""
@@ -6597,6 +7272,7 @@ class AIAgent:
                 if self.verbose_logging:
                     logging.debug(f"Tool {function_name} completed in {tool_duration:.2f}s")
                     logging.debug(f"Tool result ({len(function_result)} chars): {function_result}")
+                self._turn_tool_exec_elapsed_ms += max(tool_duration, 0.0) * 1000.0
 
             # Print cute message per tool
             if self.quiet_mode:
@@ -6920,6 +7596,7 @@ class AIAgent:
             if self.verbose_logging:
                 logging.debug(f"Tool {function_name} completed in {tool_duration:.2f}s")
                 logging.debug(f"Tool result ({len(function_result)} chars): {function_result}")
+            self._turn_tool_exec_elapsed_ms += max(tool_duration, 0.0) * 1000.0
 
             if self.tool_complete_callback:
                 try:
@@ -7273,6 +7950,11 @@ class AIAgent:
         self._last_content_with_tools = None
         self._mute_post_response = False
         self._surrogate_sanitized = False
+        self._turn_fallback_activations = 0
+        self._turn_provider_wait_elapsed_ms = 0.0
+        self._turn_tool_exec_elapsed_ms = 0.0
+        self._turn_provider_attempt_count = 0
+        self._turn_provider_wait_measurement_mode = "insufficient_data"
 
         # Pre-turn connection health check: detect and clean up dead TCP
         # connections left over from provider outages or dropped streams.
@@ -7698,7 +8380,7 @@ class AIAgent:
             
             api_start_time = time.time()
             retry_count = 0
-            max_retries = 3
+            max_retries = self._max_retry_attempts_for_request()
             primary_recovery_attempted = False
             max_compression_attempts = 3
             codex_auth_retry_attempted=False
@@ -7778,6 +8460,9 @@ class AIAgent:
                         response = self._interruptible_api_call(api_kwargs)
                     
                     api_duration = time.time() - api_start_time
+                    self._turn_provider_wait_elapsed_ms += max(api_duration, 0.0) * 1000.0
+                    self._turn_provider_attempt_count += 1
+                    self._turn_provider_wait_measurement_mode = "provider_wait_observed"
                     
                     # Stop thinking spinner silently -- the response box or tool
                     # execution messages that follow are more informative.
@@ -7868,9 +8553,10 @@ class AIAgent:
                         # Eager fallback: empty/malformed responses are a common
                         # rate-limit symptom.  Switch to fallback immediately
                         # rather than retrying with extended backoff.
-                        if self._fallback_index < len(self._fallback_chain):
-                            self._emit_status("⚠️ Empty/malformed response — switching to fallback...")
-                        if self._try_activate_fallback():
+                        if self._attempt_local_fallback(
+                            fallback_status="⚠️ Empty/malformed response — switching to fallback...",
+                            delegated_status="⚠️ Empty/malformed response — Cloudflare AI Gateway is handling provider failover.",
+                        ):
                             retry_count = 0
                             continue
 
@@ -7904,8 +8590,10 @@ class AIAgent:
                         
                         if retry_count >= max_retries:
                             # Try fallback before giving up
-                            self._emit_status(f"⚠️ Max retries ({max_retries}) for invalid responses — trying fallback...")
-                            if self._try_activate_fallback():
+                            if self._attempt_local_fallback(
+                                fallback_status=f"⚠️ Max retries ({max_retries}) for invalid responses — trying fallback...",
+                                delegated_status=f"⚠️ Max retries ({max_retries}) for invalid responses — Cloudflare AI Gateway is handling provider failover.",
+                            ):
                                 retry_count = 0
                                 continue
                             self._emit_status(f"❌ Max retries ({max_retries}) exceeded for invalid responses. Giving up.")
@@ -7922,6 +8610,7 @@ class AIAgent:
                         # Longer backoff for rate limiting (likely cause of None choices)
                         # Jittered exponential: 5s base, 120s cap + random jitter
                         wait_time = jittered_backoff(retry_count, base_delay=5.0, max_delay=120.0)
+                        wait_time = self._cap_retry_wait_for_request(wait_time)
                         self._vprint(f"{self.log_prefix}⏳ Retrying in {wait_time}s (extended backoff for possible rate limit)...", force=True)
                         logging.warning(f"Invalid API response (retry {retry_count}/{max_retries}): {', '.join(error_details)} | Provider: {provider_name}")
                         
@@ -8150,35 +8839,6 @@ class AIAgent:
                         self.session_cost_status = cost_result.status
                         self.session_cost_source = cost_result.source
 
-                        # Persist token counts to session DB for /insights.
-                        # Do this for every platform with a session_id so non-CLI
-                        # sessions (gateway, cron, delegated runs) cannot lose
-                        # token/accounting data if a higher-level persistence path
-                        # is skipped or fails. Gateway/session-store writes use
-                        # absolute totals, so they safely overwrite these per-call
-                        # deltas instead of double-counting them.
-                        if self._session_db and self.session_id:
-                            try:
-                                self._session_db.update_token_counts(
-                                    self.session_id,
-                                    input_tokens=canonical_usage.input_tokens,
-                                    output_tokens=canonical_usage.output_tokens,
-                                    cache_read_tokens=canonical_usage.cache_read_tokens,
-                                    cache_write_tokens=canonical_usage.cache_write_tokens,
-                                    reasoning_tokens=canonical_usage.reasoning_tokens,
-                                    estimated_cost_usd=float(cost_result.amount_usd)
-                                    if cost_result.amount_usd is not None else None,
-                                    cost_status=cost_result.status,
-                                    cost_source=cost_result.source,
-                                    billing_provider=self.provider,
-                                    billing_base_url=self.base_url,
-                                    billing_mode="subscription_included"
-                                    if cost_result.status == "included" else None,
-                                    model=self.model,
-                                )
-                            except Exception:
-                                pass  # never block the agent loop
-                        
                         if self.verbose_logging:
                             logging.debug(f"Token usage: prompt={usage_dict['prompt_tokens']:,}, completion={usage_dict['completion_tokens']:,}, total={usage_dict['total_tokens']:,}")
                         
@@ -8198,8 +8858,18 @@ class AIAgent:
                             if not self.quiet_mode:
                                 self._vprint(f"{self.log_prefix}   💾 Cache: {cached:,}/{prompt:,} tokens ({hit_pct:.0f}% hit, {written:,} written)")
 
-                    provider_usage = self._extract_openrouter_usage_metadata(response)
-                    self._last_provider_usage_metadata = provider_usage or {}
+                    billed_cost = None
+                    upstream_cost = None
+                    cache_discount = None
+                    provider_usage = self._extract_provider_transport_metadata(
+                        response,
+                        source="chat_completion_result",
+                    )
+                    openrouter_usage = self._extract_openrouter_usage_metadata(response)
+                    if openrouter_usage:
+                        provider_usage.update(openrouter_usage)
+                    self._merge_provider_usage_metadata(provider_usage)
+                    provider_usage = dict(self._last_provider_usage_metadata or {})
                     if provider_usage:
                         billed_cost = self._coerce_float(provider_usage.get("cost"))
                         if billed_cost is not None:
@@ -8211,14 +8881,61 @@ class AIAgent:
                         if cache_discount is not None:
                             self.session_cache_discount_usd += cache_discount
                         logger.info(
-                            "OpenRouter usage: generation_id=%s cost=%s upstream_inference_cost=%s cache_discount=%s cached_tokens=%s cache_write_tokens=%s",
+                            "Provider usage: provider=%s model=%s generation_id=%s request_id=%s status_code=%s async_request_id=%s cost=%s upstream_inference_cost=%s cache_discount=%s cached_tokens=%s cache_write_tokens=%s",
+                            getattr(self, "provider", "") or "",
+                            provider_usage.get("response_model", "") or getattr(self, "model", "") or "",
                             provider_usage.get("generation_id", ""),
+                            provider_usage.get("provider_request_id", "") or provider_usage.get("request_id", ""),
+                            provider_usage.get("provider_http_status_code", ""),
+                            provider_usage.get("provider_async_request_id", ""),
                             provider_usage.get("cost", ""),
                             provider_usage.get("upstream_inference_cost", ""),
                             provider_usage.get("cache_discount", ""),
                             provider_usage.get("cached_tokens", ""),
                             provider_usage.get("cache_write_tokens", ""),
                         )
+
+                    provider_status_code = provider_usage.get("provider_http_status_code")
+                    try:
+                        provider_status_code = int(provider_status_code)
+                    except (TypeError, ValueError):
+                        provider_status_code = None
+
+                    # Persist token counts and last-known provider metadata to
+                    # session DB for /insights and cache/cost forensics.
+                    if self._session_db and self.session_id:
+                        try:
+                            self._session_db.update_token_counts(
+                                self.session_id,
+                                input_tokens=canonical_usage.input_tokens,
+                                output_tokens=canonical_usage.output_tokens,
+                                cache_read_tokens=canonical_usage.cache_read_tokens,
+                                cache_write_tokens=canonical_usage.cache_write_tokens,
+                                reasoning_tokens=canonical_usage.reasoning_tokens,
+                                estimated_cost_usd=float(cost_result.amount_usd)
+                                if cost_result.amount_usd is not None else None,
+                                cost_status=cost_result.status,
+                                cost_source=cost_result.source,
+                                billing_provider=self.provider,
+                                billing_base_url=self.base_url,
+                                billing_mode="subscription_included"
+                                if cost_result.status == "included" else None,
+                                provider_generation_id=str(provider_usage.get("generation_id") or "").strip() or None,
+                                provider_request_id=str(
+                                    provider_usage.get("provider_request_id")
+                                    or provider_usage.get("request_id")
+                                    or ""
+                                ).strip() or None,
+                                provider_async_request_id=str(provider_usage.get("provider_async_request_id") or "").strip() or None,
+                                provider_http_status_code=provider_status_code,
+                                provider_response_model=str(provider_usage.get("response_model") or "").strip() or None,
+                                provider_cache_discount_usd=cache_discount,
+                                provider_billed_cost_usd=billed_cost,
+                                provider_upstream_inference_cost_usd=upstream_cost,
+                                model=self.model,
+                            )
+                        except Exception:
+                            pass  # never block the agent loop
                     
                     has_retried_429 = False  # Reset on success
                     self._touch_activity(f"API call #{api_call_count} completed")
@@ -8265,6 +8982,17 @@ class AIAgent:
 
                     status_code = getattr(api_error, "status_code", None)
                     error_context = self._extract_api_error_context(api_error)
+                    provider_error_meta = self._extract_provider_transport_metadata(
+                        status_code=status_code or getattr(getattr(api_error, "response", None), "status_code", None),
+                        headers=getattr(getattr(api_error, "response", None), "headers", None),
+                        body=getattr(api_error, "body", None),
+                        source="chat_completion_error",
+                    )
+                    if provider_error_meta:
+                        self._merge_provider_usage_metadata(provider_error_meta)
+                        self._log_provider_async_candidate(provider_error_meta)
+                        if status_code in (None, ""):
+                            status_code = provider_error_meta.get("provider_http_status_code")
 
                     # ── Classify the error for structured recovery decisions ──
                     _compressor = getattr(self, "context_compressor", None)
@@ -8367,6 +9095,9 @@ class AIAgent:
 
                     retry_count += 1
                     elapsed_time = time.time() - api_start_time
+                    self._turn_provider_wait_elapsed_ms += max(elapsed_time, 0.0) * 1000.0
+                    self._turn_provider_attempt_count += 1
+                    self._turn_provider_wait_measurement_mode = "provider_wait_observed"
                     
                     error_type = type(api_error).__name__
                     error_msg = str(api_error).lower()
@@ -8477,8 +9208,10 @@ class AIAgent:
                         pool = self._credential_pool
                         pool_may_recover = pool is not None and pool.has_available()
                         if not pool_may_recover:
-                            self._emit_status("⚠️ Rate limited — switching to fallback provider...")
-                            if self._try_activate_fallback():
+                            if self._attempt_local_fallback(
+                                fallback_status="⚠️ Rate limited — switching to fallback provider...",
+                                delegated_status="⚠️ Rate limited — Cloudflare AI Gateway is handling provider failover.",
+                            ):
                                 retry_count = 0
                                 continue
 
@@ -8657,8 +9390,10 @@ class AIAgent:
                             pass
                         # Try fallback before aborting — a different provider
                         # may not have the same issue (rate limit, auth, etc.)
-                        self._emit_status(f"⚠️ Non-retryable error (HTTP {status_code}) — trying fallback...")
-                        if self._try_activate_fallback():
+                        if self._attempt_local_fallback(
+                            fallback_status=f"⚠️ Non-retryable error (HTTP {status_code}) — trying fallback...",
+                            delegated_status=f"⚠️ Non-retryable error (HTTP {status_code}) — Cloudflare AI Gateway is handling provider failover.",
+                        ):
                             retry_count = 0
                             continue
                         self._dump_api_request_debug(
@@ -8714,15 +9449,20 @@ class AIAgent:
                         # client once for transient transport errors (stale
                         # connection pool, TCP reset).  Only attempted once
                         # per API call block.
-                        if not primary_recovery_attempted and self._try_recover_primary_transport(
+                        if (
+                            not self._is_cost_optimized_feishu_request()
+                            and not primary_recovery_attempted
+                            and self._try_recover_primary_transport(
                             api_error, retry_count=retry_count, max_retries=max_retries,
-                        ):
+                        )):
                             primary_recovery_attempted = True
                             retry_count = 0
                             continue
                         # Try fallback before giving up entirely
-                        self._emit_status(f"⚠️ Max retries ({max_retries}) exhausted — trying fallback...")
-                        if self._try_activate_fallback():
+                        if self._attempt_local_fallback(
+                            fallback_status=f"⚠️ Max retries ({max_retries}) exhausted — trying fallback...",
+                            delegated_status=f"⚠️ Max retries ({max_retries}) exhausted — Cloudflare AI Gateway is handling provider failover.",
+                        ):
                             retry_count = 0
                             continue
                         _final_summary = self._summarize_api_error(api_error)
@@ -8807,6 +9547,7 @@ class AIAgent:
                                 except (TypeError, ValueError):
                                     pass
                     wait_time = _retry_after if _retry_after else jittered_backoff(retry_count, base_delay=2.0, max_delay=60.0)
+                    wait_time = self._cap_retry_wait_for_request(wait_time)
                     if is_rate_limited:
                         self._emit_status(f"⏱️ Rate limit reached. Waiting {wait_time}s before retry (attempt {retry_count + 1}/{max_retries})...")
                     else:
@@ -9638,6 +10379,12 @@ class AIAgent:
             "estimated_cost_usd": self.session_estimated_cost_usd,
             "cost_status": self.session_cost_status,
             "cost_source": self.session_cost_source,
+            "provider_wait_elapsed_ms": int(round(self._turn_provider_wait_elapsed_ms)),
+            "tool_exec_elapsed_ms": int(round(self._turn_tool_exec_elapsed_ms)),
+            "provider_attempt_count": int(self._turn_provider_attempt_count),
+            "provider_retry_count": max(int(self._turn_provider_attempt_count) - 1, 0),
+            "provider_wait_measurement_mode": self._turn_provider_wait_measurement_mode,
+            "provider_fallback_used": bool(self._fallback_activated),
             "provider_usage": dict(self._last_provider_usage_metadata or {}),
             "provider_usage_totals": {
                 "billed_cost_usd": self.session_billed_cost_usd,

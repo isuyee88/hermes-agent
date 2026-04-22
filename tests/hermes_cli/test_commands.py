@@ -1,6 +1,6 @@
 """Tests for the central command registry and autocomplete."""
 
-from prompt_toolkit.completion import CompleteEvent
+from prompt_toolkit.completion import CompleteEvent, Completion
 from prompt_toolkit.document import Document
 
 from hermes_cli.commands import (
@@ -91,6 +91,8 @@ class TestResolveCommand:
         assert resolve_command("gateway").name == "platforms"
         assert resolve_command("set-home").name == "sethome"
         assert resolve_command("reload_mcp").name == "reload-mcp"
+        assert resolve_command("report").name == "kpi"
+        assert resolve_command("feishu-kpi").name == "kpi"
 
     def test_leading_slash_stripped(self):
         assert resolve_command("/help").name == "help"
@@ -417,6 +419,20 @@ class TestSlashCommandCompleter:
         completions = _completions(completer, "/no-desc")
         assert len(completions) == 1
         assert "Skill command" in completions[0].display_meta_text
+
+    def test_at_context_completion_does_not_crash(self, monkeypatch):
+        completer = SlashCommandCompleter()
+
+        monkeypatch.setattr(
+            completer,
+            "_context_completions",
+            lambda word, limit=30: iter([Completion("@diff", start_position=-len(word))]),
+        )
+
+        completions = _completions(completer, "@d")
+
+        assert len(completions) == 1
+        assert completions[0].text == "@diff"
 
 
 # ── SUBCOMMANDS extraction ──────────────────────────────────────────────

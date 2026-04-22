@@ -25,6 +25,7 @@ from tools.feishu_api import (
     markdown_to_doc_blocks,
     mirror_model_registry_to_bitable,
     normalize_document_summary,
+    normalize_sheet_range,
     normalize_user_profile,
     quote_range,
     resolve_message_receive_id_type,
@@ -647,9 +648,15 @@ def feishu_sheet_read_range_tool(args: Dict[str, Any], **_kw: Any) -> str:
         return tool_error("range is required")
     try:
         token = extract_spreadsheet_token(args.get("spreadsheet_token_or_url", ""))
-        data = _client().request_json(
+        client = _client()
+        normalized_range = normalize_sheet_range(
+            client,
+            spreadsheet_token=token,
+            range_name=range_name,
+        )
+        data = client.request_json(
             "GET",
-            f"/open-apis/sheets/v2/spreadsheets/{token}/values/{quote_range(range_name)}",
+            f"/open-apis/sheets/v2/spreadsheets/{token}/values/{quote_range(normalized_range)}",
         )
         values = data.get("valueRange", {}).get("values")
         if values is None:
@@ -657,7 +664,7 @@ def feishu_sheet_read_range_tool(args: Dict[str, Any], **_kw: Any) -> str:
         return tool_result(
             success=True,
             spreadsheet_token=token,
-            range=range_name,
+            range=normalized_range,
             values=values or [],
         )
     except Exception as exc:
@@ -674,15 +681,21 @@ def feishu_sheet_write_range_tool(args: Dict[str, Any], **_kw: Any) -> str:
         return tool_error("values must be a 2D array")
     try:
         token = extract_spreadsheet_token(args.get("spreadsheet_token_or_url", ""))
-        data = _client().request_json(
+        client = _client()
+        normalized_range = normalize_sheet_range(
+            client,
+            spreadsheet_token=token,
+            range_name=range_name,
+        )
+        data = client.request_json(
             "PUT",
             f"/open-apis/sheets/v2/spreadsheets/{token}/values",
-            json_body={"valueRange": {"range": range_name, "values": values}},
+            json_body={"valueRange": {"range": normalized_range, "values": values}},
         )
         return tool_result(
             success=True,
             spreadsheet_token=token,
-            updated_range=data.get("updatedRange") or range_name,
+            updated_range=data.get("updatedRange") or normalized_range,
             updated_rows=data.get("updatedRows"),
         )
     except Exception as exc:

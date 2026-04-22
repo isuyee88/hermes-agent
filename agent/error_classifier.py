@@ -591,6 +591,13 @@ def _classify_400(
 
     # Generic 400 + large session → probable context overflow
     # Anthropic sometimes returns a bare "Error" message when context is too large
+    if error_code == "2005" or "failed to get response from provider" in error_msg:
+        return result_fn(
+            FailoverReason.server_error,
+            retryable=True,
+            should_fallback=True,
+        )
+
     err_body_msg = ""
     if isinstance(body, dict):
         err_obj = body.get("error", {})

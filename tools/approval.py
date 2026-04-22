@@ -169,10 +169,17 @@ def detect_dangerous_command(command: str) -> tuple:
 # Per-session approval state (thread-safe)
 # =========================================================================
 
-_lock = threading.Lock()
+_lock = None
 _pending: dict[str, dict] = {}
 _session_approved: dict[str, set] = {}
 _permanent_approved: set = set()
+
+
+def _get_approval_lock() -> threading.Lock:
+    global _lock
+    if _lock is None:
+        _lock = threading.Lock()
+    return _lock
 
 # =========================================================================
 # Blocking gateway approval (mirrors CLI's synchronous input() flow)
@@ -205,7 +212,7 @@ def register_gateway_notify(session_key: str, cb) -> None:
     ``pattern_keys``.  The callback bridges sync→async (runs in the agent
     thread, must schedule the actual send on the event loop).
     """
-    with _lock:
+    with _get_approval_lock():
         _gateway_notify_cbs[session_key] = cb
 
 
@@ -215,7 +222,7 @@ def unregister_gateway_notify(session_key: str) -> None:
     Signals ALL blocked threads for this session so they don't hang forever
     (e.g. when the agent run finishes or is interrupted).
     """
-    with _lock:
+    with _get_approval_lock():
         _gateway_notify_cbs.pop(session_key, None)
         entries = _gateway_queues.pop(session_key, [])
         for entry in entries:
@@ -233,7 +240,7 @@ def resolve_gateway_approval(session_key: str, choice: str,
 
     Returns the number of approvals resolved (0 means nothing was pending).
     """
-    with _lock:
+    with _get_approval_lock():
         queue = _gateway_queues.get(session_key)
         if not queue:
             return 0
@@ -253,37 +260,37 @@ def resolve_gateway_approval(session_key: str, choice: str,
 
 def has_blocking_approval(session_key: str) -> bool:
     """Check if a session has one or more blocking gateway approvals waiting."""
-    with _lock:
+    with _get_approval_lock():
         return bool(_gateway_queues.get(session_key))
 
 
 def pending_approval_count(session_key: str) -> int:
     """Return the number of pending blocking approvals for a session."""
-    with _lock:
+    with _get_approval_lock():
         return len(_gateway_queues.get(session_key, []))
 
 
 def submit_pending(session_key: str, approval: dict):
     """Store a pending approval request for a session."""
-    with _lock:
+    with _get_approval_lock():
         _pending[session_key] = approval
 
 
 def pop_pending(session_key: str) -> Optional[dict]:
     """Retrieve and remove a pending approval for a session."""
-    with _lock:
+    with _get_approval_lock():
         return _pending.pop(session_key, None)
 
 
 def has_pending(session_key: str) -> bool:
     """Check if a session has a pending approval request."""
-    with _lock:
+    with _get_approval_lock():
         return session_key in _pending
 
 
 def approve_session(session_key: str, pattern_key: str):
     """Approve a pattern for this session only."""
-    with _lock:
+    with _get_approval_lock():
         _session_approved.setdefault(session_key, set()).add(pattern_key)
 
 
@@ -294,7 +301,7 @@ def is_approved(session_key: str, pattern_key: str) -> bool:
     existing command_allowlist entries continue to work after key migrations.
     """
     aliases = _approval_key_aliases(pattern_key)
-    with _lock:
+    with _get_approval_lock():
         if any(alias in _permanent_approved for alias in aliases):
             return True
         session_approvals = _session_approved.get(session_key, set())
@@ -303,19 +310,19 @@ def is_approved(session_key: str, pattern_key: str) -> bool:
 
 def approve_permanent(pattern_key: str):
     """Add a pattern to the permanent allowlist."""
-    with _lock:
+    with _get_approval_lock():
         _permanent_approved.add(pattern_key)
 
 
 def load_permanent(patterns: set):
     """Bulk-load permanent allowlist entries from config."""
-    with _lock:
+    with _get_approval_lock():
         _permanent_approved.update(patterns)
 
 
 def clear_session(session_key: str):
     """Clear all approvals and pending requests for a session."""
-    with _lock:
+    with _get_approval_lock():
         _session_approved.pop(session_key, None)
         _pending.pop(session_key, None)
         _gateway_notify_cbs.pop(session_key, None)
@@ -750,7 +757,7 @@ def check_all_command_guards(command: str, env_type: str,
     # gets the command output (approved) or a definitive "BLOCKED" message.
     if is_gateway or is_ask:
         notify_cb = None
-        with _lock:
+        with _get_approval_lock():
             notify_cb = _gateway_notify_cbs.get(session_key)
 
         if notify_cb is not None:
@@ -764,7 +771,7 @@ def check_all_command_guards(command: str, env_type: str,
                 "description": combined_desc,
             }
             entry = _ApprovalEntry(approval_data)
-            with _lock:
+            with _get_approval_lock():
                 _gateway_queues.setdefault(session_key, []).append(entry)
 
             # Notify the user (bridges sync agent thread → async gateway)
@@ -772,7 +779,7 @@ def check_all_command_guards(command: str, env_type: str,
                 notify_cb(approval_data)
             except Exception as exc:
                 logger.warning("Gateway approval notify failed: %s", exc)
-                with _lock:
+                with _get_approval_lock():
                     queue = _gateway_queues.get(session_key, [])
                     if entry in queue:
                         queue.remove(entry)
@@ -794,7 +801,7 @@ def check_all_command_guards(command: str, env_type: str,
             resolved = entry.event.wait(timeout=timeout)
 
             # Clean up this entry from the queue
-            with _lock:
+            with _get_approval_lock():
                 queue = _gateway_queues.get(session_key, [])
                 if entry in queue:
                     queue.remove(entry)
