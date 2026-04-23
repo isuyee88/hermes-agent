@@ -117,6 +117,19 @@ _MODEL_REGISTRY_VIEW_SPECS = [
         "filter_hint": "Filter Hidden = true or Status in (inactive, invalid).",
     },
 ]
+_MODEL_REGISTRY_INTRO_FIELD_CANDIDATES = (
+    "Introduction",
+    "Description",
+    "Summary",
+    "Model Introduction",
+    "Model Description",
+    "简介",
+    "介绍",
+    "模型介绍",
+    "模型简介",
+    "说明",
+    "备注",
+)
 
 
 @dataclass(slots=True)
@@ -1366,7 +1379,193 @@ def build_model_registry(force_refresh: bool = False) -> Dict[str, Any]:
     return payload
 
 
+def _bitable_registry_is_configured() -> bool:
+    bitable_app_token = str(os.getenv("FEISHU_BITABLE_APP_TOKEN") or "").strip()
+    bitable_wiki_token = str(os.getenv("FEISHU_BITABLE_WIKI_TOKEN") or "").strip()
+    bitable_table_id = str(os.getenv("FEISHU_BITABLE_TABLE_ID") or "").strip()
+    return bool((bitable_app_token or bitable_wiki_token) and bitable_table_id)
+
+
+def _coerce_bitable_scalar(value: Any) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, list):
+        parts: list[str] = []
+        for item in value:
+            normalized = _coerce_bitable_scalar(item)
+            if normalized in (None, ""):
+                continue
+            if isinstance(normalized, bool):
+                parts.append("true" if normalized else "false")
+            else:
+                parts.append(str(normalized).strip())
+        return "\n".join(part for part in parts if part)
+    if isinstance(value, dict):
+        for key in ("text", "name", "title", "display_name", "url", "link", "value", "email"):
+            candidate = value.get(key)
+            normalized = _coerce_bitable_scalar(candidate)
+            if normalized not in (None, ""):
+                return normalized
+        return json.dumps(value, ensure_ascii=False, sort_keys=True)
+    return str(value)
+
+
+def _bitable_text(fields: Dict[str, Any], *names: str) -> str:
+    for name in names:
+        if name not in fields:
+            continue
+        normalized = _coerce_bitable_scalar(fields.get(name))
+        if normalized in (None, ""):
+            continue
+        return str(normalized).strip()
+    return ""
+
+
+def _bitable_bool(fields: Dict[str, Any], *names: str, default: bool = False) -> bool:
+    for name in names:
+        if name not in fields:
+            continue
+        normalized = _coerce_bitable_scalar(fields.get(name))
+        if isinstance(normalized, bool):
+            return normalized
+        if isinstance(normalized, (int, float)):
+            return bool(normalized)
+        text = str(normalized or "").strip().lower()
+        if not text:
+            continue
+        if text in {"1", "true", "yes", "y", "checked", "on"}:
+            return True
+        if text in {"0", "false", "no", "n", "unchecked", "off"}:
+            return False
+    return default
+
+
+def _bitable_int(fields: Dict[str, Any], *names: str) -> int | None:
+    for name in names:
+        if name not in fields:
+            continue
+        normalized = _coerce_bitable_scalar(fields.get(name))
+        if normalized in (None, ""):
+            continue
+        try:
+            return int(float(str(normalized).strip()))
+        except Exception:
+            continue
+    return None
+
+
+def _normalize_bitable_model_registry_entry(record: Dict[str, Any], *, now: int) -> Dict[str, Any] | None:
+    fields = record.get("fields") if isinstance(record.get("fields"), dict) else {}
+    if not isinstance(fields, dict):
+        return None
+
+    provider = _bitable_text(fields, "Provider", "provider").lower()
+    model_id = _bitable_text(fields, "Model", "model", "Model ID", "模型ID")
+    if not provider or not model_id:
+        return None
+
+    introduction = _bitable_text(fields, *_MODEL_REGISTRY_INTRO_FIELD_CANDIDATES)
+    display_name = _bitable_text(fields, "Display Name", "DisplayName", "名称", "Model Name") or model_id
+    rank = _bitable_int(fields, "Rank", "排序", "Order")
+    generated_command = _bitable_text(fields, "Generated Command")
+    if not generated_command:
+        generated_command = f"/model {model_id} --provider {provider}"
+
+    status = _bitable_text(fields, "Status", "状态") or "active"
+    selection_hint = _bitable_text(fields, "Selection Hint", "Selection", "推荐级别", "标签")
+
+    return {
+        "provider": provider,
+        "model": model_id,
+        "display_name": display_name,
+        "is_free": _bitable_bool(fields, "Is Free", "Free", "免费"),
+        "is_available": _bitable_bool(fields, "Is Available", "Available", "可用", default=True),
+        "rank": rank if rank is not None else 9999,
+        "last_probe_at": _bitable_int(fields, "Last Probe At", "Probe At") or now,
+        "latency_ms": _bitable_int(fields, "Latency Ms", "Latency"),
+        "context_window": _bitable_int(fields, "Context Window", "Context"),
+        "reasoning": _bitable_bool(fields, "Reasoning", "推理"),
+        "manual_pinned": _bitable_bool(fields, "Manual Pinned", "Pinned", "置顶"),
+        "selection_hint": selection_hint,
+        "status": status,
+        "hidden": _bitable_bool(fields, "Hidden", "隐藏"),
+        "recent_used": _bitable_bool(fields, "Recent Used", "Recently Used"),
+        "recent_used_count": _bitable_int(fields, "Recent Used Count", "Used Count") or 0,
+        "recent_used_at": _bitable_int(fields, "Recent Used At"),
+        "generated_command": generated_command,
+        "last_error_code": _bitable_text(fields, "Last Error Code"),
+        "last_error_message": _bitable_text(fields, "Last Error Message"),
+        "last_failed_at": _bitable_int(fields, "Last Failed At"),
+        "consecutive_failures": _bitable_int(fields, "Consecutive Failures") or 0,
+        "failure_kind": _bitable_text(fields, "Failure Kind"),
+        "source": _bitable_text(fields, "Source") or "bitable",
+        "introduction": introduction,
+        "description": introduction,
+        "summary": introduction,
+        "record_id": str(record.get("record_id") or "").strip(),
+    }
+
+
+def _load_model_registry_from_bitable(force_refresh: bool = False) -> Dict[str, Any]:
+    del force_refresh  # Remote Bitable reads are always live.
+    client = build_feishu_client()
+    app_token, table_id = resolve_bitable_target({}, client)
+    page_token = ""
+    now = int(time.time())
+    entries: list[dict[str, Any]] = []
+
+    while True:
+        params: Dict[str, Any] = {"page_size": 500}
+        if page_token:
+            params["page_token"] = page_token
+        payload = client.request_json(
+            "GET",
+            f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/records",
+            params=params,
+        )
+        for item in payload.get("items") or []:
+            if not isinstance(item, dict):
+                continue
+            normalized = _normalize_bitable_model_registry_entry(item, now=now)
+            if normalized is not None:
+                entries.append(normalized)
+        if not payload.get("has_more"):
+            break
+        page_token = str(payload.get("page_token") or "").strip()
+        if not page_token:
+            break
+
+    entries.sort(
+        key=lambda item: (
+            bool(item.get("hidden")),
+            0 if item.get("recent_used") else 1,
+            0 if str(item.get("selection_hint") or "").strip().lower() == "recommended" else 1,
+            int(item.get("rank") or 9999),
+            str(item.get("provider") or ""),
+            str(item.get("model") or ""),
+        )
+    )
+
+    payload = {
+        "status": "ok",
+        "schema_version": _MODEL_REGISTRY_SCHEMA_VERSION,
+        "generated_at": now,
+        "refreshed_at": now,
+        "source": "bitable",
+        "entries": entries,
+    }
+    atomic_write_json(get_model_registry_path(), payload)
+    return payload
+
+
 def load_feishu_model_registry(force_refresh: bool = False) -> Dict[str, Any]:
+    if _bitable_registry_is_configured():
+        try:
+            return _load_model_registry_from_bitable(force_refresh=force_refresh)
+        except Exception:
+            logger.warning("Failed loading model registry from Feishu Bitable; falling back to local registry", exc_info=True)
     return build_model_registry(force_refresh=force_refresh)
 
 

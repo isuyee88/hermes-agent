@@ -24,7 +24,7 @@
       "persist": true
     }
   },
-  "logpush": true,
+  "logpush": false,
   "vars": {
     "HONEYCOMB_DATASET": "hermes-feishu-gateway",
     "FEISHU_API_BASE": "https://open.feishu.cn",
@@ -48,6 +48,11 @@
     "HERMES_MODEL_CATALOG_QUEUE_RETRY_DELAY_SECONDS": "300",
     "HERMES_MODEL_CATALOG_QUEUE_HARD_RETRY_DELAY_SECONDS": "21600",
     "HERMES_MODEL_CATALOG_QUEUE_LEASE_SECONDS": "900",
+    "HERMES_FEISHU_KPI_QUEUE_ENABLED": "true",
+    "HERMES_FEISHU_KPI_QUEUE_DELAY_SECONDS": "600",
+    "HERMES_FEISHU_KPI_QUEUE_RETRY_DELAY_SECONDS": "120",
+    "HERMES_FEISHU_KPI_QUEUE_HARD_RETRY_DELAY_SECONDS": "3600",
+    "HERMES_FEISHU_KPI_QUEUE_LEASE_SECONDS": "300",
     "FEISHU_MODEL_REGISTRY_MIRROR_ENABLED": "true",
     "FEISHU_MODEL_REGISTRY_MAX_MUTATIONS_PER_RUN": "25",
     "FEISHU_MODEL_REGISTRY_STALE_DELETE_AFTER_SECONDS": "86400",
@@ -67,6 +72,10 @@
     {
       "binding": "FEISHU_GATEWAY_ANALYTICS",
       "dataset": "hermes_feishu_gateway_events"
+    },
+    {
+      "binding": "FEISHU_GATEWAY_KPI_ROLLUPS",
+      "dataset": "hermes_feishu_kpi_rollups"
     }
   ],
   "queues": {

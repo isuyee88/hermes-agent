@@ -201,8 +201,10 @@ export async function runFeishuWorkflow(args: {
                       return await deps.executeCloudflareAiExec(env, normalized, planned);
                     } catch (error) {
                       const fallbackReason = deps.classifyCfAiExecFallbackReason(error, planned);
-                      deps.log("feishu.cf_ai_exec.fallback", {
+                      const fallbackPayload = {
                         correlation_id: normalized.correlation_id,
+                        session_key: normalized.session_key,
+                        event_id: normalized.event_id,
                         route_decision_reason: deps.trim(planned.route_decision_reason),
                         fallback_reason: fallbackReason,
                         fallback_path: "modal_internal_direct",
@@ -213,7 +215,46 @@ export async function runFeishuWorkflow(args: {
                           gateway_error_class: fallbackReason,
                           misroute_detected: fallbackReason === "misrouted_request_class",
                         }),
-                      });
+                      };
+                      deps.log("feishu.cf_ai_exec.fallback", fallbackPayload);
+                      writeFeishuAnalyticsEvent(env, "feishu.cf_ai_exec.fallback", fallbackPayload);
+                      const fallbackInternal = await deps.invokeAgentExec(
+                        env,
+                        normalized,
+                        {
+                          ...planned,
+                          route_decision_reason: deps.trim(planned.route_decision_reason),
+                          fallback_reason: fallbackReason,
+                          provider_async_eligible: !!planned.provider_async_eligible,
+                          provider_async_observed: !!planned.provider_async_observed,
+                          gateway_error_class: fallbackReason,
+                          misroute_detected: fallbackReason === "misrouted_request_class",
+                        },
+                        sitePrefetch,
+                      );
+                      const fallbackDonePayload = {
+                        correlation_id: normalized.correlation_id,
+                        session_key: normalized.session_key,
+                        event_id: normalized.event_id,
+                        execution_mode: fallbackInternal.execution_mode || "modal_heavy_exec",
+                        route_decision_reason:
+                          deps.trim(fallbackInternal.route_decision_reason) || deps.trim(planned.route_decision_reason),
+                        fallback_reason: deps.trim(fallbackInternal.fallback_reason) || fallbackReason,
+                        fallback_path: "modal_internal_direct",
+                        success: true,
+                        ...deps.buildRoutingLogFields(normalized, {
+                          ...planned,
+                          ...fallbackInternal,
+                          route_hint: (fallbackInternal.route_hint || effectiveRouteHint) as ModalInternalResponse["route_hint"],
+                          gateway_error_class: deps.trim(fallbackInternal.fallback_reason) || fallbackReason,
+                          misroute_detected:
+                            (deps.trim(fallbackInternal.fallback_reason) || fallbackReason) ===
+                            "misrouted_request_class",
+                        }),
+                      };
+                      deps.log("feishu.cf_ai_exec.fallback.done", fallbackDonePayload);
+                      writeFeishuAnalyticsEvent(env, "feishu.cf_ai_exec.fallback.done", fallbackDonePayload);
+                      return fallbackInternal;
                     }
                   }
                   return deps.invokeAgentExec(

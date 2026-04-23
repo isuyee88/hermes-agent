@@ -16,6 +16,13 @@ import aiohttp
 
 TEST_CHAT_ID = os.getenv("FEISHU_TEST_CHAT_ID") or os.getenv("FEISHU_HOME_CHANNEL") or ""
 
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="backslashreplace")
+    except Exception:
+        pass
+
 
 async def get_tenant_token(app_id: str, app_secret: str) -> str:
     """获取应用级别的tenant_access_token"""

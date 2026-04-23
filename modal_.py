@@ -61,6 +61,23 @@ PERSONALITY_LABELS = {
     "finance": "Finance",
     "board": "Board",
 }
+RECENT_MODEL_HISTORY_KEY = "recent_models_json"
+MODEL_REGISTRY_INTRO_KEYS: tuple[str, ...] = ("introduction", "description", "summary")
+PERSONALITY_SYSTEM_PROMPTS = {
+    "none": "Keep the tone neutral, helpful, and direct.",
+    "ceo": "Answer like a concise CEO: prioritize decisions, tradeoffs, and outcomes.",
+    "cto": "Answer like a pragmatic CTO: emphasize architecture, risks, and implementation detail.",
+    "staff": "Answer like a chief of staff: structure the response clearly and keep stakeholders aligned.",
+    "sev": "Answer like an incident commander: identify the issue, impact, next steps, and mitigation.",
+    "grow": "Answer like a growth lead: focus on experiments, funnels, and measurable impact.",
+    "content": "Answer like a content strategist: provide crisp messaging and audience-aware framing.",
+    "seo": "Answer like an SEO lead: consider search intent, information architecture, and discoverability.",
+    "ads": "Answer like a paid ads operator: focus on targeting, creative angles, and efficiency.",
+    "bd": "Answer like a business development lead: focus on partnerships, positioning, and leverage.",
+    "ops": "Answer like an operations lead: optimize for process clarity, handoffs, and reliability.",
+    "finance": "Answer like a finance lead: highlight cost, ROI, and planning implications.",
+    "board": "Answer like a board-ready advisor: summarize crisply, note risk, and stay outcome-oriented.",
+}
 
 if modal is not None:
     modal_volume = modal.Volume.from_name("hermes-agent-data", create_if_missing=True)
@@ -214,6 +231,7 @@ def _load_session_state_map() -> dict[str, dict[str, str]]:
                     "current_model": str(value.get("current_model") or "openrouter/free"),
                     "current_provider": str(value.get("current_provider") or "openrouter"),
                     "current_personality": str(value.get("current_personality") or "none"),
+                    RECENT_MODEL_HISTORY_KEY: str(value.get(RECENT_MODEL_HISTORY_KEY) or "{}"),
                 }
             if payload:
                 return payload
@@ -235,6 +253,7 @@ def _load_session_state_map() -> dict[str, dict[str, str]]:
             "current_model": str(raw_state.get("current_model") or "openrouter/free"),
             "current_provider": str(raw_state.get("current_provider") or "openrouter"),
             "current_personality": str(raw_state.get("current_personality") or "none"),
+            RECENT_MODEL_HISTORY_KEY: str(raw_state.get(RECENT_MODEL_HISTORY_KEY) or "{}"),
         }
         result[str(session_key)] = normalized
     return result
@@ -297,6 +316,7 @@ def _get_session_state(session_key: str) -> dict[str, str]:
             "current_model": "openrouter/free",
             "current_provider": "openrouter",
             "current_personality": "none",
+            RECENT_MODEL_HISTORY_KEY: "{}",
         },
     )
     return state
@@ -308,6 +328,7 @@ def _save_session_state(session_key: str) -> dict[str, str]:
         "current_model": str(state.get("current_model") or "openrouter/free"),
         "current_provider": str(state.get("current_provider") or "openrouter"),
         "current_personality": str(state.get("current_personality") or "none"),
+        RECENT_MODEL_HISTORY_KEY: str(state.get(RECENT_MODEL_HISTORY_KEY) or "{}"),
     }
     _persist_session_state_map()
     return SESSION_STATE[session_key]
@@ -333,6 +354,266 @@ def _build_session_state_after(state: dict[str, str]) -> dict[str, Any]:
         "current_provider": state.get("current_provider") or "openrouter",
         "current_personality": state.get("current_personality") or "none",
         "route_status_lines": _build_route_status_lines(state),
+    }
+
+
+def _load_registry_payload(force_refresh: bool = False) -> dict[str, Any]:
+    try:
+        from tools.feishu_api import load_feishu_model_registry
+
+        payload = load_feishu_model_registry(force_refresh=force_refresh)
+    except Exception:
+        return {"status": "fallback", "entries": []}
+    return payload if isinstance(payload, dict) else {"status": "fallback", "entries": []}
+
+
+def _iter_registry_entries(force_refresh: bool = False) -> list[dict[str, Any]]:
+    payload = _load_registry_payload(force_refresh=force_refresh)
+    entries = payload.get("entries")
+    if not isinstance(entries, list):
+        return []
+    normalized_entries: list[dict[str, Any]] = []
+    for item in entries:
+        if not isinstance(item, dict):
+            continue
+        provider = str(item.get("provider") or "").strip().lower()
+        model_id = str(item.get("model") or "").strip()
+        if not provider or not model_id:
+            continue
+        normalized = dict(item)
+        normalized["provider"] = provider
+        normalized["model"] = model_id
+        normalized_entries.append(normalized)
+    normalized_entries.sort(
+        key=lambda item: (
+            bool(item.get("hidden")),
+            0 if str(item.get("selection_hint") or "").strip().lower() == "recommended" else 1,
+            int(item.get("rank") or 9999),
+            str(item.get("provider") or ""),
+            str(item.get("model") or ""),
+        )
+    )
+    return normalized_entries
+
+
+def _get_registry_entries_for_provider(provider_slug: str) -> list[dict[str, Any]]:
+    normalized_provider = str(provider_slug or "").strip().lower()
+    entries = [
+        item
+        for item in _iter_registry_entries(force_refresh=False)
+        if str(item.get("provider") or "").strip().lower() == normalized_provider and not bool(item.get("hidden"))
+    ]
+    if entries:
+        return entries
+    return [
+        {
+            "provider": provider,
+            "model": model,
+            "display_name": model,
+            "selection_hint": "recommended" if index == 0 else "",
+            "rank": index + 1,
+            "generated_command": f"/model {model} --provider {provider}",
+        }
+        for index, (provider, model) in enumerate(MODEL_PRESETS)
+        if str(provider or "").strip().lower() == normalized_provider and str(model or "").strip()
+    ]
+
+
+def _lookup_registry_entry(provider_slug: str, model_id: str) -> dict[str, Any] | None:
+    provider = str(provider_slug or "").strip().lower()
+    model = str(model_id or "").strip()
+    if not provider or not model:
+        return None
+    for item in _get_registry_entries_for_provider(provider):
+        if str(item.get("model") or "").strip() == model:
+            return item
+    return None
+
+
+def _model_intro_text(entry: dict[str, Any] | None) -> str:
+    if not isinstance(entry, dict):
+        return ""
+    for key in MODEL_REGISTRY_INTRO_KEYS:
+        value = str(entry.get(key) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _models_for_provider(provider_slug: str) -> list[str]:
+    return [str(item.get("model") or "").strip() for item in _get_registry_entries_for_provider(provider_slug)]
+
+
+def _load_recent_model_history(state: dict[str, str]) -> dict[str, list[str]]:
+    raw = str(state.get(RECENT_MODEL_HISTORY_KEY) or "{}")
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        parsed = {}
+    if not isinstance(parsed, dict):
+        return {}
+    result: dict[str, list[str]] = {}
+    for provider, models in parsed.items():
+        provider_slug = str(provider or "").strip().lower()
+        if not provider_slug or not isinstance(models, list):
+            continue
+        result[provider_slug] = [str(model).strip() for model in models if str(model).strip()]
+    return result
+
+
+def _save_recent_model_history(state: dict[str, str], history: dict[str, list[str]]) -> None:
+    compact: dict[str, list[str]] = {}
+    for provider, models in history.items():
+        provider_slug = str(provider or "").strip().lower()
+        if not provider_slug:
+            continue
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for model in models:
+            normalized_model = str(model or "").strip()
+            if not normalized_model or normalized_model in seen:
+                continue
+            deduped.append(normalized_model)
+            seen.add(normalized_model)
+        if deduped:
+            compact[provider_slug] = deduped[:8]
+    state[RECENT_MODEL_HISTORY_KEY] = json.dumps(compact, ensure_ascii=False)
+
+
+def _remember_recent_model(state: dict[str, str], provider_slug: str, model_id: str) -> None:
+    provider = str(provider_slug or "").strip().lower()
+    model = str(model_id or "").strip()
+    if not provider or not model:
+        return
+    history = _load_recent_model_history(state)
+    existing = [item for item in history.get(provider, []) if item != model]
+    history[provider] = [model, *existing][:8]
+    _save_recent_model_history(state, history)
+
+
+def _performance_priority(model_id: str) -> int:
+    normalized = str(model_id or "").strip().lower()
+    if not normalized:
+        return 99
+    if any(token in normalized for token in ("mini", "flash", "nano", "k2.5")):
+        return 0
+    if any(token in normalized for token in ("70b", "sonnet", "opus")):
+        return 2
+    return 1
+
+
+def _personality_system_prompt(name: str) -> str:
+    normalized = str(name or "none").strip().lower() or "none"
+    return PERSONALITY_SYSTEM_PROMPTS.get(normalized, PERSONALITY_SYSTEM_PROMPTS["none"])
+
+
+def _flatten_chat_completion_content(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, list):
+        parts: list[str] = []
+        for item in value:
+            if isinstance(item, str):
+                text = item.strip()
+            elif isinstance(item, dict):
+                text = str(item.get("text") or item.get("content") or "").strip()
+            else:
+                text = str(item).strip()
+            if text:
+                parts.append(text)
+        return "\n".join(parts).strip()
+    if isinstance(value, dict):
+        return str(value.get("text") or value.get("content") or "").strip()
+    return str(value).strip()
+
+
+def _build_session_system_prompt(state: dict[str, str]) -> str:
+    personality = str(state.get("current_personality") or "none").strip().lower() or "none"
+    return "\n".join(
+        [
+            "You are Hermes, a helpful assistant replying inside Feishu.",
+            "Answer the user's request directly. Do not merely acknowledge, restate, or paraphrase the incoming message.",
+            "When the user asks for analysis, provide actual reasoning and a concrete answer.",
+            "Keep the reply concise but useful.",
+            _personality_system_prompt(personality),
+        ]
+    )
+
+
+def _generate_session_reply(message_text: str, session_key: str) -> dict[str, Any]:
+    state = _get_session_state(session_key)
+    provider = str(state.get("current_provider") or "openrouter").strip().lower() or "openrouter"
+    model_id = str(state.get("current_model") or "openrouter/free").strip() or "openrouter/free"
+
+    from hermes_cli.runtime_provider import resolve_runtime_provider
+    import httpx
+
+    runtime = resolve_runtime_provider(requested=provider)
+    base_url = str(runtime.get("base_url") or "").rstrip("/")
+    api_key = str(runtime.get("api_key") or "").strip()
+    if not base_url or not api_key:
+        raise RuntimeError(f"Missing runtime credentials for provider '{provider}'")
+
+    endpoint = base_url
+    endpoint_lower = endpoint.lower()
+    if not endpoint_lower.endswith("/chat/completions") and not endpoint_lower.endswith("/v1/chat/completions"):
+        endpoint = f"{endpoint}/chat/completions"
+
+    payload = {
+        "model": model_id,
+        "messages": [
+            {"role": "system", "content": _build_session_system_prompt(state)},
+            {"role": "user", "content": str(message_text or "").strip()},
+        ],
+        "temperature": 0.6,
+    }
+    response = httpx.post(
+        endpoint,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        json=payload,
+        timeout=45.0,
+    )
+    response.raise_for_status()
+    body = response.json()
+    choices = body.get("choices")
+    if not isinstance(choices, list) or not choices:
+        raise RuntimeError("Model returned no completion choices")
+    first_choice = choices[0] if isinstance(choices[0], dict) else {}
+    message = first_choice.get("message") if isinstance(first_choice, dict) else {}
+    content = _flatten_chat_completion_content(message.get("content") if isinstance(message, dict) else "")
+    if not content:
+        raise RuntimeError("Model returned an empty reply")
+    return {
+        "text": content,
+        "provider": provider,
+        "model": model_id,
+        "base_url": base_url,
+        "ai_call_count": 1,
+    }
+
+
+def _build_generated_reply_result(message_text: str, session_key: str, *, route_hint: str) -> dict[str, Any]:
+    state = _get_session_state(session_key)
+    generated = _generate_session_reply(message_text, session_key)
+    final_text = str(generated.get("text") or "").strip()
+    return {
+        "status": "completed",
+        "route_hint": route_hint,
+        "execution_mode": "inline",
+        "final_response": final_text,
+        "send_plan": _build_text_send_plan(final_text),
+        "action_plan": _build_text_send_plan(final_text),
+        "session_state_after": _build_session_state_after(state),
+        "cache_eligible": False,
+        "ai_call_count": int(generated.get("ai_call_count") or 1),
+        "capability_match": True,
+        "preferred_model_selected": True,
+        "reconcile_required": False,
     }
 
 
@@ -416,12 +697,28 @@ def _handle_command(command_text: str, session_key: str) -> dict[str, Any]:
 
     if command == "/model":
         if not args:
-            models = "\n".join(f"- {provider}: {model}" for provider, model in MODEL_PRESETS)
+            registry_entries = [item for item in _iter_registry_entries(force_refresh=False) if not bool(item.get("hidden"))]
+            grouped_models: dict[str, list[str]] = {}
+            for item in registry_entries:
+                provider_slug = str(item.get("provider") or "").strip().lower()
+                model_id = str(item.get("model") or "").strip()
+                if provider_slug and model_id:
+                    grouped_models.setdefault(provider_slug, []).append(model_id)
+            if not grouped_models:
+                for provider, model in MODEL_PRESETS:
+                    provider_slug = str(provider or "").strip().lower()
+                    model_id = str(model or "").strip()
+                    if provider_slug and model_id:
+                        grouped_models.setdefault(provider_slug, []).append(model_id)
+            models = "\n".join(
+                f"{provider}:\n" + "\n".join(f"- {model_id}" for model_id in model_ids)
+                for provider, model_ids in grouped_models.items()
+            )
             content = "\n".join(
                 [
-                    * _build_route_status_lines(state),
+                    *_build_route_status_lines(state),
                     "",
-                    "Suggested models:",
+                    "Available models from Feishu registry:",
                     models,
                     "",
                     "Use `/model <model-id> --provider <slug>` to switch.",
@@ -444,9 +741,15 @@ def _handle_command(command_text: str, session_key: str) -> dict[str, Any]:
             return _build_command_result("Missing model id. Use `/model <model-id> --provider <slug>`.", state)
         state["current_model"] = model_id
         state["current_provider"] = provider
+        _remember_recent_model(state, provider, model_id)
         state = _save_session_state(session_key)
+        model_entry = _lookup_registry_entry(provider, model_id)
+        intro = _model_intro_text(model_entry)
+        switch_text = f"Model switched to `{model_id}`\nProvider: {provider}\nScope: session only"
+        if intro:
+            switch_text += f"\nIntroduction: {intro}"
         return _build_command_result(
-            f"Model switched to `{model_id}`\nProvider: {provider}\nScope: session only",
+            switch_text,
             state,
         )
 
@@ -526,49 +829,143 @@ def _build_command_center_card() -> dict[str, Any]:
 
 
 def _build_model_hub_card() -> dict[str, Any]:
+    registry_entries = [
+        item
+        for item in _iter_registry_entries(force_refresh=False)
+        if not bool(item.get("hidden")) and bool(item.get("is_available", True))
+    ]
+    if not registry_entries:
+        registry_entries = [
+            {
+                "provider": provider,
+                "model": model,
+                "selection_hint": "recommended" if index == 0 else "",
+                "rank": index + 1,
+            }
+            for index, (provider, model) in enumerate(MODEL_PRESETS)
+        ]
+    grouped_entries: dict[str, list[dict[str, Any]]] = {}
+    for item in registry_entries:
+        provider_slug = str(item.get("provider") or "").strip().lower()
+        model_id = str(item.get("model") or "").strip()
+        if provider_slug and model_id:
+            grouped_entries.setdefault(provider_slug, []).append(item)
+    for items in grouped_entries.values():
+        items.sort(key=lambda item: (int(item.get("rank") or 9999), str(item.get("model") or "")))
     elements: list[dict[str, Any]] = [
         {
             "tag": "markdown",
             "content": (
                 "**Hermes Model Hub**\n"
-                "Switch the active session model or open control cards."
+                "Choose a model ID from the Feishu Bitable registry and switch directly."
             ),
         }
     ]
+    for provider_slug, items in grouped_entries.items():
+        elements.append({"tag": "markdown", "content": f"**{provider_slug}**"})
+        model_actions = [
+            _button(
+                str(item.get("model") or "").strip(),
+                "registry_switch_model",
+                extra={
+                    "provider": provider_slug,
+                    "model": str(item.get("model") or "").strip(),
+                },
+                btn_type="primary" if str(item.get("selection_hint") or "").strip().lower() == "recommended" else "default",
+            )
+            for item in items[:20]
+            if str(item.get("model") or "").strip()
+        ]
+        for chunk in _chunk_actions(model_actions, 2):
+            elements.append({"tag": "action", "actions": chunk})
+    elements.append({"tag": "action", "actions": [_button("Close", "registry_close_card")]})
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {"title": {"tag": "plain_text", "content": "Hermes Model Hub"}, "template": "blue"},
+        "elements": elements,
+    }
+
+
+def _build_provider_model_card(provider_slug: str, view_name: str = "featured", session_key: str = "session:default") -> dict[str, Any]:
+    normalized_provider = str(provider_slug or "").strip().lower() or "openrouter"
+    normalized_view = str(view_name or "").strip().lower() or "featured"
+    provider_title = "OpenRouter" if normalized_provider == "openrouter" else "NVIDIA"
+    view_title = {
+        "featured": "Featured",
+        "recent": "Recent",
+        "performance": "Performance",
+    }.get(normalized_view, "Featured")
+
+    provider_entries = list(_get_registry_entries_for_provider(normalized_provider))
+    session_state = _get_session_state(session_key)
+    recent_history = _load_recent_model_history(session_state).get(normalized_provider, [])
+    if normalized_view == "recent":
+        provider_entries.sort(
+            key=lambda item: (
+                0 if str(item.get("model") or "").strip() in recent_history else 1,
+                0 if bool(item.get("recent_used")) else 1,
+                -int(item.get("recent_used_at") or 0),
+                int(item.get("rank") or 9999),
+                str(item.get("model") or ""),
+            )
+        )
+    elif normalized_view == "performance":
+        provider_entries.sort(
+            key=lambda item: (
+                int(item.get("latency_ms") or 10**9),
+                _performance_priority(str(item.get("model") or "")),
+                int(item.get("rank") or 9999),
+                str(item.get("model") or ""),
+            )
+        )
+    else:
+        provider_entries.sort(
+            key=lambda item: (
+                0 if str(item.get("selection_hint") or "").strip().lower() == "recommended" else 1,
+                int(item.get("rank") or 9999),
+                str(item.get("model") or ""),
+            )
+        )
+    note_by_view = {
+        "featured": "Featured list from the Feishu registry.",
+        "recent": "Recent list keeps your session history first.",
+        "performance": "Performance list prefers lower-latency candidates.",
+    }
+    elements: list[dict[str, Any]] = [
+        {
+            "tag": "markdown",
+            "content": f"**{provider_title} {view_title}**\nChoose a model from the Feishu Bitable registry.\n{note_by_view.get(normalized_view, '')}",
+        }
+    ]
+
     model_actions = [
         _button(
-            f"{provider}:{model.split('/')[-1][:18]}",
+            str(item.get("model") or "").strip(),
             "registry_switch_model",
-            extra={"provider": provider, "model": model},
-            btn_type="primary" if provider == "openrouter" else "default",
+            extra={
+                "provider": normalized_provider,
+                "model": str(item.get("model") or "").strip(),
+            },
+            btn_type="primary" if str(item.get("selection_hint") or "").strip().lower() == "recommended" else "default",
         )
-        for provider, model in MODEL_PRESETS
+        for item in provider_entries[:16]
     ]
     for chunk in _chunk_actions(model_actions, 2):
         elements.append({"tag": "action", "actions": chunk})
+
     elements.append(
         {
             "tag": "action",
             "actions": [
-                _button("Status", "command_run", extra={"command_text": "/status"}),
-                _button("Providers", "command_run", extra={"command_text": "/provider"}),
-                _button("Model Text", "command_run", extra={"command_text": "/model"}),
-            ],
-        }
-    )
-    elements.append(
-        {
-            "tag": "action",
-            "actions": [
-                _button("Personality", "open_menu_card", extra={"event_key": "personality_picker"}),
-                _button("Commands", "open_menu_card", extra={"event_key": "command_center"}),
+                _button("Model Hub", "open_menu_card", extra={"event_key": "model_picker"}),
                 _button("Close", "registry_close_card"),
             ],
         }
     )
+
     return {
         "config": {"wide_screen_mode": True},
-        "header": {"title": {"tag": "plain_text", "content": "Hermes Model Hub"}, "template": "blue"},
+        "header": {"title": {"tag": "plain_text", "content": f"{provider_title} {view_title}"}, "template": "blue"},
         "elements": elements,
     }
 
@@ -613,6 +1010,20 @@ def _render_card(event_key: str, session_key: str) -> dict[str, Any] | None:
     normalized = str(event_key or "").strip()
     if normalized == "model_picker":
         return _build_model_hub_card()
+    provider_view_map = {
+        "provider_openrouter": ("openrouter", "featured"),
+        "provider_openrouter_featured": ("openrouter", "featured"),
+        "provider_openrouter_recent": ("openrouter", "recent"),
+        "provider_openrouter_performance": ("openrouter", "performance"),
+        "provider_nvidia": ("nvidia", "featured"),
+        "provider_nvidia_featured": ("nvidia", "featured"),
+        "provider_nvidia_recent": ("nvidia", "recent"),
+        "provider_nvidia_performance": ("nvidia", "performance"),
+    }
+    provider_view = provider_view_map.get(normalized)
+    if provider_view is not None:
+        provider_slug, view_name = provider_view
+        return _build_provider_model_card(provider_slug, view_name, session_key)
     if normalized == "personality_picker":
         return _build_personality_card(session_key)
     if normalized == "command_center":
@@ -643,14 +1054,24 @@ def _handle_session_control(context: dict[str, Any]) -> dict[str, Any]:
         }
 
     if action == "render_card":
-        card = _render_card(str(payload.get("event_key") or ""), session_key)
+        event_key = str(payload.get("event_key") or "").strip()
+        card = _render_card(event_key, session_key)
+        card_title = ""
+        if isinstance(card, dict):
+            header = card.get("header")
+            if isinstance(header, dict):
+                title = header.get("title")
+                if isinstance(title, dict):
+                    card_title = str(title.get("content") or "").strip()
         return {
             "status": "ok" if card else "error",
             "action": action,
+            "event_key": event_key,
+            "card_title": card_title,
             "route_hint": "fast_control",
             "execution_mode": "control_complete",
             "card": card,
-            "error": "" if card else f"unsupported event_key: {payload.get('event_key')}",
+            "error": "" if card else f"unsupported event_key: {event_key}",
             "session_state_after": _build_session_state_after(state),
             "reconcile_required": False,
         }
@@ -762,28 +1183,34 @@ if modal is not None:
                 },
                 action=result.get("action"),
                 status=result.get("status"),
+                event_key=result.get("event_key") or context["payload"].get("event_key"),
+                card_present=bool(result.get("card")),
+                card_title=result.get("card_title"),
+                error=result.get("error"),
             )
             return result
 
-        if context["path"] == "/internal/feishu/agent-exec":
-            if context["message_text"].startswith("/"):
-                result = _handle_command(context["message_text"], context["session_key"])
-            else:
+        if context["path"] == "/internal/feishu/agent-exec" and not context["message_text"].startswith("/"):
+            try:
+                result = _build_generated_reply_result(
+                    context["message_text"],
+                    context["session_key"],
+                    route_hint="modal_heavy_exec",
+                )
+            except Exception as exc:
                 state = _get_session_state(context["session_key"])
-                prefix = ""
-                if state.get("current_personality") and state.get("current_personality") != "none":
-                    prefix = f"[{state['current_personality']}] "
+                error_text = f"Unable to generate a model reply for this session: {exc}"
                 result = {
-                    "status": "completed",
+                    "status": "failed",
                     "route_hint": "modal_heavy_exec",
                     "execution_mode": "inline",
-                    "final_response": f"{prefix}收到消息：{context['message_text'][:120] or '收到消息'}",
-                    "send_plan": _build_text_send_plan(f"{prefix}我收到了你的消息：{context['message_text'][:120] or '收到消息'}"),
-                    "action_plan": _build_text_send_plan(f"{prefix}我收到了你的消息：{context['message_text'][:120] or '收到消息'}"),
+                    "final_response": error_text,
+                    "send_plan": _build_text_send_plan(error_text),
+                    "action_plan": _build_text_send_plan(error_text),
                     "session_state_after": _build_session_state_after(state),
                     "cache_eligible": False,
                     "ai_call_count": 0,
-                    "capability_match": True,
+                    "capability_match": False,
                     "preferred_model_selected": True,
                     "reconcile_required": False,
                 }
@@ -813,18 +1240,70 @@ if modal is not None:
             )
             return result
 
+        if context["path"] == "/internal/feishu/agent-exec":
+            if context["message_text"].startswith("/"):
+                result = _handle_command(context["message_text"], context["session_key"])
+            else:
+                result = _build_generated_reply_result(
+                    context["message_text"],
+                    context["session_key"],
+                    route_hint="modal_heavy_exec",
+                )
+            result.setdefault("worker_context", {})
+            result["worker_context"].update(
+                {
+                    "worker_boot_id": f"feishu-chat-{uuid.uuid4().hex}",
+                    "worker_started_at": _now_ms(),
+                    "initialized": True,
+                }
+            )
+            result["timestamp"] = time.time()
+            _append_feishu_trace(
+                "internal.agent_exec.done",
+                {
+                    "event_id": context["event_id"],
+                    "correlation_id": context["correlation_id"],
+                    "session_key": context["session_key"],
+                    "message_id": context["message_id"],
+                },
+                execution_mode=result.get("execution_mode"),
+                request_class=result.get("request_class", "text_plain"),
+                route_hint=result.get("route_hint"),
+                ai_call_count=result.get("ai_call_count"),
+                capability_match=result.get("capability_match"),
+                preferred_model_selected=result.get("preferred_model_selected"),
+            )
+            return result
+
         if context["path"] == "/internal/feishu/message-inline":
-            state = _get_session_state(context["session_key"])
-            return {
-                "status": "completed",
-                "route_hint": "cf_ai_gateway",
-                "execution_mode": "inline",
-                "final_response": f"收到消息：{context['message_text'][:120] or '收到消息'}",
-                "send_plan": _build_text_send_plan(f"我收到了你的消息：{context['message_text'][:120] or '收到消息'}"),
-                "action_plan": _build_text_send_plan(f"我收到了你的消息：{context['message_text'][:120] or '收到消息'}"),
-                "session_state_after": _build_session_state_after(state),
-                "timestamp": time.time(),
-            }
+            try:
+                result = _build_generated_reply_result(
+                    context["message_text"],
+                    context["session_key"],
+                    route_hint="cf_ai_gateway",
+                )
+            except Exception as exc:
+                state = _get_session_state(context["session_key"])
+                error_text = f"Unable to generate an inline reply for this session: {exc}"
+                result = {
+                    "status": "failed",
+                    "route_hint": "cf_ai_gateway",
+                    "execution_mode": "inline",
+                    "final_response": error_text,
+                    "send_plan": _build_text_send_plan(error_text),
+                    "action_plan": _build_text_send_plan(error_text),
+                    "session_state_after": _build_session_state_after(state),
+                    "ai_call_count": 0,
+                }
+            result["timestamp"] = time.time()
+            return result
+
+        if context["path"] == "/internal/feishu/message-inline":
+            return _build_generated_reply_result(
+                context["message_text"],
+                context["session_key"],
+                route_hint="cf_ai_gateway",
+            )
 
         if context["path"] == "/internal/feishu/ack-reaction":
             return {"status": "ok", "message": "ack reaction processed", "worker_context": True}

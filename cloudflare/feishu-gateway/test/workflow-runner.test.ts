@@ -150,4 +150,71 @@ describe("runFeishuWorkflow", () => {
       }),
     );
   });
+
+  it("writes fallback analytics when cf ai exec falls back to modal once and succeeds", async () => {
+    const { step } = createStepHarness();
+    const analytics = {
+      writeDataPoint: vi.fn(),
+    };
+    const planned: ModalInternalResponse = {
+      status: "ok",
+      external_exec_candidate: true,
+      route_hint: "modal_heavy_exec",
+      execution_mode: "deferred_reconcile",
+      route_decision_reason: "provider_model_not_found",
+      provider_async_eligible: true,
+      provider_async_observed: false,
+      send_plan: [],
+    };
+    const deps = createDeps({
+      buildEdgeDirectPlan: vi.fn(async () => planned),
+      executeCloudflareAiExec: vi.fn(async () => {
+        throw new Error("provider 404");
+      }),
+      classifyCfAiExecFallbackReason: vi.fn(() => "provider_model_not_found"),
+      invokeAgentExec: vi.fn(async () => ({
+        status: "ok",
+        route_hint: "modal_heavy_exec",
+        execution_mode: "modal_heavy_exec",
+        route_decision_reason: "provider_model_not_found",
+        fallback_reason: "provider_model_not_found",
+        send_plan: [{ kind: "text", content: "fallback ok" }],
+        reconcile_required: false,
+      })),
+    });
+
+    await runFeishuWorkflow({
+      env: {
+        FEISHU_GATEWAY_ANALYTICS: analytics,
+      } as Env,
+      event: {
+        payload: buildNormalizedPayload(),
+        instanceId: "wf-2",
+      },
+      step,
+      deps: deps as any,
+    });
+
+    expect(analytics.writeDataPoint).toHaveBeenCalledTimes(3);
+    expect(analytics.writeDataPoint).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({
+        indexes: ["feishu.cf_ai_exec.fallback"],
+      }),
+    );
+    expect(analytics.writeDataPoint).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({
+        indexes: ["feishu.cf_ai_exec.fallback.done"],
+      }),
+    );
+    expect(deps.log).toHaveBeenCalledWith(
+      "feishu.cf_ai_exec.fallback.done",
+      expect.objectContaining({
+        correlation_id: "corr-1",
+        fallback_reason: "provider_model_not_found",
+        success: true,
+      }),
+    );
+  });
 });

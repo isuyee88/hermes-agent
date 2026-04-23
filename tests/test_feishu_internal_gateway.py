@@ -24,8 +24,7 @@ def test_model_picker_local_menu_card_exposes_navigation_buttons() -> None:
     assert card is not None
     assert card["header"]["title"]["content"] == "Hermes Model Hub"
     actions = _collect_action_names(card)
-    assert "open_menu_card" in actions
-    assert "command_run" in actions
+    assert "registry_switch_model" in actions
     assert "registry_close_card" in actions
 
 

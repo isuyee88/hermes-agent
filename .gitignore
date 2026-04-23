@@ -91,8 +91,10 @@ wf_instance_details.json
 feishu_kpi_test_report_*.json
 feishu_bot_test_*.json
 feishu_tenant_token_*.txt
+feishu_tokens_*.json
 cloudflare/feishu-gateway/.cf-out/
 cloudflare/feishu-gateway/.wrangler/
+cloudflare/feishu-gateway/.wrangler-dist/
 cloudflare/feishu-gateway/.tmp-cf-*/
 cloudflare/feishu-gateway/.dev.vars
 cloudflare/feishu-gateway/dist/

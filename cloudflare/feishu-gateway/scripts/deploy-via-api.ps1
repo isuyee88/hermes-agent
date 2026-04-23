@@ -280,6 +280,11 @@ $modelCatalogQueueDelaySeconds = Get-EnvValue "HERMES_MODEL_CATALOG_QUEUE_DELAY_
 $modelCatalogQueueRetryDelaySeconds = Get-EnvValue "HERMES_MODEL_CATALOG_QUEUE_RETRY_DELAY_SECONDS"
 $modelCatalogQueueHardRetryDelaySeconds = Get-EnvValue "HERMES_MODEL_CATALOG_QUEUE_HARD_RETRY_DELAY_SECONDS"
 $modelCatalogQueueLeaseSeconds = Get-EnvValue "HERMES_MODEL_CATALOG_QUEUE_LEASE_SECONDS"
+$feishuKpiQueueEnabled = Get-EnvValue "HERMES_FEISHU_KPI_QUEUE_ENABLED"
+$feishuKpiQueueDelaySeconds = Get-EnvValue "HERMES_FEISHU_KPI_QUEUE_DELAY_SECONDS"
+$feishuKpiQueueRetryDelaySeconds = Get-EnvValue "HERMES_FEISHU_KPI_QUEUE_RETRY_DELAY_SECONDS"
+$feishuKpiQueueHardRetryDelaySeconds = Get-EnvValue "HERMES_FEISHU_KPI_QUEUE_HARD_RETRY_DELAY_SECONDS"
+$feishuKpiQueueLeaseSeconds = Get-EnvValue "HERMES_FEISHU_KPI_QUEUE_LEASE_SECONDS"
 $feishuModelRegistryMirrorEnabled = Get-EnvValue "FEISHU_MODEL_REGISTRY_MIRROR_ENABLED"
 $feishuRegistryMaxMutations = Get-EnvValue "FEISHU_MODEL_REGISTRY_MAX_MUTATIONS_PER_RUN"
 $feishuRegistryStaleDeleteAfterSeconds = Get-EnvValue "FEISHU_MODEL_REGISTRY_STALE_DELETE_AFTER_SECONDS"
@@ -329,6 +334,26 @@ try {
     [void]$bindings.Add(@{
         name = "BROWSER"
         type = "browser"
+    })
+    [void]$bindings.Add(@{
+        name = "MODEL_CATALOG_DB"
+        type = "d1"
+        database_id = "783a29b3-47e5-41f7-aadd-3f284765ac79"
+    })
+    [void]$bindings.Add(@{
+        name = "MODEL_CATALOG_QUEUE"
+        type = "queue"
+        queue_name = "hermes-model-catalog-heartbeat"
+    })
+    [void]$bindings.Add(@{
+        name = "FEISHU_GATEWAY_ANALYTICS"
+        type = "analytics_engine"
+        dataset = "hermes_feishu_gateway_events"
+    })
+    [void]$bindings.Add(@{
+        name = "FEISHU_GATEWAY_KPI_ROLLUPS"
+        type = "analytics_engine"
+        dataset = "hermes_feishu_kpi_rollups"
     })
     [void]$bindings.Add(@{
         name = "FEISHU_API_BASE"
@@ -390,6 +415,11 @@ try {
     Add-OptionalPlainBinding -Bindings $bindings -Name "HERMES_MODEL_CATALOG_QUEUE_RETRY_DELAY_SECONDS" -Value $modelCatalogQueueRetryDelaySeconds
     Add-OptionalPlainBinding -Bindings $bindings -Name "HERMES_MODEL_CATALOG_QUEUE_HARD_RETRY_DELAY_SECONDS" -Value $modelCatalogQueueHardRetryDelaySeconds
     Add-OptionalPlainBinding -Bindings $bindings -Name "HERMES_MODEL_CATALOG_QUEUE_LEASE_SECONDS" -Value $modelCatalogQueueLeaseSeconds
+    Add-OptionalPlainBinding -Bindings $bindings -Name "HERMES_FEISHU_KPI_QUEUE_ENABLED" -Value $feishuKpiQueueEnabled
+    Add-OptionalPlainBinding -Bindings $bindings -Name "HERMES_FEISHU_KPI_QUEUE_DELAY_SECONDS" -Value $feishuKpiQueueDelaySeconds
+    Add-OptionalPlainBinding -Bindings $bindings -Name "HERMES_FEISHU_KPI_QUEUE_RETRY_DELAY_SECONDS" -Value $feishuKpiQueueRetryDelaySeconds
+    Add-OptionalPlainBinding -Bindings $bindings -Name "HERMES_FEISHU_KPI_QUEUE_HARD_RETRY_DELAY_SECONDS" -Value $feishuKpiQueueHardRetryDelaySeconds
+    Add-OptionalPlainBinding -Bindings $bindings -Name "HERMES_FEISHU_KPI_QUEUE_LEASE_SECONDS" -Value $feishuKpiQueueLeaseSeconds
     Add-OptionalPlainBinding -Bindings $bindings -Name "FEISHU_MODEL_REGISTRY_MIRROR_ENABLED" -Value $feishuModelRegistryMirrorEnabled
     Add-OptionalPlainBinding -Bindings $bindings -Name "HERMES_CF_TEXT_PLAIN_ROUTE_NAME" -Value $textPlainRouteName
     Add-OptionalPlainBinding -Bindings $bindings -Name "HERMES_CF_TEXT_CODING_ROUTE_NAME" -Value $textCodingRouteName

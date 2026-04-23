@@ -1,97 +1,135 @@
-# 获取飞书用户访问令牌 (user_access_token)
+# 获取飞书用户访问令牌 (`user_access_token`)
 
-## 方法一：通过飞书开放平台获取测试令牌（推荐用于测试）
+## 当前结论
 
-### 步骤1: 访问飞书开放平台
-1. 打开 https://open.feishu.cn/app/
-2. 登录您的飞书账号
-3. 找到您的应用（App ID: cli_a9525a47e4f99bc2）
+- `app3` 的应用身份链路已经可用，机器人身份发消息和 webhook 回调都正常。
+- 真用户闭环现在分成三类独立阻塞，不能再只看“有没有 token”：
+  - `99991677`：当前 shell 里的 `FEISHU_USER_ACCESS_TOKEN` 已过期。
+  - `99991672`：用户态成员接口缺少聊天读取权限，至少要有 `im:chat.members:read`、`im:chat.group_info:readonly`、`im:chat:readonly`、`im:chat` 之一。
+  - `230027`：用户态发消息缺少 `im:message.send_as_user` 权限。
+- 所以 `FX003` 的真实目标已经变成“补齐用户身份权限并重新授权完成成员审计”，`FX004` 的真实目标变成“补齐 `send_as_user` 后再做真实用户消息闭环”。
 
-### 步骤2: 获取测试令牌
-1. 进入应用详情页
-2. 点击左侧菜单 "凭证与基础信息"
-3. 找到 "用户访问令牌" 部分
-4. 点击 "获取 user_access_token"
-5. 选择权限范围（需要 `im:message:send` 和 `im:message`）
-6. 复制生成的令牌
+## 推荐授权方式
 
-### 步骤3: 设置环境变量
+优先使用仓库内脚本打印授权地址：
 
-**Windows PowerShell:**
+```powershell
+python scripts/feishu_oauth_flow.py --print-auth-url-only
+```
+
+如果希望脚本直接拉起本地回调并等待浏览器回跳：
+
+```powershell
+python scripts/feishu_oauth_flow.py
+```
+
+如果要显式追加用户态发消息权限，可直接传 scope：
+
+```powershell
+python scripts/feishu_oauth_flow.py --scope im:message --scope im:message:send_as_bot --scope im:chat:readonly --scope im:chat.members:read --scope im:message.send_as_user
+```
+
+说明：
+
+- API 错误里显示的是 `im:message.send_as_user`。
+- 飞书后台权限名有时会显示成 `im:message:send_as_user`。
+- 以后台实际可勾选权限为准，开通后再重新授权。
+
+## 当前默认参数
+
+- App ID: `cli_a9525a47e4f99bc2`
+- Redirect URI: `http://localhost:3000/callback`
+- 默认 scopes:
+  - `im:message`
+  - `im:message:send_as_bot`
+  - `im:chat:readonly`
+  - `im:chat.members:read`
+
+默认脚本还没有强制带上 `send_as_user`，因为这项权限是否已在后台开通需要先由管理员确认。
+
+## 管理后台需要确认的权限
+
+至少确认 `app3` 已开通并发布以下用户身份权限：
+
+- 成员审计相关：`im:chat.members:read` 或 `im:chat.group_info:readonly` 或 `im:chat:readonly` 或 `im:chat`
+- 用户态发消息相关：`im:message.send_as_user`
+
+如果权限刚开通，还需要重新发布应用并重新做一次 OAuth 授权。
+
+## 授权完成后如何落地到当前环境
+
+脚本成功后会生成 `feishu_tokens_*.json`，也会打印环境变量示例。PowerShell 可直接执行：
+
 ```powershell
 $env:FEISHU_USER_ACCESS_TOKEN="u-xxxxxxxxxxxxxxxx"
+$env:FEISHU_USER_REFRESH_TOKEN="ur-xxxxxxxxxxxxxxxx"
 ```
 
-**Windows CMD:**
-```cmd
-set FEISHU_USER_ACCESS_TOKEN=u-xxxxxxxxxxxxxxxx
+如果终端里还是旧 token，脚本会继续报 `99991677`。当前仓库里的执行清单脚本已经会优先读取最新的 `feishu_tokens_*.json`，但手工命令仍建议显式更新环境变量。
+
+## 重新授权后的验证顺序
+
+1. 先验证用户态发消息权限是否齐全：
+
+```powershell
+python scripts/feishu_user_token_test.py --single-message "用户态 smoke test"
 ```
 
-**Mac/Linux:**
-```bash
-export FEISHU_USER_ACCESS_TOKEN=u-xxxxxxxxxxxxxxxx
+2. 再验证用户态成员读取是否齐全：
+
+```powershell
+python scripts/check_feishu_delivery_path.py --all-env-apps --target-chat-id oc_ec86c28e66596c25377aff2ee028901c --recent-message-window-minutes 180
 ```
 
-## 方法二：通过OAuth2流程获取（生产环境）
+3. 成员和发消息都通过后，再补采真实 read receipt：
 
-如果您需要长期有效的令牌，需要通过OAuth2授权流程：
-
-### 1. 配置OAuth回调地址
-在飞书开放平台 -> 您的应用 -> 安全设置中配置重定向URL
-
-### 2. 引导用户授权
-```
-https://open.feishu.cn/open-apis/authen/v1/index?app_id=cli_a9525a47e4f99bc2&redirect_uri=https://your-domain.com/callback
+```powershell
+python scripts/feishu_read_receipt_probe.py --chat-id oc_ec86c28e66596c25377aff2ee028901c --window-minutes 180 --page-size 20 --limit 10
 ```
 
-### 3. 获取授权码并交换令牌
-用户授权后，飞书会重定向到您的回调地址并附带 `code` 参数，然后用code换取access_token。
+4. 最后重跑统一 KPI 快照和执行清单：
 
-## 方法三：使用机器人Webhook（最简单）
-
-如果您只是想测试机器人是否能正常工作，可以直接使用Webhook：
-
-### 1. 在飞书群组中添加机器人
-1. 打开目标群组
-2. 点击群组设置 -> 群机器人
-3. 添加自定义机器人
-4. 复制Webhook地址
-
-### 2. 使用Webhook发送消息
-```bash
-curl -X POST https://open.feishu.cn/open-apis/bot/v2/hook/xxxxxx \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "msg_type": "text",
-    "content": {
-      "text": "测试消息"
-    }
-  }'
+```powershell
+python scripts/feishu_kpi_execution_snapshot.py --hours 24 --artifacts-dir D:\suyee\github\hermesagent
+python scripts/feishu_execution_task_checklist.py --hours 24 --artifacts-dir D:\suyee\github\hermesagent --target-chat-id oc_ec86c28e66596c25377aff2ee028901c
 ```
 
-## 测试脚本使用方法
+## 如果只想验证应用身份
 
-获取令牌后，运行测试：
+如果当前只是确认 `app3` 的应用身份、机器人身份和群可见性，可运行：
 
-```bash
-# 设置令牌
-$env:FEISHU_USER_ACCESS_TOKEN="u-your-token"
-
-# 运行测试
-python scripts/feishu_user_token_test.py
+```powershell
+python scripts/feishu_get_test_token.py --skip-send-test
 ```
 
-## 注意事项
+这个脚本只验证 tenant token 侧链路，不会生成 `user_access_token`。
 
-1. **令牌有效期**：测试令牌通常有效期为2小时，过期需要重新获取
-2. **权限范围**：确保令牌有发送消息的权限
-3. **安全性**：不要将令牌提交到代码仓库
-4. **频率限制**：注意飞书API的调用频率限制
+## 常见问题
 
-## 当前环境状态
+### 1. `99991677 Authentication token expired`
 
-- FEISHU_APP_ID3: ✅ 已设置 (cli_a9525a47e4f99bc2)
-- FEISHU_APP_SECRET3: ✅ 已设置
-- FEISHU_USER_ACCESS_TOKEN: ❌ 未设置
+说明当前终端中的 `FEISHU_USER_ACCESS_TOKEN` 还是旧值。重新授权后要么重新导出环境变量，要么改用最新生成的 `feishu_tokens_*.json`。
 
-请先获取用户访问令牌，然后重新运行测试脚本。
+### 2. `99991672 Access denied`
+
+说明 token 本身可能是新的，但用户态成员读取权限没有开通。先去飞书后台给 `app3` 开通聊天读取相关用户权限，再重新授权。
+
+### 3. `230027 Lack of necessary permissions, ext=requires im:message.send_as_user scope.`
+
+说明用户态发消息权限没开通。必须先补齐 `send_as_user`，否则 `FX004` 无法形成真实用户消息闭环。
+
+### 4. 授权成功但终端里还是失败
+
+优先排查：
+
+- 当前 shell 是否仍在使用旧的 `FEISHU_USER_ACCESS_TOKEN`
+- 最新 `feishu_tokens_*.json` 是否已经生成
+- 飞书后台权限是否已经发布而不仅仅是勾选
+
+### 5. 本地回调始终收不到
+
+检查：
+
+- 飞书开放平台是否已配置 `http://localhost:3000/callback`
+- 本机 `3000` 端口是否被占用
+- 浏览器里是否真正完成了授权确认

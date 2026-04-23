@@ -1411,6 +1411,21 @@ class GatewayRunner:
             )
         return grouped
 
+    def _get_chat_model_registry_intro(self, provider_slug: str, model_id: str) -> str:
+        provider = str(provider_slug or "").strip().lower()
+        model = str(model_id or "").strip()
+        if not provider or not model:
+            return ""
+        for entry in self._load_chat_model_registry_index().get(provider, []):
+            if str(entry.get("model") or "").strip() != model:
+                continue
+            for key in ("introduction", "description", "summary"):
+                value = str(entry.get(key) or "").strip()
+                if value:
+                    return value
+            return ""
+        return ""
+
     def _build_route_debug_payload(
         self,
         *,
@@ -1577,29 +1592,38 @@ class GatewayRunner:
                 if str(item.get("model") or "").strip()
                 and not bool(item.get("hidden"))
             ]
-            all_models = self._dedupe_strings(
-                (
-                    [current_model] if slug == current_provider and current_model else []
+            if prefer_registry_only:
+                all_models = self._dedupe_strings(
+                    ([] if not (slug == current_provider and current_model and current_model not in registry_models) else [current_model])
+                    + registry_models
                 )
-                + recent_models
-                + registry_models
-                + ([] if prefer_registry_only else expanded_models)
-                + curated_models
-            )
+            else:
+                all_models = self._dedupe_strings(
+                    (
+                        [current_model] if slug == current_provider and current_model else []
+                    )
+                    + recent_models
+                    + registry_models
+                    + expanded_models
+                    + curated_models
+                )
             models = all_models if max_models <= 0 else all_models[:max_models]
             recent_registry_models = [
                 str(item.get("model") or "").strip()
                 for item in registry_entries
                 if bool(item.get("recent_used")) and str(item.get("model") or "").strip()
             ]
-            featured_models = self._dedupe_strings(recent_models + recent_registry_models + curated_models + all_models)[:6]
-            preview_models = featured_models[:4]
+            featured_models = self._dedupe_strings(
+                registry_models if prefer_registry_only else (recent_models + recent_registry_models + curated_models + all_models)
+            )[:6]
+            preview_models = (registry_models[:4] if prefer_registry_only else featured_models[:4])
             total_models = len(all_models)
             model_details = {
                 str(item.get("model") or "").strip(): {
                     "display_name": str(item.get("display_name") or item.get("model") or "").strip(),
                     "is_free": bool(item.get("is_free")),
                     "is_available": bool(item.get("is_available", True)),
+                    "rank": int(item.get("rank") or 0),
                     "selection_hint": str(item.get("selection_hint") or "").strip(),
                     "status": str(item.get("status") or "").strip(),
                     "recent_used": bool(item.get("recent_used")),
@@ -1607,6 +1631,9 @@ class GatewayRunner:
                     "recent_used_at": int(item.get("recent_used_at") or 0) or None,
                     "context_window": item.get("context_window"),
                     "latency_ms": item.get("latency_ms"),
+                    "introduction": str(
+                        item.get("introduction") or item.get("description") or item.get("summary") or ""
+                    ).strip(),
                 }
                 for item in registry_entries
                 if str(item.get("model") or "").strip()
@@ -1636,6 +1663,8 @@ class GatewayRunner:
                 for item in hot_candidates
                 if str(item.get("model") or "").strip()
             ]
+            if prefer_registry_only:
+                hot_models = []
             records.append(
                 {
                     "slug": slug,
@@ -1973,6 +2002,9 @@ class GatewayRunner:
                 if mi.has_cost_data():
                     lines.append(f"Cost: {mi.format_cost()}")
                 lines.append(f"Capabilities: {mi.format_capabilities()}")
+            intro = self._get_chat_model_registry_intro(result.target_provider, result.new_model)
+            if intro:
+                lines.append(f"Introduction: {intro}")
             lines.append("_(session only - other requests continue on dynamic routing by default)_")
             return "\n".join(lines)
 
@@ -5890,6 +5922,9 @@ class GatewayRunner:
                             if mi.has_cost_data():
                                 lines.append(f"Cost: {mi.format_cost()}")
                             lines.append(f"Capabilities: {mi.format_capabilities()}")
+                        intro = _self._get_chat_model_registry_intro(result.target_provider, result.new_model)
+                        if intro:
+                            lines.append(f"Introduction: {intro}")
                         lines.append("_(session only — other requests continue on dynamic routing by default)_")
                         return "\n".join(lines)
 
@@ -6050,6 +6085,10 @@ class GatewayRunner:
 
         if result.warning_message:
             lines.append(f"Warning: {result.warning_message}")
+
+        intro = self._get_chat_model_registry_intro(result.target_provider, result.new_model)
+        if intro:
+            lines.append(f"Introduction: {intro}")
 
         lines.append("_(session only — Hermes still executes through Cloudflare AI Gateway, with this model ID pinned for the current Feishu session)_")
 

@@ -3844,19 +3844,15 @@ class TestFeishuModelPickerAndMenu(unittest.TestCase):
         action_rows = [item for item in card["elements"] if item.get("tag") == "action"]
 
         self.assertTrue(any("**Current route**" in block for block in markdown_blocks))
-        self.assertTrue(any("**Recent Used**" in block for block in markdown_blocks))
-        self.assertTrue(any("**Hot Models**" in block for block in markdown_blocks))
-        self.assertTrue(any("**Recommended**" in block for block in markdown_blocks))
         self.assertTrue(any("**OpenRouter** (openrouter)" in block for block in markdown_blocks))
+        self.assertTrue(any("Feishu Bitable model registry" in block for block in markdown_blocks))
         labels = [
             action["text"]["content"]
             for row in action_rows
             for action in row.get("actions", [])
             if action.get("tag") == "button"
         ]
-        self.assertIn("OpenRouter Picks", labels)
-        self.assertIn("openai/gpt-4.1-mini", labels)
-        self.assertIn("anthropic/claude-opus-4.6", labels)
+        self.assertIn("OpenRouter Models", labels)
 
     @patch.dict(os.environ, {}, clear=True)
     def test_model_picker_model_card_routes_to_provider_picks_card(self):
@@ -3892,9 +3888,8 @@ class TestFeishuModelPickerAndMenu(unittest.TestCase):
         )
 
         markdown_blocks = [item["content"] for item in card["elements"] if item.get("tag") == "markdown"]
-        self.assertEqual(card["header"]["title"]["content"], "OpenRouter Featured")
-        self.assertTrue(any(block == "**Featured (3/3)**" for block in markdown_blocks))
-        self.assertTrue(any("点击模型立即切换" in block for block in markdown_blocks))
+        self.assertEqual(card["header"]["title"]["content"], "OpenRouter Models")
+        self.assertTrue(any("Feishu Registry Models" in block for block in markdown_blocks))
         buttons = [
             action
             for row in card["elements"]
@@ -3905,12 +3900,9 @@ class TestFeishuModelPickerAndMenu(unittest.TestCase):
         labels = [button["text"]["content"] for button in buttons]
         self.assertIn("anthropic/claude-opus-4.6", labels)
         self.assertIn("google/gemma-3-27b-it:free", labels)
-        self.assertIn("切到最近", labels)
-        self.assertIn("切到性能", labels)
         model_button = next(button for button in buttons if button["text"]["content"] == "anthropic/claude-opus-4.6")
         self.assertEqual(model_button["value"]["model"], "anthropic/claude-opus-4.6")
         self.assertEqual(model_button["value"]["provider"], "openrouter")
-        self.assertEqual(model_button["value"]["filter"], "featured")
 
     @patch.dict(os.environ, {}, clear=True)
     def test_card_action_model_picker_select_invokes_callback_and_clears_state(self):
@@ -4061,7 +4053,6 @@ class TestFeishuModelPickerAndMenu(unittest.TestCase):
             open_id="ou_owner",
             model_id="moonshotai/kimi-k2.5",
             provider_slug="nvidia",
-            event_chat_type="group",
         )
 
     @patch.dict(os.environ, {}, clear=True)

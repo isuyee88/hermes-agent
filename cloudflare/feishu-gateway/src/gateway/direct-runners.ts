@@ -5,6 +5,7 @@ import type {
   PendingReconcileItem,
   SitePrefetchManifest,
 } from "../runtime";
+import { writeFeishuAnalyticsEvent } from "../observability/analytics-engine";
 
 type DirectRunnerDeps = {
   trim: (value: unknown) => string;
@@ -233,8 +234,10 @@ export async function runDirectWorkerPlannedPath(
       internal = await deps.executeCloudflareAiExec(env, normalized, planned);
     } catch (error) {
       const fallbackReason = deps.classifyCfAiExecFallbackReason(error, planned);
-      deps.log("feishu.direct_planned.cf_ai_exec.fallback", {
+      const fallbackPayload = {
         correlation_id: normalized.correlation_id,
+        session_key: normalized.session_key,
+        event_id: normalized.event_id,
         route_decision_reason: deps.trim(planned.route_decision_reason),
         fallback_reason: fallbackReason,
         fallback_path: "modal_internal_direct",
@@ -247,7 +250,9 @@ export async function runDirectWorkerPlannedPath(
           gateway_error_class: fallbackReason,
           misroute_detected: fallbackReason === "misrouted_request_class",
         }),
-      });
+      };
+      deps.log("feishu.direct_planned.cf_ai_exec.fallback", fallbackPayload);
+      writeFeishuAnalyticsEvent(env, "feishu.cf_ai_exec.fallback", fallbackPayload);
       try {
         internal = await deps.invokeAgentExec(
           env,
@@ -264,12 +269,15 @@ export async function runDirectWorkerPlannedPath(
           sitePrefetch,
         );
         fallbackPath = "modal_internal_direct";
-        deps.log("feishu.direct_planned.modal_exec.fallback_done", {
+        const fallbackDonePayload = {
           correlation_id: normalized.correlation_id,
+          session_key: normalized.session_key,
+          event_id: normalized.event_id,
           execution_mode: internal.execution_mode || "modal_heavy_exec",
           route_decision_reason: deps.trim(internal.route_decision_reason) || deps.trim(planned.route_decision_reason),
           fallback_reason: deps.trim(internal.fallback_reason) || fallbackReason,
           fallback_path: fallbackPath,
+          success: true,
           ...deps.buildRoutingLogFields(normalized, {
             ...planned,
             ...internal,
@@ -277,7 +285,9 @@ export async function runDirectWorkerPlannedPath(
             gateway_error_class: deps.trim(internal.fallback_reason) || fallbackReason,
             misroute_detected: (deps.trim(internal.fallback_reason) || fallbackReason) === "misrouted_request_class",
           }),
-        });
+        };
+        deps.log("feishu.direct_planned.modal_exec.fallback_done", fallbackDonePayload);
+        writeFeishuAnalyticsEvent(env, "feishu.cf_ai_exec.fallback.done", fallbackDonePayload);
       } catch (modalError) {
         deps.log("feishu.direct_planned.modal_exec.fallback_error", {
           correlation_id: normalized.correlation_id,

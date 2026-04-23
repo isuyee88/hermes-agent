@@ -1,5 +1,6 @@
 import importlib.util
 import sys
+import types
 from pathlib import Path
 
 
@@ -63,3 +64,75 @@ def test_session_state_persists_to_shared_store(monkeypatch, tmp_path):
 
     assert restored["current_model"] == "moonshotai/kimi-k2.5"
     assert restored["current_provider"] == "nvidia"
+
+
+def test_model_command_uses_registry_intro(monkeypatch):
+    module = _load_module()
+    monkeypatch.setitem(
+        sys.modules,
+        "tools.feishu_api",
+        types.SimpleNamespace(
+            load_feishu_model_registry=lambda force_refresh=False: {
+                "status": "ok",
+                "entries": [
+                    {
+                        "provider": "nvidia",
+                        "model": "moonshotai/kimi-k2.5",
+                        "introduction": "Long-context Chinese reasoning model for fast analysis.",
+                    }
+                ],
+            }
+        ),
+    )
+
+    result = module._handle_command("/model moonshotai/kimi-k2.5 --provider nvidia", "agent:main:feishu:dm:test")
+
+    assert "Model switched to `moonshotai/kimi-k2.5`" in result["final_response"]
+    assert "Introduction: Long-context Chinese reasoning model for fast analysis." in result["final_response"]
+
+
+def test_model_hub_card_uses_registry_model_ids(monkeypatch):
+    module = _load_module()
+    monkeypatch.setitem(
+        sys.modules,
+        "tools.feishu_api",
+        types.SimpleNamespace(
+            load_feishu_model_registry=lambda force_refresh=False: {
+                "status": "ok",
+                "entries": [
+                    {"provider": "openrouter", "model": "openai/gpt-5.4-mini", "selection_hint": "recommended"},
+                    {"provider": "nvidia", "model": "moonshotai/kimi-k2.5"},
+                ],
+            }
+        ),
+    )
+
+    card = module._build_model_hub_card()
+    labels = [
+        action.get("text", {}).get("content")
+        for element in card["elements"]
+        if element.get("tag") == "action"
+        for action in element.get("actions", [])
+    ]
+
+    assert "openai/gpt-5.4-mini" in labels
+    assert "moonshotai/kimi-k2.5" in labels
+
+
+def test_generated_reply_result_uses_model_output(monkeypatch):
+    module = _load_module()
+    monkeypatch.setattr(
+        module,
+        "_generate_session_reply",
+        lambda message_text, session_key: {
+            "text": f"分析结果: {message_text}",
+            "provider": "openrouter",
+            "model": "openai/gpt-5.4-mini",
+            "ai_call_count": 1,
+        },
+    )
+
+    result = module._build_generated_reply_result("请分析这个问题", "agent:main:feishu:dm:test", route_hint="modal_heavy_exec")
+
+    assert result["final_response"] == "分析结果: 请分析这个问题"
+    assert "我收到了你的消息" not in result["final_response"]

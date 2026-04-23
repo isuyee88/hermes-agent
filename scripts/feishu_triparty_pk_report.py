@@ -67,10 +67,17 @@ DEFAULT_GOALS = {
     "idle_hourly_cost_usd": Decimal("0.005"),
     "cost_per_session_usd": Decimal("0.0045"),
     "cache_hit_rate": Decimal("0.30"),
+    "gateway_error_rate": Decimal("0.00"),
+    "rate_limit_triggered_fallback_count": 0,
+    "fallback_once_success_rate": Decimal("1.00"),
+    "browser_preprocess_accuracy": Decimal("1.00"),
     "browser_single_ai_call_completion_rate": Decimal("0.50"),
     "capability_match_rate": Decimal("1.00"),
     "preferred_model_selection_accuracy": Decimal("0.95"),
+    "route_decision_explainable_rate": Decimal("1.00"),
 }
+SESSION_COST_SOURCE_POLICIES = {"strict", "official_average", "blended_total"}
+DEFAULT_SESSION_COST_SOURCE_POLICY = "strict"
 
 
 @dataclass(frozen=True)
@@ -161,6 +168,11 @@ def _coalesce(*values: Any) -> Any:
     return None
 
 
+def _normalize_session_cost_source_policy(value: str | None) -> str:
+    normalized = str(value or "").strip().lower()
+    return normalized if normalized in SESSION_COST_SOURCE_POLICIES else DEFAULT_SESSION_COST_SOURCE_POLICY
+
+
 def _parse_now(now_raw: str | None, timezone_name: str) -> datetime:
     tz = _get_timezone(timezone_name)
     if now_raw:
@@ -245,14 +257,33 @@ def _build_analysis_windows(
 
 
 def _row_ts_ms(row: dict[str, Any]) -> int:
-    ts_ms = _normalized_epoch_ms(row.get("__timestamp_ms"))
-    if ts_ms is not None:
-        return ts_ms
+    for field in ("__timestamp_ms", "timestamp_ms", "ts_ms"):
+        ts_ms = _normalized_epoch_ms(row.get(field))
+        if ts_ms is not None:
+            return ts_ms
     ts = row.get("ts")
-    try:
-        return int(float(ts) * 1000)
-    except (TypeError, ValueError):
-        return 0
+    if ts is not None:
+        try:
+            return int(float(ts) * 1000)
+        except (TypeError, ValueError):
+            if isinstance(ts, str):
+                try:
+                    parsed = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                    if parsed.tzinfo is None:
+                        parsed = parsed.replace(tzinfo=timezone.utc)
+                    return int(parsed.timestamp() * 1000)
+                except ValueError:
+                    pass
+    timestamp = row.get("timestamp")
+    if isinstance(timestamp, str):
+        try:
+            parsed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return int(parsed.timestamp() * 1000)
+        except ValueError:
+            pass
+    return 0
 
 
 def _normalized_epoch_ms(value: Any) -> int | None:
@@ -2152,6 +2183,8 @@ def _build_cloudflare_summary(
                     "request_class": str(record.get("request_class") or "").strip(),
                     "gateway_route_name": str(record.get("gateway_route_name") or "").strip(),
                     "route_family": str(record.get("route_family") or "").strip(),
+                    "success": _coerce_optional_bool(record.get("success")),
+                    "status_code": _coerce_optional_int(record.get("status_code")),
                     "cf_cache_status": record.get("cf_cache_status"),
                     "gateway_eligible": _coerce_optional_bool(record.get("gateway_eligible")),
                     "cache_eligible": _coerce_optional_bool(record.get("cache_eligible")),
@@ -2486,6 +2519,7 @@ def _build_goal_assessment(
     window_payloads: dict[str, dict[str, Any]],
     *,
     cloudflare_summary: dict[str, Any] | None = None,
+    session_cost_source_policy: str = DEFAULT_SESSION_COST_SOURCE_POLICY,
 ) -> dict[str, Any]:
     current_payload = window_payloads.get("current", {})
     billing_summary = current_payload.get("billing_summary") or {}
@@ -2526,6 +2560,34 @@ def _build_goal_assessment(
     overall_cache_hit_rate = _decimal(
         ((_build_cache_hit_rate(cloudflare_summary or {}, eligible_only=False).get("current") or {}).get("hit_rate"))
     )
+    gateway_error_rate_summary = _build_gateway_error_rate(cloudflare_summary or {})
+    gateway_error_rate_current = gateway_error_rate_summary.get("current") or {}
+    gateway_error_rate = (
+        _decimal(gateway_error_rate_current.get("error_rate"))
+        if int(gateway_error_rate_current.get("sample_count") or 0) > 0
+        else None
+    )
+    rate_limit_triggered_fallback_summary = _build_rate_limit_triggered_fallback_count(window_payloads)
+    rate_limit_triggered_fallback_current = rate_limit_triggered_fallback_summary.get("current") or {}
+    rate_limit_triggered_fallback_count = (
+        _coerce_optional_int(rate_limit_triggered_fallback_current.get("triggered_fallback_count"))
+        if int(rate_limit_triggered_fallback_current.get("sample_count") or 0) > 0
+        else None
+    )
+    fallback_once_success_summary = _build_fallback_once_success_rate(window_payloads)
+    fallback_once_success_current = fallback_once_success_summary.get("current") or {}
+    fallback_once_success_rate = (
+        _decimal(fallback_once_success_current.get("success_rate"))
+        if int(fallback_once_success_current.get("measured_count") or 0) > 0
+        else None
+    )
+    browser_preprocess_accuracy_summary = _build_browser_preprocess_accuracy(window_payloads)
+    browser_preprocess_accuracy_current = browser_preprocess_accuracy_summary.get("current") or {}
+    browser_preprocess_accuracy = (
+        _decimal(browser_preprocess_accuracy_current.get("accuracy"))
+        if int(browser_preprocess_accuracy_current.get("sample_count") or 0) > 0
+        else None
+    )
     browser_single_ai_call_completion_rate = _decimal(
         ((_build_browser_single_ai_call_completion(window_payloads).get("current") or {}).get("completion_rate"))
     )
@@ -2533,24 +2595,46 @@ def _build_goal_assessment(
     preferred_model_selection_accuracy = _decimal(
         ((_build_preferred_model_selection_accuracy(window_payloads).get("current") or {}).get("accuracy"))
     )
+    route_decision_explainable_summary = _build_route_decision_explainable_rate(window_payloads)
+    route_decision_explainable_current = route_decision_explainable_summary.get("current") or {}
+    route_decision_explainable_rate = (
+        _decimal(route_decision_explainable_current.get("explainable_rate"))
+        if int(route_decision_explainable_current.get("sample_count") or 0) > 0
+        else None
+    )
 
     read_actual = read_receipt_p90 if read_receipt_p90 > 0 else None
     reply_minus_ai_actual = reply_minus_ai_p90 if reply_minus_ai_p90 > 0 else None
     idle_actual = idle_hourly_p90 if idle_hourly_p90 > 0 or int(idle_cost.get("idle_hour_count") or 0) > 0 else None
+    session_cost_source_policy = _normalize_session_cost_source_policy(session_cost_source_policy)
+    has_allocated_session_cost = any(cost > 0 for cost in allocated_session_costs)
+    has_total_session_cost = any(cost > 0 for cost in total_session_costs)
     session_cost_measurement_mode = "modal_session_allocated_p90"
-    if any(cost > 0 for cost in allocated_session_costs):
+    session_cost_truth_status = "authoritative"
+    if session_cost_source_policy == "blended_total" and has_total_session_cost:
+        session_cost_actual = total_session_cost_p90
+        session_cost_measurement_mode = "session_total_cost_p90"
+        session_cost_truth_status = "partial" if has_function_trace_gap and not has_allocated_session_cost else "authoritative"
+    elif has_allocated_session_cost:
         session_cost_actual = session_cost_p90
+    elif has_function_trace_gap and session_cost_source_policy == "official_average":
+        session_cost_actual = avg_cost_per_session if avg_cost_per_session is not None and avg_cost_per_session > 0 else None
+        session_cost_measurement_mode = "official_total_div_session_count_forced"
+        session_cost_truth_status = "estimated"
     elif has_function_trace_gap:
         session_cost_actual = None
         session_cost_measurement_mode = "insufficient_function_trace"
+        session_cost_truth_status = "unavailable"
     elif avg_cost_per_session is not None and avg_cost_per_session > 0:
         session_cost_actual = avg_cost_per_session
         session_cost_measurement_mode = "official_total_div_session_count"
+        session_cost_truth_status = "estimated"
     else:
         session_cost_actual = None
         session_cost_measurement_mode = ""
+        session_cost_truth_status = "unavailable"
     total_session_cost_actual = (
-        total_session_cost_p90 if any(cost > 0 for cost in total_session_costs) else None
+        total_session_cost_p90 if has_total_session_cost else None
     )
 
     return {
@@ -2560,9 +2644,14 @@ def _build_goal_assessment(
             "idle_hourly_cost_usd": _decimal_str(DEFAULT_GOALS["idle_hourly_cost_usd"]),
             "cost_per_session_usd": _decimal_str(DEFAULT_GOALS["cost_per_session_usd"]),
             "cache_hit_rate": _decimal_str(DEFAULT_GOALS["cache_hit_rate"]),
+            "gateway_error_rate": _decimal_str(DEFAULT_GOALS["gateway_error_rate"]),
+            "rate_limit_triggered_fallback_count": int(DEFAULT_GOALS["rate_limit_triggered_fallback_count"]),
+            "fallback_once_success_rate": _decimal_str(DEFAULT_GOALS["fallback_once_success_rate"]),
+            "browser_preprocess_accuracy": _decimal_str(DEFAULT_GOALS["browser_preprocess_accuracy"]),
             "browser_single_ai_call_completion_rate": _decimal_str(DEFAULT_GOALS["browser_single_ai_call_completion_rate"]),
             "capability_match_rate": _decimal_str(DEFAULT_GOALS["capability_match_rate"]),
             "preferred_model_selection_accuracy": _decimal_str(DEFAULT_GOALS["preferred_model_selection_accuracy"]),
+            "route_decision_explainable_rate": _decimal_str(DEFAULT_GOALS["route_decision_explainable_rate"]),
         },
         "current": {
             "read_receipt_p90_ms": round(float(read_actual), 1) if read_actual is not None else None,
@@ -2571,16 +2660,30 @@ def _build_goal_assessment(
             "idle_hourly_p90_cost_usd": _decimal_str(idle_actual) if idle_actual is not None else None,
             "session_cost_p90_usd": _decimal_str(session_cost_actual) if session_cost_actual is not None else None,
             "session_cost_measurement_mode": session_cost_measurement_mode,
+            "session_cost_source_policy": session_cost_source_policy,
+            "session_cost_truth_status": session_cost_truth_status,
             "session_total_cost_p90_usd": _decimal_str(total_session_cost_actual) if total_session_cost_actual is not None else None,
+            "session_total_cost_truth_status": (
+                "partial" if has_function_trace_gap and has_total_session_cost and not has_allocated_session_cost else "authoritative"
+            )
+            if total_session_cost_actual is not None
+            else "unavailable",
             "avg_cost_per_session_usd": _decimal_str(avg_cost_per_session) if avg_cost_per_session is not None else None,
             "cache_eligible_hit_rate": _decimal_str(cache_eligible_hit_rate) if cache_eligible_hit_rate > 0 else None,
             "overall_cache_hit_rate": _decimal_str(overall_cache_hit_rate) if overall_cache_hit_rate > 0 else None,
+            "gateway_error_rate": _decimal_str(gateway_error_rate) if gateway_error_rate is not None else None,
+            "rate_limit_triggered_fallback_count": rate_limit_triggered_fallback_count,
+            "fallback_once_success_rate": _decimal_str(fallback_once_success_rate) if fallback_once_success_rate is not None else None,
+            "browser_preprocess_accuracy": _decimal_str(browser_preprocess_accuracy) if browser_preprocess_accuracy is not None else None,
             "browser_single_ai_call_completion_rate": (
                 _decimal_str(browser_single_ai_call_completion_rate) if browser_single_ai_call_completion_rate > 0 else None
             ),
             "capability_match_rate": _decimal_str(capability_match_rate) if capability_match_rate > 0 else None,
             "preferred_model_selection_accuracy": (
                 _decimal_str(preferred_model_selection_accuracy) if preferred_model_selection_accuracy > 0 else None
+            ),
+            "route_decision_explainable_rate": (
+                _decimal_str(route_decision_explainable_rate) if route_decision_explainable_rate is not None else None
             ),
         },
         "statuses": {
@@ -2606,6 +2709,32 @@ def _build_goal_assessment(
                 smaller_is_better=False,
                 inclusive=True,
             ),
+            "gateway_error_rate_equals_0": _goal_status(
+                actual=gateway_error_rate,
+                target=DEFAULT_GOALS["gateway_error_rate"],
+                smaller_is_better=True,
+                inclusive=True,
+            ),
+            "rate_limit_triggered_fallback_count_equals_0": _goal_status(
+                actual=Decimal(str(rate_limit_triggered_fallback_count))
+                if rate_limit_triggered_fallback_count is not None
+                else None,
+                target=Decimal(str(DEFAULT_GOALS["rate_limit_triggered_fallback_count"])),
+                smaller_is_better=True,
+                inclusive=True,
+            ),
+            "fallback_once_success_rate_equals_1_00": _goal_status(
+                actual=fallback_once_success_rate,
+                target=DEFAULT_GOALS["fallback_once_success_rate"],
+                smaller_is_better=False,
+                inclusive=True,
+            ),
+            "browser_preprocess_accuracy_equals_1_00": _goal_status(
+                actual=browser_preprocess_accuracy,
+                target=DEFAULT_GOALS["browser_preprocess_accuracy"],
+                smaller_is_better=False,
+                inclusive=True,
+            ),
             "browser_single_ai_call_completion_rate_over_0_50": _goal_status(
                 actual=browser_single_ai_call_completion_rate if browser_single_ai_call_completion_rate > 0 else None,
                 target=DEFAULT_GOALS["browser_single_ai_call_completion_rate"],
@@ -2624,18 +2753,25 @@ def _build_goal_assessment(
                 smaller_is_better=False,
                 inclusive=True,
             ),
+            "route_decision_explainable_rate_equals_1_00": _goal_status(
+                actual=route_decision_explainable_rate,
+                target=DEFAULT_GOALS["route_decision_explainable_rate"],
+                smaller_is_better=False,
+                inclusive=True,
+            ),
         },
         "session_cost_detail": modal_session_cost_summary,
         "session_total_cost_detail": total_session_cost_summary,
         "idle_cost_detail": idle_cost,
         "notes": [
-            "All target checks use current-window p90 values and strict '<' thresholds.",
+            "Goal checks use current-window metrics with metric-specific thresholds (latency/cost use p90; count/rate gates use explicit equality or lower/greater bounds).",
             "Read receipt target uses original inbound-message read timing (T0->T2) when available; reply-send to reply-read remains a supplemental diagnostic only.",
             "Missing measurements are treated as not_met for gatekeeping, while detailed measurement mode fields remain available for diagnosis.",
             "Idle cost uses official Modal hourly billing for hours with zero observed sessions; if no idle hours are present, the gate remains not_met until data is available.",
             "Session cost target uses p90 over per-session Modal calibrated allocation only.",
             "When official Modal billing exists but function-level trace allocation is missing, session cost remains unavailable instead of falling back to total-cost/session-count.",
             "Combined session total cost remains available as a diagnostic field and may include provider billed cost and Cloudflare AI Gateway cost when present.",
+            "Session cost source policy may be switched to `blended_total` or `official_average` for diagnostics, but `strict` remains the default gatekeeping mode.",
         ],
     }
 
@@ -2898,6 +3034,7 @@ def _build_goal_check_from_sessions(
     end_ms: int,
     timezone_name: str,
     strict_goal_metric: str,
+    session_cost_source_policy: str = DEFAULT_SESSION_COST_SOURCE_POLICY,
 ) -> dict[str, Any]:
     metric_name = "p90" if str(strict_goal_metric or "").strip().lower() != "p50" else "p50"
     metrics = _refresh_session_metrics(sessions)
@@ -2907,6 +3044,12 @@ def _build_goal_check_from_sessions(
         if session.get("allocated_cost_usd") is not None
     )
     modal_session_cost_summary = _summarize_decimal_series(allocated_session_costs)
+    total_session_costs = _collect_nonnegative_decimals(
+        session.get("total_session_cost_usd")
+        for session in sessions
+        if session.get("total_session_cost_usd") is not None
+    )
+    total_session_cost_summary = _summarize_decimal_series(total_session_costs)
     idle_cost = _build_idle_cost_summary_for_range(
         payload,
         start_ms=start_ms,
@@ -2919,10 +3062,21 @@ def _build_goal_check_from_sessions(
     reply_actual = _decimal(((metrics.get("t0_to_t3_minus_model_ms") or {}).get(metric_name)))
     idle_actual = _decimal(((idle_cost.get("summary") or {}).get(metric_name)))
     session_cost_actual = _decimal(modal_session_cost_summary.get(metric_name))
+    total_session_cost_actual = _decimal(total_session_cost_summary.get(metric_name))
     read_value = read_actual if read_actual > 0 else None
     reply_value = reply_actual if reply_actual > 0 else None
     idle_value = idle_actual if idle_actual > 0 or int(idle_cost.get("idle_hour_count") or 0) > 0 else None
-    session_cost_value = session_cost_actual if any(cost > 0 for cost in allocated_session_costs) else None
+    session_cost_source_policy = _normalize_session_cost_source_policy(session_cost_source_policy)
+    has_allocated_session_cost = any(cost > 0 for cost in allocated_session_costs)
+    has_total_session_cost = any(cost > 0 for cost in total_session_costs)
+    if session_cost_source_policy == "blended_total" and has_total_session_cost:
+        session_cost_value = total_session_cost_actual
+        session_cost_measurement_mode = "session_total_cost_window_metric"
+        session_cost_truth_status = "diagnostic"
+    else:
+        session_cost_value = session_cost_actual if has_allocated_session_cost else None
+        session_cost_measurement_mode = "modal_session_allocated_window_metric" if has_allocated_session_cost else "unavailable"
+        session_cost_truth_status = "authoritative" if has_allocated_session_cost else "unavailable"
     measurement_modes = sorted(
         {
             str(session.get("reply_minus_ai_measurement_mode") or "").strip()
@@ -2943,6 +3097,8 @@ def _build_goal_check_from_sessions(
             "reply_minus_ai_ms": round(float(reply_value), 1) if reply_value is not None else None,
             "modal_idle_hourly_cost_usd": _decimal_str(idle_value) if idle_value is not None else None,
             "modal_session_cost_usd": _decimal_str(session_cost_value) if session_cost_value is not None else None,
+            "modal_session_cost_measurement_mode": session_cost_measurement_mode,
+            "modal_session_cost_truth_status": session_cost_truth_status,
         },
         "statuses": {
             "read_receipt_under_5s": _goal_status(actual=read_value, target=Decimal(str(DEFAULT_GOALS["read_receipt_ms"]))),
@@ -3267,6 +3423,177 @@ def _build_preferred_model_selection_accuracy(window_payloads: dict[str, dict[st
     return result
 
 
+def _build_gateway_error_rate(cloudflare_summary: dict[str, Any]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    window_summaries = (cloudflare_summary or {}).get("window_summaries") or {}
+    for label, summary in window_summaries.items():
+        gateway_rows = list((summary or {}).get("gateway_request_rows") or [])
+        measurable_rows: list[dict[str, Any]] = []
+        for row in gateway_rows:
+            status_code = _coerce_optional_int(row.get("status_code"))
+            success = _coerce_optional_bool(row.get("success"))
+            if status_code is None and success is None:
+                continue
+            measurable_rows.append(row)
+        error_count = 0
+        for row in measurable_rows:
+            status_code = _coerce_optional_int(row.get("status_code"))
+            success = _coerce_optional_bool(row.get("success"))
+            if success is False or (status_code is not None and status_code >= 400):
+                error_count += 1
+        result[label] = {
+            "sample_count": len(measurable_rows),
+            "error_count": error_count,
+            "error_rate": _safe_ratio(error_count, len(measurable_rows)) if measurable_rows else None,
+        }
+    return result
+
+
+def _build_rate_limit_triggered_fallback_count(window_payloads: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for label, payload in window_payloads.items():
+        sessions = list(((payload.get("session_summary") or {}).get("sessions") or []))
+        measurable_sessions: list[dict[str, Any]] = []
+        triggered_count = 0
+        for session in sessions:
+            route_hint = str(session.get("route_hint") or "").strip()
+            request_class = str(session.get("request_class") or "").strip()
+            route_decision_reason = str(session.get("route_decision_reason") or "").strip().lower()
+            fallback_reason = str(session.get("fallback_reason") or "").strip()
+            gateway_error_class = str(session.get("gateway_error_class") or "").strip().lower()
+            ai_call_count = _coerce_optional_int(session.get("ai_call_count"))
+            has_observability = bool(
+                route_hint
+                or request_class
+                or route_decision_reason
+                or fallback_reason
+                or gateway_error_class
+                or ai_call_count is not None
+            )
+            if not has_observability:
+                continue
+            measurable_sessions.append(session)
+            rate_limited = gateway_error_class == "rate_limited" or "rate_limit" in route_decision_reason or "429" in route_decision_reason
+            fallback_triggered = bool(fallback_reason) or (ai_call_count is not None and ai_call_count > 1)
+            if rate_limited and fallback_triggered:
+                triggered_count += 1
+        result[label] = {
+            "sample_count": len(measurable_sessions),
+            "triggered_fallback_count": triggered_count if measurable_sessions else None,
+        }
+    return result
+
+
+def _build_fallback_once_success_rate(window_payloads: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    model_error_classes = {
+        "provider_permission_denied",
+        "provider_model_not_found",
+        "rate_limited",
+        "upstream_5xx",
+        "timeout",
+        "payload_incompatible",
+        "catalog_stale",
+    }
+    result: dict[str, Any] = {}
+    for label, payload in window_payloads.items():
+        sessions = list(((payload.get("session_summary") or {}).get("sessions") or []))
+        model_error_fallback_sessions: list[dict[str, Any]] = []
+        measurable_sessions: list[dict[str, Any]] = []
+        success_count = 0
+        multi_fallback_success_count = 0
+        for session in sessions:
+            gateway_error_class = str(session.get("gateway_error_class") or "").strip().lower()
+            fallback_reason = str(session.get("fallback_reason") or "").strip()
+            ai_call_count = _coerce_optional_int(session.get("ai_call_count"))
+            fallback_triggered = bool(fallback_reason) or (ai_call_count is not None and ai_call_count > 1)
+            if gateway_error_class not in model_error_classes or not fallback_triggered:
+                continue
+            model_error_fallback_sessions.append(session)
+            if ai_call_count is None or ai_call_count < 2:
+                continue
+            measurable_sessions.append(session)
+            reply_sent = bool(session.get("reply_sent"))
+            if reply_sent and ai_call_count <= 2:
+                success_count += 1
+            if reply_sent and ai_call_count > 2:
+                multi_fallback_success_count += 1
+        result[label] = {
+            "sample_count": len(model_error_fallback_sessions),
+            "measured_count": len(measurable_sessions),
+            "success_count": success_count,
+            "multi_fallback_success_count": multi_fallback_success_count,
+            "success_rate": _safe_ratio(success_count, len(measurable_sessions)) if measurable_sessions else None,
+        }
+    return result
+
+
+def _build_browser_preprocess_accuracy(window_payloads: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    browser_request_classes = {"tool_browser"}
+    result: dict[str, Any] = {}
+    for label, payload in window_payloads.items():
+        sessions = list(((payload.get("session_summary") or {}).get("sessions") or []))
+        browser_sessions: list[dict[str, Any]] = []
+        success_count = 0
+        for session in sessions:
+            request_class = str(session.get("request_class") or "").strip().lower()
+            route_hint = str(session.get("route_hint") or "").strip().lower()
+            requires_browser = session.get("requires_browser") is True
+            browser_related = requires_browser or route_hint == "cf_browser_first" or request_class in browser_request_classes
+            if not browser_related:
+                continue
+            browser_sessions.append(session)
+            explicit = _coerce_optional_bool(session.get("browser_preprocess_ok"))
+            if explicit is not None:
+                if explicit:
+                    success_count += 1
+                continue
+            capability_match = _coerce_optional_bool(session.get("capability_match"))
+            expected_browser = requires_browser or request_class in browser_request_classes
+            routed_browser = route_hint == "cf_browser_first"
+            if capability_match is not None:
+                if capability_match and expected_browser and routed_browser:
+                    success_count += 1
+                continue
+            if expected_browser and routed_browser:
+                success_count += 1
+        result[label] = {
+            "sample_count": len(browser_sessions),
+            "success_count": success_count,
+            "accuracy": _safe_ratio(success_count, len(browser_sessions)) if browser_sessions else None,
+        }
+    return result
+
+
+def _build_route_decision_explainable_rate(window_payloads: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for label, payload in window_payloads.items():
+        sessions = list(((payload.get("session_summary") or {}).get("sessions") or []))
+        measurable_sessions: list[dict[str, Any]] = []
+        explainable_count = 0
+        for session in sessions:
+            route_hint = str(session.get("route_hint") or "").strip()
+            route_family = str(session.get("route_family") or "").strip()
+            gateway_route_name = str(session.get("gateway_route_name") or "").strip()
+            request_class = str(session.get("request_class") or "").strip()
+            has_route_context = bool(route_hint or route_family or gateway_route_name or request_class)
+            if not has_route_context:
+                continue
+            measurable_sessions.append(session)
+            reason = (
+                str(session.get("route_decision_reason") or "").strip()
+                or str(session.get("fallback_reason") or "").strip()
+                or str(session.get("gateway_error_class") or "").strip()
+            )
+            if reason:
+                explainable_count += 1
+        result[label] = {
+            "sample_count": len(measurable_sessions),
+            "explainable_count": explainable_count,
+            "explainable_rate": _safe_ratio(explainable_count, len(measurable_sessions)) if measurable_sessions else None,
+        }
+    return result
+
+
 def _build_modal_cost_optimization(window_payloads: dict[str, dict[str, Any]]) -> dict[str, Any]:
     current_payload = window_payloads.get("current", {})
     sessions = list(((current_payload.get("session_summary") or {}).get("sessions") or []))
@@ -3308,6 +3635,7 @@ def _build_recent_window_eval(
     recent_min_sessions: int,
     timezone_name: str,
     strict_goal_metric: str,
+    session_cost_source_policy: str = DEFAULT_SESSION_COST_SOURCE_POLICY,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     current_payload = window_payloads.get("current", {})
     selection = _select_recent_sessions(
@@ -3323,6 +3651,7 @@ def _build_recent_window_eval(
         end_ms=int(selection.get("end_ms") or 0),
         timezone_name=timezone_name,
         strict_goal_metric=strict_goal_metric,
+        session_cost_source_policy=session_cost_source_policy,
     )
     return (
         {
@@ -3843,9 +4172,14 @@ def _render_markdown_summary(*, report: dict[str, Any]) -> str:
         f"- Modal idle hourly cost <0.005: `{statuses.get('modal_idle_hourly_cost_under_0_005')}` (current p90 `${current_goals.get('idle_hourly_p90_cost_usd')}`)",
         f"- Session cost <0.0045: `{statuses.get('session_cost_under_0_0045')}` (current p90 `${current_goals.get('session_cost_p90_usd')}`, avg `${current_goals.get('avg_cost_per_session_usd')}`)",
         f"- AI Gateway cache eligible hit rate >30%: `{statuses.get('cache_hit_rate_over_0_30')}` (current `{current_goals.get('cache_eligible_hit_rate')}`)",
+        f"- AI Gateway error rate =0: `{statuses.get('gateway_error_rate_equals_0')}` (current `{current_goals.get('gateway_error_rate')}`)",
+        f"- Rate-limit triggered fallback count =0: `{statuses.get('rate_limit_triggered_fallback_count_equals_0')}` (current `{current_goals.get('rate_limit_triggered_fallback_count')}`)",
+        f"- Model-error fallback once success rate =100%: `{statuses.get('fallback_once_success_rate_equals_1_00')}` (current `{current_goals.get('fallback_once_success_rate')}`)",
+        f"- Browser classify+preprocess accuracy =100%: `{statuses.get('browser_preprocess_accuracy_equals_1_00')}` (current `{current_goals.get('browser_preprocess_accuracy')}`)",
         f"- Browser single AI completion >50%: `{statuses.get('browser_single_ai_call_completion_rate_over_0_50')}` (current `{current_goals.get('browser_single_ai_call_completion_rate')}`)",
         f"- Capability match =100%: `{statuses.get('capability_match_rate_equals_1_00')}` (current `{current_goals.get('capability_match_rate')}`)",
         f"- Preferred model accuracy >=95%: `{statuses.get('preferred_model_selection_accuracy_over_0_95')}` (current `{current_goals.get('preferred_model_selection_accuracy')}`)",
+        f"- Route decision explainable coverage =100%: `{statuses.get('route_decision_explainable_rate_equals_1_00')}` (current `{current_goals.get('route_decision_explainable_rate')}`)",
         "",
         "## Recent Goal Check",
         f"- Recent read receipt <5s: `{recent_statuses.get('read_receipt_under_5s')}` ({recent_goals.get('metric')} `{recent_current.get('read_receipt_ms')}` ms)",
@@ -3907,8 +4241,20 @@ def _build_window_report(
         snapshot_profile=snapshot_profile,
         include_duplicates=include_duplicates,
     )
-    billing_rows = cost_report_module._run_modal_billing_report(window.start, window.end)
-    billing_summary = cost_report_module._build_billing_summary(billing_rows, billing_descriptions)
+    window_data_gaps: list[str] = []
+    try:
+        billing_rows = cost_report_module._run_modal_billing_report(window.start, window.end)
+        billing_summary = cost_report_module._build_billing_summary(billing_rows, billing_descriptions)
+    except Exception as exc:
+        billing_rows = []
+        billing_summary = {
+            "matched_rows": 0,
+            "matched_descriptions": sorted(billing_descriptions),
+            "total_cost_usd": "0",
+            "hourly_costs": [],
+            "billing_error": str(exc),
+        }
+        window_data_gaps.append(f"modal_billing_report_failed:{window.label}")
     cost_items = _build_cost_items(
         rows,
         window=window,
@@ -3948,6 +4294,7 @@ def _build_window_report(
         "execution_path_summary": _build_execution_path_summary(rows),
         "hourly_official_costs": official_hourly_costs,
         "hourly_session_counts": _hourly_session_count(session_summary["sessions"], timezone_name),
+        "data_gaps": window_data_gaps,
     }
 
 
@@ -3979,6 +4326,12 @@ def main() -> int:
     parser.add_argument("--recent-hours", type=int, default=3)
     parser.add_argument("--recent-min-sessions", type=int, default=20)
     parser.add_argument("--strict-goal-metric", default="p90")
+    parser.add_argument(
+        "--session-cost-source-policy",
+        default=DEFAULT_SESSION_COST_SOURCE_POLICY,
+        choices=sorted(SESSION_COST_SOURCE_POLICIES),
+        help="How to resolve session-cost truth when per-session Modal allocation is incomplete.",
+    )
     args = parser.parse_args()
 
     now = _parse_now(args.now or None, args.timezone)
@@ -4018,6 +4371,7 @@ def main() -> int:
             modal_module=modal_module,
         )
         window_payloads[label] = window_payload
+        data_gaps.extend(str(gap) for gap in (window_payload.get("data_gaps") or []) if str(gap).strip())
         data_gaps.extend(
             gap.get("reason") if isinstance(gap, dict) else str(gap)
             for gap in (window_payload.get("cost_calibration") or {}).get("allocation_gaps") or []
@@ -4075,14 +4429,23 @@ def main() -> int:
     text_route_cache_hit_rate = _build_text_route_cache_hit_rate(cloudflare_summary)
     cache_hit_rate = _build_cache_hit_rate(cloudflare_summary, eligible_only=False)
     cache_eligible_hit_rate = _build_cache_hit_rate(cloudflare_summary, eligible_only=True)
+    gateway_error_rate = _build_gateway_error_rate(cloudflare_summary)
+    rate_limit_triggered_fallback_count = _build_rate_limit_triggered_fallback_count(window_payloads)
+    fallback_once_success_rate = _build_fallback_once_success_rate(window_payloads)
+    browser_preprocess_accuracy = _build_browser_preprocess_accuracy(window_payloads)
     browser_single_ai_call_completion = _build_browser_single_ai_call_completion(window_payloads)
     capability_match_rate = _build_capability_match_rate(window_payloads)
     preferred_model_selection_accuracy = _build_preferred_model_selection_accuracy(window_payloads)
+    route_decision_explainable_rate = _build_route_decision_explainable_rate(window_payloads)
     optimization_analysis = _build_optimization_analysis(
         window_payloads=window_payloads,
         hourly_cost_pk=hourly_cost_pk,
     )
-    goal_assessment = _build_goal_assessment(window_payloads, cloudflare_summary=cloudflare_summary)
+    goal_assessment = _build_goal_assessment(
+        window_payloads,
+        cloudflare_summary=cloudflare_summary,
+        session_cost_source_policy=args.session_cost_source_policy,
+    )
     modal_cost_optimization = _build_modal_cost_optimization(window_payloads)
     recent_window_eval, goal_check_recent = _build_recent_window_eval(
         window_payloads,
@@ -4090,6 +4453,7 @@ def main() -> int:
         recent_min_sessions=args.recent_min_sessions,
         timezone_name=args.timezone,
         strict_goal_metric=args.strict_goal_metric,
+        session_cost_source_policy=args.session_cost_source_policy,
     )
     fixed_window_payload_matrix: dict[str, dict[str, dict[str, Any]]] = {}
     for hours in FIXED_WINDOW_HOURS:
@@ -4131,6 +4495,7 @@ def main() -> int:
     report = {
         "generated_at": _to_iso(now),
         "history_visible_mode": args.history_visible_mode,
+        "session_cost_source_policy": _normalize_session_cost_source_policy(args.session_cost_source_policy),
         "windows": {
             label: {
                 "label": payload["window"]["label"],
@@ -4157,9 +4522,14 @@ def main() -> int:
         "text_route_cache_hit_rate": text_route_cache_hit_rate,
         "cache_hit_rate": cache_hit_rate,
         "cache_eligible_hit_rate": cache_eligible_hit_rate,
+        "gateway_error_rate": gateway_error_rate,
+        "rate_limit_triggered_fallback_count": rate_limit_triggered_fallback_count,
+        "fallback_once_success_rate": fallback_once_success_rate,
+        "browser_preprocess_accuracy": browser_preprocess_accuracy,
         "browser_single_ai_call_completion": browser_single_ai_call_completion,
         "capability_match_rate": capability_match_rate,
         "preferred_model_selection_accuracy": preferred_model_selection_accuracy,
+        "route_decision_explainable_rate": route_decision_explainable_rate,
         "cloudflare_summary": cloudflare_summary,
         "optimization_analysis": optimization_analysis,
         "modal_cost_optimization": modal_cost_optimization,

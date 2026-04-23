@@ -8,12 +8,28 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 
 
 DEFAULT_ACCOUNT_ID = "d1215a30b84b673ef0367010b0e78c10"
 DEFAULT_WORKFLOW_NAME = "hermes-feishu-agent-workflow"
 DEFAULT_WORKER_NAME = "hermes-feishu-gateway"
+
+
+def _is_synthetic_instance(instance_id: str) -> bool:
+    normalized_id = trim(instance_id).lower()
+    return "test_" in normalized_id or "selftest" in normalized_id
+
+
+def _parse_created_on_epoch(value: Any) -> float:
+    raw = trim(value)
+    if not raw:
+        return 0.0
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return 0.0
 
 
 def classify_instance_error(instance_id: str, error_message: str) -> str:
@@ -29,7 +45,7 @@ def classify_instance_error(instance_id: str, error_message: str) -> str:
         return "modal_internal_route_missing"
     if "modal_internal_failed:500" in normalized_error:
         return "modal_runtime_error"
-    if "test_" in normalized_id or "selftest" in normalized_id:
+    if _is_synthetic_instance(normalized_id):
         return "synthetic_test_instance"
     return "unknown"
 
@@ -156,11 +172,19 @@ def select_instance(config: DiagnoseConfig, instances: list[dict[str, Any]]) -> 
             if trim(item.get("id")) == config.instance_id:
                 return item
         return {"id": config.instance_id}
+    sorted_instances = sorted(
+        instances,
+        key=lambda item: _parse_created_on_epoch(item.get("created_on")),
+        reverse=True,
+    )
     if config.chat_filter:
-        for item in instances:
-            if config.chat_filter in trim(item.get("id")):
-                return item
-    return instances[0] if instances else None
+        matching = [item for item in sorted_instances if config.chat_filter in trim(item.get("id"))]
+        non_synthetic_matching = [item for item in matching if not _is_synthetic_instance(trim(item.get("id")))]
+        if non_synthetic_matching:
+            return non_synthetic_matching[0]
+        if matching:
+            return matching[0]
+    return sorted_instances[0] if sorted_instances else None
 
 
 def build_modal_probe_body(detail: dict[str, Any]) -> dict[str, Any]:
@@ -375,7 +399,7 @@ def summarize_recent_instances(instances: list[dict[str, Any]]) -> list[dict[str
                 "id": instance_id,
                 "status": trim(item.get("status")),
                 "created_on": trim(item.get("created_on")),
-                "is_synthetic": "test_" in instance_id.lower() or "selftest" in instance_id.lower(),
+                "is_synthetic": _is_synthetic_instance(instance_id),
             }
         )
     return out
@@ -410,6 +434,7 @@ def main() -> int:
             "workflow_name": config.workflow_name,
             "selected_instance_id": trim(detail.get("id")) or trim(selected.get("id")),
             "selected_instance_status": trim(detail.get("status")) or trim(selected.get("status")),
+            "selected_instance_created_on": trim(detail.get("created_on")) or trim(selected.get("created_on")),
             "selected_instance_error": trim((detail.get("error") or {}).get("message")) if isinstance(detail.get("error"), dict) else "",
             "selected_instance_error_class": classify_instance_error(
                 trim(detail.get("id")) or trim(selected.get("id")),
@@ -419,8 +444,7 @@ def main() -> int:
                 ((detail.get("params") or {}) if isinstance(detail.get("params"), dict) else {}).get("chat_id")
             ),
             "selected_instance_is_synthetic": (
-                "test_" in (trim(detail.get("id")) or trim(selected.get("id"))).lower()
-                or "selftest" in (trim(detail.get("id")) or trim(selected.get("id"))).lower()
+                _is_synthetic_instance(trim(detail.get("id")) or trim(selected.get("id")))
             ),
             "recent_instances": summarize_recent_instances(instances),
             "worker_settings": {

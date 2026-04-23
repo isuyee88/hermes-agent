@@ -1,7 +1,37 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import time
 from typing import Any, Callable
+
+
+def _row_timestamp_seconds(row: dict[str, Any]) -> int:
+    for field in ("timestamp_ms", "__timestamp_ms", "ts_ms"):
+        value = row.get(field)
+        if isinstance(value, (int, float)):
+            return int(float(value) / 1000)
+        try:
+            parsed = int(str(value or "").strip())
+            if parsed > 1_600_000_000_000:
+                return int(parsed / 1000)
+            if parsed > 1_600_000_000:
+                return parsed
+        except (TypeError, ValueError):
+            pass
+
+    ts = row.get("ts")
+    try:
+        return int(float(ts))
+    except (TypeError, ValueError):
+        if isinstance(ts, str):
+            try:
+                parsed = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                return int(parsed.timestamp())
+            except ValueError:
+                pass
+    return 0
 
 
 def _summarize_numeric_series(values: list[int | float]) -> dict[str, Any]:
@@ -75,7 +105,7 @@ def build_feishu_perf_summary_from_rows(
     for row in rows:
         if not isinstance(row, dict):
             continue
-        row_ts = int(row.get("ts") or 0)
+        row_ts = _row_timestamp_seconds(row)
         if min_ts is not None and row_ts and row_ts < min_ts:
             continue
         if normalized_event_type and str(row.get("event_type") or "").strip() != normalized_event_type:

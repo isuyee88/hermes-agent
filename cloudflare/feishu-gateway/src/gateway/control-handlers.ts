@@ -121,6 +121,34 @@ async function dispatchTextViaAgentExec(
   });
 }
 
+function fallbackCommandForMenuEvent(eventKey: string): string {
+  const normalizedEventKey = String(eventKey || "").trim().toLowerCase();
+  const providerEventToCommand: Record<string, string> = {
+    provider_openrouter: "/model --provider openrouter",
+    provider_openrouter_featured: "/model --provider openrouter",
+    provider_openrouter_recent: "/model --provider openrouter",
+    provider_openrouter_performance: "/model --provider openrouter",
+    provider_nvidia: "/model --provider nvidia",
+    provider_nvidia_featured: "/model --provider nvidia",
+    provider_nvidia_recent: "/model --provider nvidia",
+    provider_nvidia_performance: "/model --provider nvidia",
+  };
+  return providerEventToCommand[normalizedEventKey] || "";
+}
+
+async function dispatchFallbackCommandForMenuEvent(
+  env: Env,
+  normalized: FeishuNormalizedPayload,
+  deps: Pick<ControlDeps, "callModalWithReconciles">,
+  eventKey: string,
+): Promise<ModalInternalResponse | null> {
+  const fallbackCommand = fallbackCommandForMenuEvent(eventKey);
+  if (!fallbackCommand) {
+    return null;
+  }
+  return dispatchCommandViaAgentExec(env, normalized, deps, fallbackCommand);
+}
+
 function inferFeishuReceiveIdType(trim: ControlDeps["trim"], receiveId: string): ReceiveIdType {
   const normalizedReceiveId = trim(receiveId);
   if (!normalizedReceiveId) {
@@ -236,7 +264,8 @@ export async function handleMenuEvent(
   deps: ControlDeps,
 ): Promise<ModalInternalResponse> {
   const event = deps.readEvent(normalized.raw_payload);
-  const eventKey = deps.readString(event, "event_key");
+  const header = deps.readRecord(normalized.raw_payload, "header");
+  const eventKey = deps.readString(event, "event_key") || deps.readString(header, "event_key");
   const target = resolveMenuTarget(normalized.raw_payload, deps);
   if (!target) {
     throw new Error(`menu_target_missing:${eventKey}`);
@@ -270,6 +299,10 @@ export async function handleMenuEvent(
     event_key: eventKey,
   });
   if (!internal.card) {
+    const fallback = await dispatchFallbackCommandForMenuEvent(env, normalized, deps, eventKey);
+    if (fallback) {
+      return fallback;
+    }
     throw new Error(internal.error || `render_card_failed:${eventKey}`);
   }
   return {
@@ -301,12 +334,17 @@ export async function handleCardAction(
     };
   }
   if (hermesAction === "open_menu_card") {
+    const requestedEventKey = deps.trim(actionValue.event_key);
     const internal = await deps.callModalWithReconciles<ModalInternalResponse>(env, "/internal/feishu/session-control", normalized, {
       ...controlPayloadBase(normalized),
       action: "render_card",
-      event_key: deps.trim(actionValue.event_key),
+      event_key: requestedEventKey,
     });
     if (!internal.card) {
+      const fallback = await dispatchFallbackCommandForMenuEvent(env, normalized, deps, requestedEventKey);
+      if (fallback) {
+        return fallback;
+      }
       throw new Error(internal.error || "open_menu_card_failed");
     }
     const target = resolveDefaultSendTarget(normalized, deps);

@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { Env, FeishuNormalizedPayload, JsonValue, ModalInternalResponse } from "../src/runtime";
-import { handleAgentCommand, handleCardAction } from "../src/gateway/control-handlers";
+import { handleAgentCommand, handleCardAction, handleControlEvent } from "../src/gateway/control-handlers";
 
 function buildNormalizedPayload(
   rawPayload: Record<string, JsonValue> = {},
@@ -100,6 +100,180 @@ describe("control-handlers fallback", () => {
     );
   });
 
+  it("routes provider_status menu events through agent-exec", async () => {
+    const rawPayload = {
+      event: {
+        event_key: "provider_status",
+        operator: {
+          operator_id: {
+            open_id: "ou_user",
+          },
+        },
+      },
+    } as Record<string, JsonValue>;
+    const deps = buildDeps({
+      "/internal/feishu/agent-exec": {
+        status: "ok",
+        send_plan: [{ type: "text", text: "provider ok" }],
+      },
+    });
+
+    const result = await handleControlEvent(
+      {} as Env,
+      buildNormalizedPayload(rawPayload, {
+        event_type: "application.bot.menu_v6",
+        raw_payload: rawPayload,
+        text: "",
+      }),
+      deps,
+    );
+
+    expect(result.status).toBe("ok");
+    expect(result.send_plan).toEqual([{ type: "text", text: "provider ok" }]);
+    expect(deps.callModalWithReconciles).toHaveBeenCalledWith(
+      {} as Env,
+      "/internal/feishu/agent-exec",
+      expect.any(Object),
+      expect.objectContaining({
+        text: "/provider",
+        message_type: "command",
+      }),
+    );
+  });
+
+  it("uses header event_key when menu payload event_key is absent", async () => {
+    const rawPayload = {
+      header: {
+        event_key: "provider_status",
+      },
+      event: {
+        operator: {
+          operator_id: {
+            open_id: "ou_user",
+          },
+        },
+      },
+    } as Record<string, JsonValue>;
+    const deps = buildDeps({
+      "/internal/feishu/agent-exec": {
+        status: "ok",
+        send_plan: [{ type: "text", text: "provider from header" }],
+      },
+    });
+
+    const result = await handleControlEvent(
+      {} as Env,
+      buildNormalizedPayload(rawPayload, {
+        event_type: "application.bot.menu_v6",
+        raw_payload: rawPayload,
+        text: "",
+      }),
+      deps,
+    );
+
+    expect(result.status).toBe("ok");
+    expect(result.send_plan).toEqual([{ type: "text", text: "provider from header" }]);
+    expect(deps.callModalWithReconciles).toHaveBeenCalledWith(
+      {} as Env,
+      "/internal/feishu/agent-exec",
+      expect.any(Object),
+      expect.objectContaining({
+        text: "/provider",
+        message_type: "command",
+      }),
+    );
+  });
+
+  it("falls back to provider command when menu render_card returns no card", async () => {
+    const rawPayload = {
+      event: {
+        event_key: "provider_nvidia_featured",
+        context: {
+          open_chat_id: "oc_chat",
+        },
+      },
+    } as Record<string, JsonValue>;
+    const deps = buildDeps({
+      "/internal/feishu/session-control": {
+        status: "error",
+        action: "render_card",
+        card: null,
+        error: "unsupported event_key: provider_nvidia_featured",
+      },
+      "/internal/feishu/agent-exec": {
+        status: "ok",
+        send_plan: [{ type: "text", text: "provider switched" }],
+      },
+    });
+
+    const result = await handleControlEvent(
+      {} as Env,
+      buildNormalizedPayload(rawPayload, {
+        event_type: "application.bot.menu_v6",
+        raw_payload: rawPayload,
+        text: "",
+      }),
+      deps,
+    );
+
+    expect(result.status).toBe("ok");
+    expect(result.send_plan).toEqual([{ type: "text", text: "provider switched" }]);
+    expect(deps.callModalWithReconciles).toHaveBeenCalledTimes(2);
+    expect(deps.callModalWithReconciles).toHaveBeenNthCalledWith(
+      2,
+      {} as Env,
+      "/internal/feishu/agent-exec",
+      expect.any(Object),
+      expect.objectContaining({
+        text: "/model --provider nvidia",
+        message_type: "command",
+      }),
+    );
+  });
+
+  it("renders route_status menu responses as text", async () => {
+    const rawPayload = {
+      event: {
+        event_key: "route_status",
+        context: {
+          open_chat_id: "oc_chat",
+        },
+      },
+    } as Record<string, JsonValue>;
+    const deps = buildDeps({
+      "/internal/feishu/session-control": {
+        status: "ok",
+        session_state_after: {
+          route_status_lines: ["Current model: anthropic/claude", "Current provider: openrouter"],
+        },
+      },
+    });
+
+    const result = await handleControlEvent(
+      {} as Env,
+      buildNormalizedPayload(rawPayload, {
+        event_type: "application.bot.menu_v6",
+        chat_type: "group",
+        raw_payload: rawPayload,
+        text: "",
+      }),
+      deps,
+    );
+
+    expect(result.status).toBe("ok");
+    expect(result.send_plan).toEqual([
+      { type: "text", text: "Current model: anthropic/claude\nCurrent provider: openrouter" },
+    ]);
+    expect(deps.callModalWithReconciles).toHaveBeenCalledWith(
+      {} as Env,
+      "/internal/feishu/session-control",
+      expect.any(Object),
+      expect.objectContaining({
+        action: "get_session_state",
+      }),
+    );
+  });
+
   it("falls back to agent-exec for card command actions when session-control returns an error payload", async () => {
     const rawPayload = {
       event: {
@@ -135,6 +309,51 @@ describe("control-handlers fallback", () => {
         text: "/status",
         message_type: "command",
         raw_message: rawPayload,
+      }),
+    );
+  });
+
+  it("falls back to provider command when open_menu_card render fails", async () => {
+    const rawPayload = {
+      event: {
+        action: {
+          value: {
+            hermes_action: "open_menu_card",
+            event_key: "provider_openrouter_recent",
+          },
+        },
+      },
+    } as Record<string, JsonValue>;
+    const deps = buildDeps({
+      "/internal/feishu/session-control": {
+        status: "error",
+        action: "render_card",
+        card: null,
+        error: "unsupported event_key: provider_openrouter_recent",
+      },
+      "/internal/feishu/agent-exec": {
+        status: "ok",
+        send_plan: [{ type: "text", text: "openrouter route" }],
+      },
+    });
+
+    const result = await handleCardAction(
+      {} as Env,
+      buildNormalizedPayload(rawPayload, { raw_payload: rawPayload, text: "" }),
+      deps,
+    );
+
+    expect(result.status).toBe("ok");
+    expect(result.send_plan).toEqual([{ type: "text", text: "openrouter route" }]);
+    expect(deps.callModalWithReconciles).toHaveBeenCalledTimes(2);
+    expect(deps.callModalWithReconciles).toHaveBeenNthCalledWith(
+      2,
+      {} as Env,
+      "/internal/feishu/agent-exec",
+      expect.any(Object),
+      expect.objectContaining({
+        text: "/model --provider openrouter",
+        message_type: "command",
       }),
     );
   });

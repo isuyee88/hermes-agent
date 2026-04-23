@@ -191,7 +191,7 @@ export async function sendLoggedFeishuOperation(
     writeFeishuAnalyticsEvent(env, "feishu.send.operation.done", donePayload);
     return response;
   } catch (error) {
-    log("feishu.send.operation.error", {
+    const errorPayload = {
       correlation_id: normalized.correlation_id,
       session_key: normalized.session_key,
       event_id: normalized.event_id,
@@ -203,7 +203,9 @@ export async function sendLoggedFeishuOperation(
       error: error instanceof Error ? error.message : String(error),
       ...extractFeishuSendErrorMeta(error),
       status: "error",
-    });
+    };
+    log("feishu.send.operation.error", errorPayload);
+    writeFeishuAnalyticsEvent(env, "feishu.send.operation.error", errorPayload);
     throw error;
   }
 }

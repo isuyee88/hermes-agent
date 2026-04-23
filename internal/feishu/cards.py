@@ -106,13 +106,13 @@ def build_local_registry_provider_card(
     elements: list[dict[str, Any]] = [
         {
             "tag": "markdown",
-            "content": f"**{provider_title} {view_title}**\nChoose a model from the local registry.",
+            "content": f"**{provider_title} {view_title}**\nChoose a model from the Feishu Bitable registry.",
         }
     ]
 
     actions = [
         button_factory(
-            label=shorten_label(str(item.get("model") or "").strip()),
+            label=str(item.get("model") or "").strip(),
             action="registry_switch_model",
             extra={
                 "provider": provider_slug,
@@ -277,91 +277,63 @@ def build_feishu_command_center_card(
 
 
 def build_feishu_model_hub_card(*, button_factory: ButtonFactory) -> dict[str, Any]:
+    from tools.feishu_api import load_feishu_model_registry
+
+    registry_payload = load_feishu_model_registry(force_refresh=False)
+    entries = [
+        entry
+        for entry in list(registry_payload.get("entries") or [])
+        if isinstance(entry, dict)
+        and not bool(entry.get("hidden"))
+        and bool(entry.get("is_available", True))
+        and str(entry.get("provider") or "").strip()
+        and str(entry.get("model") or "").strip()
+    ]
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for entry in entries:
+        grouped.setdefault(str(entry.get("provider") or "").strip().lower(), []).append(entry)
+    for provider_entries in grouped.values():
+        provider_entries.sort(
+            key=lambda item: (
+                int(item.get("rank") or 9999),
+                str(item.get("model") or ""),
+            )
+        )
+
     elements: list[dict[str, Any]] = [
         {
             "tag": "markdown",
             "content": (
                 "**Hermes Model Hub**\n"
-                "Use the shortcuts below to open local registry views, inspect route status, or jump into personality/skills."
+                "Choose a model ID from the Feishu Bitable registry and switch directly."
             ),
-        },
-        {
-            "tag": "action",
-            "actions": [
+        }
+    ]
+    for provider_slug, provider_entries in grouped.items():
+        elements.append({"tag": "markdown", "content": f"**{provider_slug}**"})
+        actions: list[dict[str, Any]] = []
+        for entry in provider_entries[:20]:
+            model_id = str(entry.get("model") or "").strip()
+            if not model_id:
+                continue
+            actions.append(
                 button_factory(
-                    label="OR Featured",
-                    action="open_menu_card",
-                    extra={"event_key": "provider_openrouter_featured"},
-                    btn_type="primary",
-                ),
-                button_factory(
-                    label="OR Recent",
-                    action="open_menu_card",
-                    extra={"event_key": "provider_openrouter_recent"},
-                ),
-                button_factory(
-                    label="OR Perf",
-                    action="open_menu_card",
-                    extra={"event_key": "provider_openrouter_performance"},
-                ),
-            ],
-        },
-        {
-            "tag": "action",
-            "actions": [
-                button_factory(
-                    label="NV Featured",
-                    action="open_menu_card",
-                    extra={"event_key": "provider_nvidia_featured"},
-                    btn_type="primary",
-                ),
-                button_factory(
-                    label="NV Recent",
-                    action="open_menu_card",
-                    extra={"event_key": "provider_nvidia_recent"},
-                ),
-                button_factory(
-                    label="NV Perf",
-                    action="open_menu_card",
-                    extra={"event_key": "provider_nvidia_performance"},
-                ),
-            ],
-        },
-        {
-            "tag": "action",
-            "actions": [
-                button_factory(label="Route Status", action="command_run", extra={"command_text": "/status"}),
-                button_factory(label="Providers", action="command_run", extra={"command_text": "/provider"}),
-                button_factory(label="Route", action="command_run", extra={"command_text": "/status"}),
-            ],
-        },
-        {
-            "tag": "action",
-            "actions": [
-                button_factory(
-                    label="Personality",
-                    action="open_menu_card",
-                    extra={"event_key": "personality_picker"},
-                ),
-                button_factory(
-                    label="Skill Combos",
-                    action="open_menu_card",
-                    extra={"event_key": "skill_combo_picker"},
-                ),
-                button_factory(
-                    label="Commands",
-                    action="open_menu_card",
-                    extra={"event_key": "command_center"},
-                ),
-            ],
-        },
+                    label=model_id,
+                    action="registry_switch_model",
+                    extra={"provider": provider_slug, "model": model_id},
+                    btn_type="primary" if str(entry.get("selection_hint") or "").strip().lower() == "recommended" else "default",
+                )
+            )
+        for index in range(0, len(actions), 2):
+            elements.append({"tag": "action", "actions": actions[index:index + 2]})
+    elements.append(
         {
             "tag": "action",
             "actions": [
                 button_factory(label="Close", action="registry_close_card", btn_type="default"),
             ],
-        },
-    ]
+        }
+    )
     return {
         "config": {"wide_screen_mode": True},
         "header": {

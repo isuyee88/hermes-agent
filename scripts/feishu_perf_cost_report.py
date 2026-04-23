@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
 from datetime import datetime, timedelta
@@ -37,6 +38,68 @@ def _load_feishu_perf_module():
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
+
+
+def _modal_python_candidates() -> list[Path]:
+    candidates: list[Path] = []
+
+    explicit = str(os.getenv("HERMES_MODAL_PYTHON") or "").strip()
+    if explicit:
+        candidates.append(Path(explicit))
+
+    sibling_python = MODAL_CLI.with_name("python.exe")
+    candidates.append(sibling_python)
+
+    modal_cli_on_path = shutil.which("modal")
+    if modal_cli_on_path:
+        candidates.append(Path(modal_cli_on_path).with_name("python.exe"))
+
+    deduped: list[Path] = []
+    for candidate in candidates:
+        resolved = candidate.expanduser()
+        if resolved.exists() and resolved not in deduped:
+            deduped.append(resolved)
+    return deduped
+
+
+def _run_modal_remote_subprocess(app: str, function_name: str, payload: dict) -> dict:
+    inline = """
+import json
+import modal
+import sys
+
+app_name = sys.argv[1]
+fn_name = sys.argv[2]
+kwargs = json.loads(sys.argv[3])
+result = modal.Function.from_name(app_name, fn_name).remote(**kwargs)
+print(json.dumps(result, ensure_ascii=False))
+""".strip()
+
+    errors: list[str] = []
+    for python_path in _modal_python_candidates():
+        command = [str(python_path), "-c", inline, app, function_name, json.dumps(payload, ensure_ascii=False)]
+        completed = subprocess.run(
+            command,
+            cwd=str(REPO_ROOT),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env={**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1"},
+            timeout=180,
+        )
+        if completed.returncode != 0:
+            errors.append(f"{python_path}: {completed.stderr.strip() or completed.stdout.strip() or 'unknown error'}")
+            continue
+        try:
+            decoded = json.loads(completed.stdout or "{}")
+        except json.JSONDecodeError as exc:
+            errors.append(f"{python_path}: json_decode_failed:{exc}")
+            continue
+        if isinstance(decoded, dict):
+            return decoded
+        errors.append(f"{python_path}: unexpected_payload_type={type(decoded).__name__}")
+    raise RuntimeError("modal_remote_subprocess_failed: " + " | ".join(errors or ["no_modal_python_found"]))
 
 
 def _normalize_phase_timings(value) -> dict[str, int]:
@@ -227,10 +290,11 @@ def _build_perf_summary_from_trace_rows(
     snapshot_profile: str,
     include_duplicates: bool,
 ) -> dict:
-    if modal is None:
-        raise RuntimeError("modal_python_sdk_unavailable")
     feishu_perf_module = _load_feishu_perf_module()
-    rows_payload = modal.Function.from_name(app, "debug_feishu_trace").remote(limit=max(limit, 1))
+    if modal is None:
+        rows_payload = _run_modal_remote_subprocess(app, "debug_feishu_trace", {"limit": max(limit, 1)})
+    else:
+        rows_payload = modal.Function.from_name(app, "debug_feishu_trace").remote(limit=max(limit, 1))
     rows = rows_payload.get("rows") if isinstance(rows_payload, dict) else []
     if not isinstance(rows, list):
         rows = []
@@ -271,17 +335,19 @@ def main() -> int:
         descriptions.add(args.app)
 
     try:
+        request_payload = {
+            "limit": max(args.limit, 1),
+            "since_seconds": since_seconds,
+            "event_type": args.event_type,
+            "experiment_label": args.experiment_label,
+            "app_name_filter": args.app_name_filter,
+            "snapshot_profile": args.snapshot_profile,
+            "include_duplicates": args.include_duplicates,
+        }
         if modal is None:
-            raise RuntimeError("modal_python_sdk_unavailable")
-        perf_summary = modal.Function.from_name(args.app, "debug_feishu_perf_summary").remote(
-            limit=max(args.limit, 1),
-            since_seconds=since_seconds,
-            event_type=args.event_type,
-            experiment_label=args.experiment_label,
-            app_name_filter=args.app_name_filter,
-            snapshot_profile=args.snapshot_profile,
-            include_duplicates=args.include_duplicates,
-        )
+            perf_summary = _run_modal_remote_subprocess(args.app, "debug_feishu_perf_summary", request_payload)
+        else:
+            perf_summary = modal.Function.from_name(args.app, "debug_feishu_perf_summary").remote(**request_payload)
     except Exception:
         try:
             perf_summary = _build_perf_summary_from_trace_rows(

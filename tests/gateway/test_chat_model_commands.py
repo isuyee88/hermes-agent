@@ -419,6 +419,60 @@ async def test_model_picker_selection_handler_uses_gateway_config_session_flags(
     assert expected_session_key in runner._session_model_overrides
 
 
+@pytest.mark.asyncio
+async def test_model_picker_selection_handler_includes_registry_intro(monkeypatch):
+    import hermes_cli.model_switch as model_switch
+
+    runner = _make_runner()
+    monkeypatch.setattr(
+        model_switch,
+        "switch_model",
+        lambda **_kwargs: SimpleNamespace(
+            success=True,
+            error_message="",
+            new_model="qwen/qwq-32b",
+            target_provider="nvidia",
+            api_key="nvapi-test",
+            base_url="https://integrate.api.nvidia.com/v1",
+            api_mode="chat_completions",
+            provider_label="NVIDIA",
+            model_info=None,
+        ),
+    )
+    monkeypatch.setattr(
+        runner,
+        "_load_chat_model_registry_index",
+        lambda: {
+            "nvidia": [
+                {
+                    "provider": "nvidia",
+                    "model": "qwen/qwq-32b",
+                    "introduction": "Reasoning-focused model with strong tool-use support.",
+                }
+            ]
+        },
+    )
+
+    handler = runner._build_model_picker_selection_handler(
+        session_key="agent:main:feishu:dm:ou_owner",
+        source=SessionSource(
+            platform=Platform.FEISHU,
+            chat_id="ou_owner",
+            chat_type="dm",
+            user_id="ou_owner",
+            user_name="Alice",
+        ),
+        current_model="openrouter/default-model",
+        current_provider="openrouter",
+        current_base_url="https://openrouter.ai/api/v1",
+        current_api_key="",
+    )
+
+    text = await handler("oc_real_chat", "qwen/qwq-32b", "nvidia")
+
+    assert "Introduction: Reasoning-focused model with strong tool-use support." in text
+
+
 def test_switch_model_with_runtime_fallback_recovers_known_provider(monkeypatch):
     import hermes_cli.model_switch as model_switch
     import hermes_cli.models as model_registry
@@ -509,3 +563,46 @@ async def test_feishu_model_switch_command_rejects_global_persist(monkeypatch):
 
     assert "`/model --global` is disabled in chat." in text
     assert runner._session_model_overrides == {}
+
+
+@pytest.mark.asyncio
+async def test_feishu_model_switch_command_includes_registry_intro(monkeypatch):
+    import hermes_cli.model_switch as model_switch
+
+    runner = _make_runner()
+    event = _make_event("/model qwen/qwq-32b --provider nvidia")
+
+    monkeypatch.setattr(
+        model_switch,
+        "switch_model",
+        lambda **_kwargs: SimpleNamespace(
+            success=True,
+            error_message="",
+            new_model="qwen/qwq-32b",
+            target_provider="nvidia",
+            api_key="nvapi-test",
+            base_url="https://integrate.api.nvidia.com/v1",
+            api_mode="chat_completions",
+            provider_label="NVIDIA",
+            model_info=None,
+            warning_message="",
+        ),
+    )
+    monkeypatch.setattr(
+        runner,
+        "_load_chat_model_registry_index",
+        lambda: {
+            "nvidia": [
+                {
+                    "provider": "nvidia",
+                    "model": "qwen/qwq-32b",
+                    "description": "General-purpose reasoning model from the Feishu registry.",
+                }
+            ]
+        },
+    )
+
+    text = await runner._handle_model_command(event)
+
+    assert "Model switched to `qwen/qwq-32b`" in text
+    assert "Introduction: General-purpose reasoning model from the Feishu registry." in text

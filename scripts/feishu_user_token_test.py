@@ -1,265 +1,232 @@
-"""
-使用用户访问令牌驱动机器人工作 - 真实测试
+from __future__ import annotations
 
-通过用户身份发送消息给机器人，触发机器人的AI处理流程
-"""
-
+import argparse
 import asyncio
 import json
 import os
 import sys
 import time
+from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
+from typing import Any
 
 import aiohttp
 
 
+DEFAULT_CHAT_ID = os.getenv("FEISHU_TEST_CHAT_ID") or os.getenv("FEISHU_HOME_CHANNEL") or "oc_ec86c28e66596c25377aff2ee028901c"
+
+
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="backslashreplace")
+    except Exception:
+        pass
+
+
+def _trim(value: Any) -> str:
+    return str(value or "").strip()
+
+
+@dataclass(frozen=True)
+class TestScenario:
+    name: str
+    message: str
+    expected_type: str
+
+
+DEFAULT_SCENARIOS = [
+    TestScenario("纯文本问候", "你好，请介绍一下你自己", "text_plain"),
+    TestScenario("浏览器任务", "打开浏览器访问 https://github.com/microsoft/vscode 查看最近的 issues", "browser_heavy"),
+    TestScenario("代码任务", "帮我写一个 Python 函数，计算斐波那契数列的前 n 项", "text_coding"),
+    TestScenario("知识问答", "什么是微服务架构？有什么优缺点？", "text_general"),
+]
+
+
 class FeishuUserDriver:
-    """使用用户令牌驱动机器人"""
-    
     def __init__(self, user_access_token: str, bot_chat_id: str):
         self.user_access_token = user_access_token
         self.bot_chat_id = bot_chat_id
-        self.results = []
-        
-    async def send_message_to_bot(self, message: str, msg_type: str = "text") -> dict:
-        """以用户身份发送消息给机器人"""
-        url = f"https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id"
+        self.results: list[dict[str, Any]] = []
+
+    async def send_message_to_bot(self, message: str, msg_type: str = "text") -> dict[str, Any]:
+        url = "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id"
         headers = {
             "Authorization": f"Bearer {self.user_access_token}",
-            "Content-Type": "application/json"
+            "Content-Type": "application/json",
         }
-        
         data = {
             "receive_id": self.bot_chat_id,
             "msg_type": msg_type,
-            "content": json.dumps({"text": message}) if msg_type == "text" else message
+            "content": json.dumps({"text": message}, ensure_ascii=False) if msg_type == "text" else message,
         }
-        
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] 发送消息: {message[:50]}...")
-        
-        async with aiohttp.ClientSession() as session:
+
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] 发送消息: {message[:60]}...")
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60)) as session:
             async with session.post(url, headers=headers, json=data) as resp:
-                result = await resp.json()
-                return result
-    
-    async def get_messages(self, container_id: str, page_size: int = 20) -> list:
-        """获取会话消息列表"""
+                return await resp.json()
+
+    async def get_messages(self, container_id: str, page_size: int = 20) -> list[dict[str, Any]]:
         url = "https://open.feishu.cn/open-apis/im/v1/messages"
         headers = {"Authorization": f"Bearer {self.user_access_token}"}
         params = {
             "container_id_type": "chat",
             "container_id": container_id,
-            "page_size": page_size
+            "page_size": page_size,
+            "sort_type": "ByCreateTimeDesc",
         }
-        
-        async with aiohttp.ClientSession() as session:
+
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60)) as session:
             async with session.get(url, headers=headers, params=params) as resp:
-                result = await resp.json()
-                if result.get("code") == 0:
-                    return result.get("data", {}).get("items", [])
+                payload = await resp.json()
+                if payload.get("code") == 0:
+                    items = ((payload.get("data") or {}).get("items") or [])
+                    return [item for item in items if isinstance(item, dict)]
                 return []
-    
-    async def wait_for_bot_reply(self, sent_message_id: str, timeout: int = 60) -> dict | None:
-        """等待机器人回复"""
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] 等待机器人回复 (最多{timeout}秒)...")
-        
+
+    async def wait_for_bot_reply(self, sent_message_id: str, timeout: int = 60) -> dict[str, Any] | None:
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] 等待机器人回复，最长 {timeout} 秒...")
         start_time = time.time()
         check_count = 0
-        
+
         while time.time() - start_time < timeout:
             await asyncio.sleep(2)
             check_count += 1
-            
             messages = await self.get_messages(self.bot_chat_id, page_size=10)
-            
-            # 查找机器人回复（非用户发送的消息）
             for msg in messages:
-                msg_id = msg.get("message_id")
-                sender_type = msg.get("sender", {}).get("sender_type")
-                
-                # 跳过我们发送的消息
-                if msg_id == sent_message_id:
+                msg_id = _trim(msg.get("message_id"))
+                sender_type = _trim((msg.get("sender") or {}).get("sender_type"))
+                if not msg_id or msg_id == sent_message_id:
                     continue
-                
-                # 找到机器人回复
-                if sender_type == "app":  # 机器人类型
-                    create_time = int(msg.get("create_time", 0)) / 1000
-                    if create_time > start_time:
-                        print(f"[{datetime.now().strftime('%H:%M:%S')}] ✓ 收到机器人回复")
-                        return msg
-            
+                if sender_type != "app":
+                    continue
+                create_time = int(msg.get("create_time") or 0) / 1000
+                if create_time > start_time:
+                    print(f"[{datetime.now().strftime('%H:%M:%S')}] 收到机器人回复。")
+                    return msg
             if check_count % 5 == 0:
                 print(f"  已等待 {int(time.time() - start_time)} 秒...")
-        
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] ✗ 等待超时，未收到回复")
+
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] 超时，未收到机器人回复。")
         return None
-    
-    async def test_scenario(self, test_name: str, message: str, expected_type: str) -> dict:
-        """测试场景"""
-        print(f"\n{'='*60}")
-        print(f"测试: {test_name}")
-        print(f"{'='*60}")
-        
-        result = {
-            "test_name": test_name,
-            "message": message,
-            "expected_type": expected_type,
+
+    async def test_scenario(self, scenario: TestScenario, timeout: int) -> dict[str, Any]:
+        print("\n" + "=" * 60)
+        print(f"测试: {scenario.name}")
+        print("=" * 60)
+        result: dict[str, Any] = {
+            "test_name": scenario.name,
+            "message": scenario.message,
+            "expected_type": scenario.expected_type,
             "start_time": time.time(),
-            "success": False
+            "success": False,
         }
-        
+
         try:
-            # T0: 发送消息
-            send_result = await self.send_message_to_bot(message)
-            
+            send_result = await self.send_message_to_bot(scenario.message)
             if send_result.get("code") != 0:
                 result["error"] = f"发送失败: {send_result}"
                 result["end_time"] = time.time()
                 return result
-            
-            sent_message_id = send_result["data"]["message_id"]
+
+            sent_message_id = _trim(((send_result.get("data") or {}).get("message_id")))
             result["message_id"] = sent_message_id
             result["send_time"] = time.time()
-            
-            # T1-T4: 等待机器人回复
-            bot_reply = await self.wait_for_bot_reply(sent_message_id, timeout=60)
+
+            bot_reply = await self.wait_for_bot_reply(sent_message_id, timeout=timeout)
             result["end_time"] = time.time()
-            
+
             if bot_reply:
                 result["success"] = True
                 result["bot_reply"] = {
-                    "message_id": bot_reply.get("message_id"),
-                    "msg_type": bot_reply.get("msg_type"),
-                    "content": bot_reply.get("body", {}).get("content", "")[:200]
+                    "message_id": _trim(bot_reply.get("message_id")),
+                    "msg_type": _trim(bot_reply.get("msg_type")),
+                    "content": _trim(((bot_reply.get("body") or {}).get("content")))[:200],
                 }
                 result["total_latency_ms"] = (result["end_time"] - result["start_time"]) * 1000
             else:
                 result["error"] = "等待机器人回复超时"
-                
-        except Exception as e:
-            result["error"] = str(e)
+        except Exception as exc:
+            result["error"] = str(exc)
             result["end_time"] = time.time()
-            import traceback
-            traceback.print_exc()
-        
         return result
-    
-    async def run_all_tests(self):
-        """运行所有测试场景"""
+
+    async def run(self, scenarios: list[TestScenario], timeout: int) -> list[dict[str, Any]]:
         print("=" * 60)
-        print("飞书机器人真实工作测试")
+        print("飞书用户态真实工作测试")
         print("=" * 60)
-        print(f"目标Chat ID: {self.bot_chat_id}")
+        print(f"目标 Chat ID: {self.bot_chat_id}")
         print(f"开始时间: {datetime.now().isoformat()}")
         print()
-        
-        # 测试场景1: 纯文本问候
-        result1 = await self.test_scenario(
-            "纯文本问候",
-            "你好，请介绍一下你自己",
-            "text_plain"
-        )
-        self.results.append(result1)
-        
-        # 测试场景2: 浏览器任务
-        result2 = await self.test_scenario(
-            "浏览器任务",
-            "打开浏览器访问 https://github.com/microsoft/vscode 查看最近的issues",
-            "browser_heavy"
-        )
-        self.results.append(result2)
-        
-        # 测试场景3: 代码任务
-        result3 = await self.test_scenario(
-            "代码任务",
-            "帮我写一个Python函数，计算斐波那契数列的前n项",
-            "text_coding"
-        )
-        self.results.append(result3)
-        
-        # 测试场景4: 知识问答
-        result4 = await self.test_scenario(
-            "知识问答",
-            "什么是微服务架构？有什么优缺点？",
-            "text_general"
-        )
-        self.results.append(result4)
-        
+
+        for scenario in scenarios:
+            self.results.append(await self.test_scenario(scenario, timeout))
         return self.results
-    
+
     def generate_report(self) -> str:
-        """生成测试报告"""
         lines = [
-            "\n" + "=" * 60,
+            "",
+            "=" * 60,
             "测试报告",
             "=" * 60,
             f"总测试数: {len(self.results)}",
-            f"成功数: {sum(1 for r in self.results if r['success'])}",
-            f"失败数: {sum(1 for r in self.results if not r['success'])}",
-            ""
+            f"成功数: {sum(1 for item in self.results if item['success'])}",
+            f"失败数: {sum(1 for item in self.results if not item['success'])}",
+            "",
         ]
-        
-        for i, result in enumerate(self.results, 1):
-            status = "✓ PASS" if result["success"] else "✗ FAIL"
-            lines.append(f"\n[{i}] {status} {result['test_name']}")
-            lines.append(f"    消息: {result['message'][:60]}...")
+        for idx, result in enumerate(self.results, start=1):
+            status = "PASS" if result["success"] else "FAIL"
+            lines.append(f"[{idx}] {status} {result['test_name']}")
+            lines.append(f"    消息: {result['message'][:80]}...")
             lines.append(f"    预期类型: {result['expected_type']}")
-            
-            if result.get("total_latency_ms"):
+            if result.get("total_latency_ms") is not None:
                 lines.append(f"    总时延: {result['total_latency_ms']:.0f}ms")
-            
             if result.get("bot_reply"):
-                reply_content = result["bot_reply"]["content"][:100]
-                lines.append(f"    机器人回复: {reply_content}...")
-            
+                lines.append(f"    机器人回复: {result['bot_reply']['content'][:120]}...")
             if result.get("error"):
                 lines.append(f"    错误: {result['error']}")
-        
-        lines.append("\n" + "=" * 60)
+        lines.append("=" * 60)
         return "\n".join(lines)
 
 
-async def main():
-    # 从环境变量获取用户访问令牌
-    user_access_token = os.getenv("FEISHU_USER_ACCESS_TOKEN")
-    
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Send user-originated Feishu messages and wait for real bot replies.")
+    parser.add_argument("--chat-id", default=DEFAULT_CHAT_ID)
+    parser.add_argument("--timeout", type=int, default=60)
+    parser.add_argument("--single-message", default="")
+    parser.add_argument("--report-file", default="")
+    return parser
+
+
+async def main() -> int:
+    args = _build_parser().parse_args()
+    user_access_token = _trim(os.getenv("FEISHU_USER_ACCESS_TOKEN"))
     if not user_access_token:
-        print("错误: 需要设置 FEISHU_USER_ACCESS_TOKEN 环境变量")
-        print()
-        print("获取用户访问令牌的方法:")
-        print("1. 访问飞书开放平台: https://open.feishu.cn/app/")
-        print("2. 进入你的应用 -> 凭证与基础信息")
-        print("3. 使用'获取 user_access_token'功能")
-        print("4. 或者通过OAuth2流程获取")
-        print()
-        print("设置环境变量:")
-        print("  Windows: set FEISHU_USER_ACCESS_TOKEN=your_token")
-        print("  Mac/Linux: export FEISHU_USER_ACCESS_TOKEN=your_token")
-        sys.exit(1)
-    
-    # 使用之前发现的群组
-    bot_chat_id = "oc_ec86c28e66596c25377aff2ee028901c"
-    
-    driver = FeishuUserDriver(user_access_token, bot_chat_id)
-    
-    try:
-        await driver.run_all_tests()
-        report = driver.generate_report()
-        print(report)
-        
-        # 保存详细结果
-        result_file = f"feishu_bot_test_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-        with open(result_file, "w", encoding="utf-8") as f:
-            json.dump(driver.results, f, ensure_ascii=False, indent=2)
-        
-        print(f"\n详细结果已保存到: {result_file}")
-        
-    except Exception as e:
-        print(f"测试执行失败: {e}")
-        import traceback
-        traceback.print_exc()
+        print("错误: 需要设置 FEISHU_USER_ACCESS_TOKEN 环境变量。")
+        print("获取方式:")
+        print("1. 运行 python scripts/feishu_oauth_flow.py")
+        print("2. 或在飞书开放平台手动获取测试 user_access_token")
+        print("设置环境变量示例:")
+        print('  PowerShell: $env:FEISHU_USER_ACCESS_TOKEN="u-xxxx"')
+        return 1
+
+    chat_id = _trim(args.chat_id)
+    if not chat_id:
+        print("错误: 缺少 chat_id。")
+        return 1
+
+    scenarios = [TestScenario("单条消息", args.single_message, "custom")] if _trim(args.single_message) else list(DEFAULT_SCENARIOS)
+    driver = FeishuUserDriver(user_access_token, chat_id)
+    await driver.run(scenarios, timeout=max(1, int(args.timeout)))
+    report = driver.generate_report()
+    print(report)
+
+    report_path = Path(args.report_file) if _trim(args.report_file) else Path(f"feishu_bot_test_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
+    report_path.write_text(json.dumps(driver.results, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"\n详细结果已保存到: {report_path}")
+    return 0 if all(item.get("success") for item in driver.results) else 1
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    raise SystemExit(asyncio.run(main()))

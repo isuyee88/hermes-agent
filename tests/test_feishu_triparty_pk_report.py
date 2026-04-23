@@ -784,6 +784,8 @@ def test_build_goal_assessment_reports_idle_and_session_cost_targets():
                         "cf_cache_status": True,
                         "gateway_eligible": True,
                         "cache_eligible": True,
+                        "success": True,
+                        "status_code": 200,
                     },
                     {
                         "request_class": "text_coding",
@@ -791,6 +793,8 @@ def test_build_goal_assessment_reports_idle_and_session_cost_targets():
                         "cf_cache_status": False,
                         "gateway_eligible": True,
                         "cache_eligible": True,
+                        "success": True,
+                        "status_code": 200,
                     },
                 ]
             }
@@ -804,15 +808,21 @@ def test_build_goal_assessment_reports_idle_and_session_cost_targets():
     assert result["statuses"]["modal_idle_hourly_cost_under_0_005"] == "met"
     assert result["statuses"]["session_cost_under_0_0045"] == "met"
     assert result["statuses"]["cache_hit_rate_over_0_30"] == "met"
+    assert result["statuses"]["gateway_error_rate_equals_0"] == "met"
+    assert result["statuses"]["rate_limit_triggered_fallback_count_equals_0"] == "not_met"
+    assert result["statuses"]["fallback_once_success_rate_equals_1_00"] == "not_met"
+    assert result["statuses"]["browser_preprocess_accuracy_equals_1_00"] == "not_met"
     assert result["statuses"]["capability_match_rate_equals_1_00"] == "met"
     assert result["statuses"]["preferred_model_selection_accuracy_over_0_95"] == "met"
     assert result["statuses"]["browser_single_ai_call_completion_rate_over_0_50"] == "not_met"
+    assert result["statuses"]["route_decision_explainable_rate_equals_1_00"] == "not_met"
     assert result["current"]["read_receipt_p90_ms"] == 4200.0
     assert result["current"]["reply_minus_ai_p90_ms"] == 12000.0
     assert result["current"]["idle_hourly_p90_cost_usd"] == "0.00200000"
     assert result["current"]["session_cost_p90_usd"] == "0.00437000"
     assert result["current"]["avg_cost_per_session_usd"] == "0.00430000"
     assert result["current"]["cache_eligible_hit_rate"] == "0.50000000"
+    assert result["current"]["gateway_error_rate"] == "0.00000000"
     assert result["current"]["capability_match_rate"] == "1.00000000"
     assert result["current"]["preferred_model_selection_accuracy"] == "1.00000000"
 
@@ -1000,6 +1010,72 @@ def test_build_goal_assessment_keeps_session_cost_unavailable_when_function_trac
     assert result["statuses"]["session_cost_under_0_0045"] == "not_met"
 
 
+def test_build_goal_assessment_can_use_blended_total_policy_when_trace_is_missing():
+    module = _load_module()
+    window_payloads = {
+        "current": {
+            "billing_summary": {"total_cost_usd": "0.06800000"},
+            "cost_calibration": {
+                "allocation_gaps": [
+                    {"hour_key": "2026-04-15T09:00:00+08:00", "reason": "official_cost_without_matching_function_trace"}
+                ]
+            },
+            "session_summary": {
+                "completion": {"session_count": 2},
+                "sessions": [
+                    {"allocated_cost_usd": "0.00000000", "total_session_cost_usd": "0.00350000"},
+                    {"allocated_cost_usd": "0.00000000", "total_session_cost_usd": "0.00420000"},
+                ],
+                "metrics": {
+                    "t0_to_t3_minus_model_ms": {"p90": 8000.0, "count": 2},
+                },
+            },
+            "hourly_official_costs": {"2026-04-15T09:00:00+08:00": Decimal("0.01000000")},
+            "hourly_session_counts": {"2026-04-15T09:00:00+08:00": 2},
+        }
+    }
+
+    result = module._build_goal_assessment(window_payloads, session_cost_source_policy="blended_total")
+
+    assert result["current"]["session_cost_source_policy"] == "blended_total"
+    assert result["current"]["session_cost_measurement_mode"] == "session_total_cost_p90"
+    assert result["current"]["session_cost_truth_status"] == "partial"
+    assert result["current"]["session_cost_p90_usd"] == "0.00413000"
+
+
+def test_build_goal_assessment_can_force_official_average_policy_when_trace_is_missing():
+    module = _load_module()
+    window_payloads = {
+        "current": {
+            "billing_summary": {"total_cost_usd": "0.06800000"},
+            "cost_calibration": {
+                "allocation_gaps": [
+                    {"hour_key": "2026-04-15T09:00:00+08:00", "reason": "official_cost_without_matching_function_trace"}
+                ]
+            },
+            "session_summary": {
+                "completion": {"session_count": 10},
+                "sessions": [
+                    {"allocated_cost_usd": "0.00000000"},
+                    {"allocated_cost_usd": "0.00000000"},
+                ],
+                "metrics": {
+                    "t0_to_t3_minus_model_ms": {"p90": 8000.0, "count": 10},
+                },
+            },
+            "hourly_official_costs": {"2026-04-15T09:00:00+08:00": Decimal("0.01000000")},
+            "hourly_session_counts": {"2026-04-15T09:00:00+08:00": 10},
+        }
+    }
+
+    result = module._build_goal_assessment(window_payloads, session_cost_source_policy="official_average")
+
+    assert result["current"]["session_cost_source_policy"] == "official_average"
+    assert result["current"]["session_cost_measurement_mode"] == "official_total_div_session_count_forced"
+    assert result["current"]["session_cost_truth_status"] == "estimated"
+    assert result["current"]["session_cost_p90_usd"] == "0.00680000"
+
+
 def test_build_goal_assessment_treats_missing_gate_data_as_not_met():
     module = _load_module()
     result = module._build_goal_assessment({"current": {"billing_summary": {}, "session_summary": {}}})
@@ -1009,9 +1085,14 @@ def test_build_goal_assessment_treats_missing_gate_data_as_not_met():
     assert result["statuses"]["modal_idle_hourly_cost_under_0_005"] == "not_met"
     assert result["statuses"]["session_cost_under_0_0045"] == "not_met"
     assert result["statuses"]["cache_hit_rate_over_0_30"] == "not_met"
+    assert result["statuses"]["gateway_error_rate_equals_0"] == "not_met"
+    assert result["statuses"]["rate_limit_triggered_fallback_count_equals_0"] == "not_met"
+    assert result["statuses"]["fallback_once_success_rate_equals_1_00"] == "not_met"
+    assert result["statuses"]["browser_preprocess_accuracy_equals_1_00"] == "not_met"
     assert result["statuses"]["browser_single_ai_call_completion_rate_over_0_50"] == "not_met"
     assert result["statuses"]["capability_match_rate_equals_1_00"] == "not_met"
     assert result["statuses"]["preferred_model_selection_accuracy_over_0_95"] == "not_met"
+    assert result["statuses"]["route_decision_explainable_rate_equals_1_00"] == "not_met"
 
 
 def test_build_goal_check_from_sessions_keeps_session_cost_not_met_when_allocations_are_zero():
@@ -1089,6 +1170,104 @@ def test_browser_single_ai_call_completion_and_preferred_model_metrics():
     assert capability_summary["current"]["match_rate"] == 0.5
     assert preferred_summary["current"]["sample_count"] == 2
     assert preferred_summary["current"]["accuracy"] == 0.5
+
+
+def test_gateway_fallback_browser_and_route_kpi_builders():
+    module = _load_module()
+    window_payloads = {
+        "current": {
+            "session_summary": {
+                "sessions": [
+                    {
+                        "session_id": "evt_rate_once",
+                        "route_hint": "modal_heavy_exec",
+                        "request_class": "text_plain",
+                        "route_decision_reason": "429_rate_limit_recoverable",
+                        "fallback_reason": "rate_limited",
+                        "gateway_error_class": "rate_limited",
+                        "ai_call_count": 2,
+                        "reply_sent": True,
+                    },
+                    {
+                        "session_id": "evt_rate_multi",
+                        "route_hint": "modal_heavy_exec",
+                        "request_class": "text_plain",
+                        "route_decision_reason": "rate_limit_backoff",
+                        "fallback_reason": "rate_limited",
+                        "gateway_error_class": "rate_limited",
+                        "ai_call_count": 3,
+                        "reply_sent": True,
+                    },
+                    {
+                        "session_id": "evt_browser_ok",
+                        "route_hint": "cf_browser_first",
+                        "request_class": "tool_browser",
+                        "requires_browser": True,
+                        "capability_match": True,
+                        "route_decision_reason": "browser_required",
+                    },
+                    {
+                        "session_id": "evt_browser_bad",
+                        "route_hint": "modal_heavy_exec",
+                        "request_class": "tool_browser",
+                        "requires_browser": True,
+                        "capability_match": False,
+                        "route_decision_reason": "",
+                    },
+                    {
+                        "session_id": "evt_plain_explainable",
+                        "route_hint": "modal_heavy_exec",
+                        "request_class": "text_plain",
+                        "route_decision_reason": "plain_text_without_attachments_or_browser",
+                    },
+                    {
+                        "session_id": "evt_plain_unexplained",
+                        "route_hint": "modal_heavy_exec",
+                        "request_class": "text_plain",
+                        "route_decision_reason": "",
+                    },
+                ]
+            }
+        }
+    }
+    cloudflare_summary = {
+        "window_summaries": {
+            "current": {
+                "gateway_request_rows": [
+                    {"success": True, "status_code": 200},
+                    {"success": False, "status_code": 429},
+                    {"status_code": 500},
+                ]
+            }
+        }
+    }
+
+    gateway_error_rate = module._build_gateway_error_rate(cloudflare_summary)
+    rate_limit_triggered_fallback = module._build_rate_limit_triggered_fallback_count(window_payloads)
+    fallback_once_success_rate = module._build_fallback_once_success_rate(window_payloads)
+    browser_preprocess_accuracy = module._build_browser_preprocess_accuracy(window_payloads)
+    route_decision_explainable_rate = module._build_route_decision_explainable_rate(window_payloads)
+
+    assert gateway_error_rate["current"]["sample_count"] == 3
+    assert gateway_error_rate["current"]["error_count"] == 2
+    assert gateway_error_rate["current"]["error_rate"] == 0.666667
+
+    assert rate_limit_triggered_fallback["current"]["sample_count"] == 6
+    assert rate_limit_triggered_fallback["current"]["triggered_fallback_count"] == 2
+
+    assert fallback_once_success_rate["current"]["sample_count"] == 2
+    assert fallback_once_success_rate["current"]["measured_count"] == 2
+    assert fallback_once_success_rate["current"]["success_count"] == 1
+    assert fallback_once_success_rate["current"]["multi_fallback_success_count"] == 1
+    assert fallback_once_success_rate["current"]["success_rate"] == 0.5
+
+    assert browser_preprocess_accuracy["current"]["sample_count"] == 2
+    assert browser_preprocess_accuracy["current"]["success_count"] == 1
+    assert browser_preprocess_accuracy["current"]["accuracy"] == 0.5
+
+    assert route_decision_explainable_rate["current"]["sample_count"] == 6
+    assert route_decision_explainable_rate["current"]["explainable_count"] == 4
+    assert route_decision_explainable_rate["current"]["explainable_rate"] == 0.666667
 
 
 def test_apply_cloudflare_observability_adds_worker_only_sessions():

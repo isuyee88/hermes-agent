@@ -35,6 +35,14 @@ DEFAULT_CHAT_PAGE_SIZE = 50
 MESSAGE_EVENT_NAME = "im.message.receive_v1"
 MESSAGE_READ_EVENT_NAME = "im.message.message_read_v1"
 DEFAULT_RECENT_MESSAGE_WINDOW_MINUTES = 0
+FEISHU_TOKEN_EXPIRED_CODE = 99991677
+FEISHU_SCOPE_MISSING_CODE = 99991672
+CHAT_MEMBER_READ_SCOPES = (
+    "im:chat.members:read",
+    "im:chat.group_info:readonly",
+    "im:chat:readonly",
+    "im:chat",
+)
 
 
 @dataclass(frozen=True)
@@ -131,6 +139,17 @@ def _coerce_int(value: Any) -> int:
         return int(_trim(value) or 0)
     except (TypeError, ValueError):
         return 0
+
+
+def _extract_required_scopes(message: Any) -> list[str]:
+    text = _trim(message)
+    if not text:
+        return []
+    scopes: list[str] = []
+    for scope in CHAT_MEMBER_READ_SCOPES + ("im:message.send_as_user", "im:message:send_as_user"):
+        if scope in text and scope not in scopes:
+            scopes.append(scope)
+    return scopes
 
 
 def _build_expected_webhook_url(value: str) -> str:
@@ -377,11 +396,13 @@ def _get_chat_members_snapshot(token: str, chat_id: str) -> dict[str, Any]:
     )
     payload = response.json()
     if not response.ok or _coerce_int(payload.get("code")) != 0:
+        required_scopes = _extract_required_scopes(payload.get("msg"))
         return {
             "ok": False,
             "status_code": response.status_code,
             "code": payload.get("code"),
             "msg": _trim(payload.get("msg")),
+            "required_scopes": required_scopes,
         }
     data = payload.get("data") or {}
     if not isinstance(data, dict):
@@ -423,12 +444,14 @@ def _get_user_chat_members_snapshot(user_access_token: str, chat_id: str) -> dic
     )
     payload = response.json()
     if not response.ok or _coerce_int(payload.get("code")) != 0:
+        required_scopes = _extract_required_scopes(payload.get("msg"))
         return {
             "ok": False,
             "source": "user",
             "status_code": response.status_code,
             "code": payload.get("code"),
             "msg": _trim(payload.get("msg")),
+            "required_scopes": required_scopes,
         }
     data = payload.get("data") or {}
     if not isinstance(data, dict):
@@ -458,6 +481,27 @@ def _get_user_chat_members_snapshot(user_access_token: str, chat_id: str) -> dic
     }
 
 
+def _classify_user_member_blockers(user_members: dict[str, Any]) -> list[str]:
+    if not isinstance(user_members, dict) or user_members.get("ok"):
+        return []
+    message = _trim(user_members.get("msg"))
+    error_code = _coerce_int(user_members.get("code"))
+    required_scopes = [str(item) for item in (user_members.get("required_scopes") or []) if _trim(item)]
+    blockers: list[str] = []
+    if message == "missing_user_access_token":
+        blockers.append("user_access_token_missing")
+        return blockers
+    if error_code == FEISHU_TOKEN_EXPIRED_CODE or message == "Authentication token expired. Please request a new one.":
+        blockers.append("user_token_expired")
+        return blockers
+    if error_code == FEISHU_SCOPE_MISSING_CODE and any(scope in CHAT_MEMBER_READ_SCOPES for scope in required_scopes):
+        blockers.append("user_scope_missing_chat_members_read")
+        return blockers
+    if error_code == FEISHU_SCOPE_MISSING_CODE:
+        blockers.append("user_scope_missing")
+    return blockers
+
+
 def _build_chat_topology_snapshot(token: str, chat: dict[str, Any], *, user_access_token: str = "") -> dict[str, Any]:
     chat_id = _trim(chat.get("chat_id"))
     if not chat_id:
@@ -480,8 +524,9 @@ def _build_chat_topology_snapshot(token: str, chat: dict[str, Any], *, user_acce
             blockers.append("chat_member_view_incomplete")
     if not members.get("ok"):
         blockers.append("chat_members_unavailable")
-    if not user_members.get("ok") and _trim(user_members.get("msg")) == "Authentication token expired. Please request a new one.":
-        blockers.append("user_token_expired")
+    for blocker in _classify_user_member_blockers(user_members):
+        if blocker not in blockers:
+            blockers.append(blocker)
     return {
         "chat_id": chat_id,
         "detail": detail,
@@ -618,6 +663,183 @@ def _format_app_ref(payload: dict[str, Any]) -> str:
         if app_name:
             return f"{app_name} ({app_id})"
     return app_id
+
+
+def _append_repair_action(actions: list[dict[str, Any]], *, code: str, title: str, detail: str, priority: int) -> None:
+    normalized_code = _trim(code)
+    if not normalized_code:
+        return
+    for item in actions:
+        if _trim(item.get("code")) == normalized_code:
+            return
+    actions.append(
+        {
+            "code": normalized_code,
+            "title": _trim(title),
+            "detail": _trim(detail),
+            "priority": int(priority),
+        }
+    )
+
+
+def _repair_action_priority(action: dict[str, Any]) -> int:
+    value = action.get("priority")
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 99
+
+
+def _build_app_repair_actions(app_report: dict[str, Any]) -> list[dict[str, Any]]:
+    actions: list[dict[str, Any]] = []
+    app_ref = _format_app_ref(app_report)
+    published = app_report.get("published_version_summary") or {}
+    missing_callbacks = [str(item) for item in (published.get("missing_required_callbacks") or [])]
+    for callback in missing_callbacks:
+        if callback == MESSAGE_READ_EVENT_NAME:
+            _append_repair_action(
+                actions,
+                code="publish_message_read_callback",
+                title="Publish message_read event",
+                detail=f"Publish `{app_ref}` with `{MESSAGE_READ_EVENT_NAME}` enabled so read-receipt correlation can be measured.",
+                priority=0,
+            )
+        elif callback == MESSAGE_EVENT_NAME:
+            _append_repair_action(
+                actions,
+                code="publish_message_receive_callback",
+                title="Publish message receive event",
+                detail=f"Publish `{app_ref}` with `{MESSAGE_EVENT_NAME}` enabled so real text ingress can reach Hermes.",
+                priority=0,
+            )
+        elif callback == "card.action.trigger":
+            _append_repair_action(
+                actions,
+                code="publish_card_action_callback",
+                title="Publish card action event",
+                detail=f"Publish `{app_ref}` with `card.action.trigger` enabled so card button clicks can reach Hermes.",
+                priority=0,
+            )
+        elif callback == "application.bot.menu_v6":
+            _append_repair_action(
+                actions,
+                code="publish_bot_menu_callback",
+                title="Publish bot menu event",
+                detail=f"Publish `{app_ref}` with `application.bot.menu_v6` enabled so menu/control actions can be verified on the retained app.",
+                priority=1,
+            )
+
+    delivery_health = app_report.get("delivery_health") or {}
+    for message in delivery_health.get("recommendation_actions") or []:
+        _append_repair_action(
+            actions,
+            code=f"delivery_health:{len(actions)}",
+            title="Fix delivery config",
+            detail=str(message),
+            priority=1,
+        )
+
+    recent = app_report.get("recent_chat_activity") or {}
+    primary_blocker = _trim(recent.get("primary_blocker"))
+    if primary_blocker == "recent_messages_target_different_bot":
+        other_bot = (recent.get("total_recent_user_messages_targeting_other_bot_ids") or [{}])[0]
+        other_app = (recent.get("total_recent_app_messages_from_other_app_ids") or [{}])[0]
+        _append_repair_action(
+            actions,
+            code="converge_target_bot_mentions",
+            title="Converge target chat to one bot identity",
+            detail=(
+                f"Recent user intent is still targeting `{_format_bot_ref(other_bot)}`"
+                + (
+                    f" and replies are coming from `{_format_app_ref(other_app)}`"
+                    if _trim(other_app.get("app_id"))
+                    else ""
+                )
+                + f". Remove or silence competing bots so `{app_ref}` becomes the only active Hermes bot in the target chat."
+            ),
+            priority=0,
+        )
+    elif primary_blocker == "recent_messages_answered_by_other_app":
+        other_app = (recent.get("total_recent_app_messages_from_other_app_ids") or [{}])[0]
+        _append_repair_action(
+            actions,
+            code="stop_other_replying_app",
+            title="Stop other app from replying in target chat",
+            detail=f"Recent replies are still coming from `{_format_app_ref(other_app)}`. Keep `{app_ref}` as the only retained replying app before re-running end-to-end verification.",
+            priority=0,
+        )
+    elif primary_blocker == "recent_messages_do_not_target_current_bot":
+        _append_repair_action(
+            actions,
+            code="retarget_real_user_messages",
+            title="Retarget real-user messages to current bot",
+            detail=f"Recent user messages are not explicitly targeting `{app_ref}`. Update operator instructions to DM the canonical bot or @mention it explicitly in group chats.",
+            priority=1,
+        )
+
+    topology = app_report.get("chat_topology") or {}
+    if int(topology.get("chats_with_multiple_bots") or 0) > 0:
+        _append_repair_action(
+            actions,
+            code="reduce_multi_bot_contention",
+            title="Reduce multi-bot contention",
+            detail=f"At least one target chat still contains multiple bots. Remove or operationally silence non-canonical bots before validating ingress and KPI windows for `{app_ref}`.",
+            priority=0,
+        )
+    if int(topology.get("chats_with_expired_user_token") or 0) > 0:
+        _append_repair_action(
+            actions,
+            code="refresh_user_access_token",
+            title="Refresh user access token",
+            detail="Refresh `FEISHU_USER_ACCESS_TOKEN` and re-run the focused member audit so the full user-view member list can be inspected.",
+            priority=1,
+        )
+    if int(topology.get("chats_with_missing_user_access_token") or 0) > 0:
+        _append_repair_action(
+            actions,
+            code="supply_user_access_token",
+            title="Supply user access token",
+            detail="Provide a fresh `FEISHU_USER_ACCESS_TOKEN` from the latest OAuth authorization before re-running the focused member audit.",
+            priority=1,
+        )
+    if int(topology.get("chats_with_user_scope_missing_chat_members_read") or 0) > 0:
+        _append_repair_action(
+            actions,
+            code="grant_user_chat_member_scope",
+            title="Grant user chat-member scopes",
+            detail=(
+                "Grant one of `im:chat.members:read`, `im:chat.group_info:readonly`, "
+                "`im:chat:readonly`, or `im:chat` for user-token access on the canonical app, "
+                "then re-authorize before re-running the member audit."
+            ),
+            priority=1,
+        )
+    if int(topology.get("chats_with_incomplete_members") or 0) > 0:
+        _append_repair_action(
+            actions,
+            code="rerun_member_audit",
+            title="Re-run full member audit",
+            detail="Tenant-view member enumeration is incomplete relative to chat topology. Re-run the audit after refreshing the user token to verify full bot membership.",
+            priority=1,
+        )
+
+    actions.sort(key=lambda item: (_repair_action_priority(item), _trim(item.get("code"))))
+    return actions
+
+
+def _build_matrix_repair_actions(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    merged: list[dict[str, Any]] = []
+    for result in results:
+        for action in result.get("repair_actions") or []:
+            _append_repair_action(
+                merged,
+                code=_trim(action.get("code")),
+                title=_trim(action.get("title")),
+                detail=_trim(action.get("detail")),
+                priority=_repair_action_priority(action),
+            )
+    merged.sort(key=lambda item: (_repair_action_priority(item), _trim(item.get("code"))))
+    return merged
 
 
 def _analyze_recent_user_messages(
@@ -887,6 +1109,8 @@ def _summarize_chat_topology_snapshots(snapshots: list[dict[str, Any]]) -> dict[
     chats_with_incomplete_members = 0
     chats_with_member_api_errors = 0
     chats_with_expired_user_token = 0
+    chats_with_missing_user_access_token = 0
+    chats_with_user_scope_missing_chat_members_read = 0
     for snapshot in snapshots:
         detail = snapshot.get("detail") or {}
         members = snapshot.get("members") or {}
@@ -902,6 +1126,10 @@ def _summarize_chat_topology_snapshots(snapshots: list[dict[str, Any]]) -> dict[
             chats_with_member_api_errors += 1
         if "user_token_expired" in blockers:
             chats_with_expired_user_token += 1
+        if "user_access_token_missing" in blockers:
+            chats_with_missing_user_access_token += 1
+        if "user_scope_missing_chat_members_read" in blockers:
+            chats_with_user_scope_missing_chat_members_read += 1
     return {
         "chat_count": len(snapshots),
         "total_known_bots": total_known_bots,
@@ -910,6 +1138,8 @@ def _summarize_chat_topology_snapshots(snapshots: list[dict[str, Any]]) -> dict[
         "chats_with_incomplete_members": chats_with_incomplete_members,
         "chats_with_member_api_errors": chats_with_member_api_errors,
         "chats_with_expired_user_token": chats_with_expired_user_token,
+        "chats_with_missing_user_access_token": chats_with_missing_user_access_token,
+        "chats_with_user_scope_missing_chat_members_read": chats_with_user_scope_missing_chat_members_read,
         "snapshots": snapshots,
     }
 
@@ -1038,10 +1268,24 @@ def _audit_app(
     if not primary_blocker:
         if MESSAGE_EVENT_NAME in published_missing_callbacks:
             primary_blocker = "published_version_missing_message_receive_callback"
+        elif "card.action.trigger" in published_missing_callbacks:
+            primary_blocker = "published_version_missing_card_action_callback"
+        elif "application.bot.menu_v6" in published_missing_callbacks:
+            primary_blocker = "published_version_missing_bot_menu_callback"
         elif MESSAGE_EVENT_NAME in missing_callbacks and not published_version_summary.get("message_receive_enabled"):
             primary_blocker = "api_reported_missing_message_receive_callback"
         elif report.get("issues"):
             primary_blocker = report["issues"][0]["code"]
+    repair_actions = _build_app_repair_actions(
+        {
+            "app_id": app.get("app_id") or pair.app_id,
+            "app_name": _trim(app.get("app_name")),
+            "published_version_summary": published_version_summary,
+            "delivery_health": report,
+            "recent_chat_activity": recent_chat_activity,
+            "chat_topology": chat_topology,
+        }
+    )
     return {
         "status": report["status"],
         "app_id_env": pair.app_id_env,
@@ -1069,6 +1313,7 @@ def _audit_app(
         "delivery_health": report,
         "delivery_ready": report["status"] == "ok",
         "primary_blocker": primary_blocker,
+        "repair_actions": repair_actions,
     }
 
 
@@ -1088,16 +1333,8 @@ def _single_pair_from_args(args: argparse.Namespace) -> CredentialPair | None:
 def _summarize_matrix(results: list[dict[str, Any]]) -> tuple[str, str]:
     active_apps = [item for item in results if int(item.get("visible_chat_count") or 0) > 0]
     ready_active_apps = [item for item in active_apps if bool(item.get("delivery_ready"))]
-    if ready_active_apps:
-        first = ready_active_apps[0]
-        return (
-            "ok",
-            (
-                f"Active app `{first.get('app_id')}` can see chats and its callback configuration "
-                "matches Hermes webhook delivery expectations."
-            ),
-        )
-    for item in active_apps:
+    preferred_active_apps = ready_active_apps + [item for item in active_apps if item not in ready_active_apps]
+    for item in preferred_active_apps:
         recent = item.get("recent_chat_activity") or {}
         topology = item.get("chat_topology") or {}
         if _trim(recent.get("primary_blocker")) == "recent_messages_target_different_bot":
@@ -1142,21 +1379,53 @@ def _summarize_matrix(results: list[dict[str, Any]]) -> tuple[str, str]:
                     f"its bot open_id `{_trim((item.get('bot_info') or {}).get('open_id'))}`."
                 ),
             )
-    for item in active_apps:
+    for item in preferred_active_apps:
         topology = item.get("chat_topology") or {}
         if int(topology.get("chats_with_multiple_bots") or 0) > 0:
+            user_member_gap = ""
+            if int(topology.get("chats_with_user_scope_missing_chat_members_read") or 0) > 0:
+                user_member_gap = (
+                    " The available user token still lacks one of "
+                    "`im:chat.members:read`, `im:chat.group_info:readonly`, `im:chat:readonly`, or `im:chat`, "
+                    "so the full human-view member list cannot yet be audited."
+                )
+            elif int(topology.get("chats_with_expired_user_token") or 0) > 0:
+                user_member_gap = (
+                    " The available user_access_token is expired, so a fresh user token is still needed to verify "
+                    "the full human-view member list."
+                )
+            elif int(topology.get("chats_with_missing_user_access_token") or 0) > 0:
+                user_member_gap = (
+                    " No user_access_token is available yet, so the full human-view member list cannot be verified."
+                )
             return (
                 "error",
                 (
                     f"Active app `{item.get('app_id')}` can see target chats, but at least one target chat still contains "
                     f"`{int(topology.get('total_known_bots') or 0)}` bot(s), so single-bot Hermes routing is not yet enforced."
-                    + (
-                        " The available user_access_token is expired, so a fresh user token is still needed to verify the full human-view member list."
-                        if int(topology.get("chats_with_expired_user_token") or 0) > 0
-                        else ""
-                    )
+                    + user_member_gap
                 ),
             )
+    for item in preferred_active_apps:
+        topology = item.get("chat_topology") or {}
+        if int(topology.get("chats_with_user_scope_missing_chat_members_read") or 0) > 0:
+            return (
+                "error",
+                (
+                    f"Active app `{item.get('app_id')}` can see target chats, but the user-token member audit still "
+                    "lacks one of `im:chat.members:read`, `im:chat.group_info:readonly`, `im:chat:readonly`, or "
+                    "`im:chat`, so the human-view member topology cannot yet be verified."
+                ),
+            )
+    if ready_active_apps:
+        first = ready_active_apps[0]
+        return (
+            "ok",
+            (
+                f"Active app `{first.get('app_id')}` can see chats and its callback configuration "
+                "matches Hermes webhook delivery expectations."
+            ),
+        )
     for item in active_apps:
         published = item.get("published_version_summary") or {}
         if MESSAGE_EVENT_NAME in (published.get("missing_required_callbacks") or []):
@@ -1165,6 +1434,24 @@ def _summarize_matrix(results: list[dict[str, Any]]) -> tuple[str, str]:
                 (
                     f"Active app `{item.get('app_id')}` can see {item.get('visible_chat_count')} chat(s), "
                     f"but its latest published app version still does not include `{MESSAGE_EVENT_NAME}`."
+                ),
+            )
+        if "card.action.trigger" in (published.get("missing_required_callbacks") or []):
+            return (
+                "error",
+                (
+                    f"Active app `{item.get('app_id')}` can see {item.get('visible_chat_count')} chat(s), "
+                    "but its latest published app version still does not include `card.action.trigger`, "
+                    "so card button clicks will not reach Hermes."
+                ),
+            )
+        if "application.bot.menu_v6" in (published.get("missing_required_callbacks") or []):
+            return (
+                "error",
+                (
+                    f"Active app `{item.get('app_id')}` can see {item.get('visible_chat_count')} chat(s), "
+                    "but its latest published app version still does not include `application.bot.menu_v6`, "
+                    "so menu control actions will not reach Hermes."
                 ),
             )
     for item in active_apps:
@@ -1243,10 +1530,12 @@ def main() -> int:
             for pair in credential_pairs
         ]
         overall_status, summary = _summarize_matrix(results)
+        recommended_actions = _build_matrix_repair_actions(results)
         if len(results) == 1 and not args.all_env_apps:
             payload = results[0]
             payload["status"] = overall_status if payload.get("visible_chat_count") else payload["status"]
             payload["summary"] = summary
+            payload["recommended_actions"] = recommended_actions
         else:
             payload = {
                 "status": overall_status,
@@ -1264,6 +1553,7 @@ def main() -> int:
                     for item in known_bots
                 ],
                 "apps": results,
+                "recommended_actions": recommended_actions,
             }
         print(json.dumps(payload, ensure_ascii=False, indent=2))
         return 0 if overall_status == "ok" else 1
