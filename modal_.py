@@ -6,7 +6,11 @@ import tempfile
 import time
 import uuid
 from pathlib import Path
+from threading import Lock
 from typing import Any
+
+from internal.feishu.result_files import lookup_result_file as _lookup_result_file
+from internal.feishu.result_files import register_result_file as _register_result_file
 
 try:
     import modal
@@ -23,6 +27,9 @@ DATA_ROOT = Path(
 FEISHU_TRACE_PATH = DATA_ROOT / "feishu_trace.jsonl"
 SESSION_STATE_PATH = DATA_ROOT / "session_state.json"
 SESSION_STATE: dict[str, dict[str, str]] = {}
+FEISHU_INTERNAL_RESULT_FILE_TTL_SECONDS = 3600
+_FEISHU_INTERNAL_RESULT_FILES: dict[str, dict[str, Any]] = {}
+_FEISHU_INTERNAL_RESULT_FILES_LOCK = Lock()
 MODEL_PRESETS: list[tuple[str, str]] = [
     ("openrouter", "openai/gpt-5-mini"),
     ("openrouter", "anthropic/claude-3.7-sonnet"),
@@ -438,10 +445,6 @@ def _model_intro_text(entry: dict[str, Any] | None) -> str:
         if value:
             return value
     return ""
-
-
-def _models_for_provider(provider_slug: str) -> list[str]:
-    return [str(item.get("model") or "").strip() for item in _get_registry_entries_for_provider(provider_slug)]
 
 
 def _load_recent_model_history(state: dict[str, str]) -> dict[str, list[str]]:
@@ -1006,6 +1009,52 @@ def _build_skill_combo_card() -> dict[str, Any]:
     }
 
 
+def _build_feishu_model_hub_card() -> dict[str, Any]:
+    return _build_model_hub_card()
+
+
+def _build_feishu_personality_card(session_key: str = "session:default") -> dict[str, Any]:
+    return _build_personality_card(session_key)
+
+
+def _build_feishu_skill_combo_card() -> dict[str, Any]:
+    return _build_skill_combo_card()
+
+
+def _build_feishu_command_center_card() -> dict[str, Any]:
+    return _build_command_center_card()
+
+
+def _build_feishu_local_menu_card(event_key: str, session_key: str = "session:default") -> dict[str, Any] | None:
+    return _render_card(event_key, session_key)
+
+
+def _register_feishu_internal_result_file(
+    file_path: str,
+    *,
+    kind: str,
+    is_voice: bool = False,
+    ttl_seconds: int | None = None,
+) -> dict[str, Any] | None:
+    return _register_result_file(
+        file_path,
+        kind=kind,
+        store=_FEISHU_INTERNAL_RESULT_FILES,
+        lock=_FEISHU_INTERNAL_RESULT_FILES_LOCK,
+        default_ttl_seconds=FEISHU_INTERNAL_RESULT_FILE_TTL_SECONDS,
+        is_voice=is_voice,
+        ttl_seconds=ttl_seconds,
+    )
+
+
+def _lookup_feishu_internal_result_file(token: str) -> dict[str, Any] | None:
+    return _lookup_result_file(
+        token,
+        store=_FEISHU_INTERNAL_RESULT_FILES,
+        lock=_FEISHU_INTERNAL_RESULT_FILES_LOCK,
+    )
+
+
 def _render_card(event_key: str, session_key: str) -> dict[str, Any] | None:
     normalized = str(event_key or "").strip()
     if normalized == "model_picker":
@@ -1190,65 +1239,33 @@ if modal is not None:
             )
             return result
 
-        if context["path"] == "/internal/feishu/agent-exec" and not context["message_text"].startswith("/"):
-            try:
-                result = _build_generated_reply_result(
-                    context["message_text"],
-                    context["session_key"],
-                    route_hint="modal_heavy_exec",
-                )
-            except Exception as exc:
-                state = _get_session_state(context["session_key"])
-                error_text = f"Unable to generate a model reply for this session: {exc}"
-                result = {
-                    "status": "failed",
-                    "route_hint": "modal_heavy_exec",
-                    "execution_mode": "inline",
-                    "final_response": error_text,
-                    "send_plan": _build_text_send_plan(error_text),
-                    "action_plan": _build_text_send_plan(error_text),
-                    "session_state_after": _build_session_state_after(state),
-                    "cache_eligible": False,
-                    "ai_call_count": 0,
-                    "capability_match": False,
-                    "preferred_model_selected": True,
-                    "reconcile_required": False,
-                }
-            result.setdefault("worker_context", {})
-            result["worker_context"].update(
-                {
-                    "worker_boot_id": f"feishu-chat-{uuid.uuid4().hex}",
-                    "worker_started_at": _now_ms(),
-                    "initialized": True,
-                }
-            )
-            result["timestamp"] = time.time()
-            _append_feishu_trace(
-                "internal.agent_exec.done",
-                {
-                    "event_id": context["event_id"],
-                    "correlation_id": context["correlation_id"],
-                    "session_key": context["session_key"],
-                    "message_id": context["message_id"],
-                },
-                execution_mode=result.get("execution_mode"),
-                request_class=result.get("request_class", "text_plain"),
-                route_hint=result.get("route_hint"),
-                ai_call_count=result.get("ai_call_count"),
-                capability_match=result.get("capability_match"),
-                preferred_model_selected=result.get("preferred_model_selected"),
-            )
-            return result
-
         if context["path"] == "/internal/feishu/agent-exec":
             if context["message_text"].startswith("/"):
                 result = _handle_command(context["message_text"], context["session_key"])
             else:
-                result = _build_generated_reply_result(
-                    context["message_text"],
-                    context["session_key"],
-                    route_hint="modal_heavy_exec",
-                )
+                try:
+                    result = _build_generated_reply_result(
+                        context["message_text"],
+                        context["session_key"],
+                        route_hint="modal_heavy_exec",
+                    )
+                except Exception as exc:
+                    state = _get_session_state(context["session_key"])
+                    error_text = f"Unable to generate a model reply for this session: {exc}"
+                    result = {
+                        "status": "failed",
+                        "route_hint": "modal_heavy_exec",
+                        "execution_mode": "inline",
+                        "final_response": error_text,
+                        "send_plan": _build_text_send_plan(error_text),
+                        "action_plan": _build_text_send_plan(error_text),
+                        "session_state_after": _build_session_state_after(state),
+                        "cache_eligible": False,
+                        "ai_call_count": 0,
+                        "capability_match": False,
+                        "preferred_model_selected": True,
+                        "reconcile_required": False,
+                    }
             result.setdefault("worker_context", {})
             result["worker_context"].update(
                 {
@@ -1297,13 +1314,6 @@ if modal is not None:
                 }
             result["timestamp"] = time.time()
             return result
-
-        if context["path"] == "/internal/feishu/message-inline":
-            return _build_generated_reply_result(
-                context["message_text"],
-                context["session_key"],
-                route_hint="cf_ai_gateway",
-            )
 
         if context["path"] == "/internal/feishu/ack-reaction":
             return {"status": "ok", "message": "ack reaction processed", "worker_context": True}

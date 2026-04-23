@@ -199,8 +199,6 @@ python scripts/feishu_kpi_execution_snapshot.py --hours 24 --artifacts-dir D:\su
   - unified KPI execution snapshot
   - Feishu delivery-path audit
   - task derivation with IDs / dependencies / suggested commands
-- Added a fixed step-checklist document:
-  - `docs/plans/2026-04-22-feishu-cf-modal-hermes-step-checklist.md`
 - New default task-checklist outputs:
   - `.tmp-feishu-execution-task-checklist.json`
   - `.tmp-feishu-execution-task-checklist.md`
